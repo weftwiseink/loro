@@ -1,0 +1,430 @@
+use std::cell::Cell;
+use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
+
+use crate::subscription::Subscriber;
+use crate::sync::AtomicU8;
+use crate::utils::subscription::Subscription;
+use crate::version::Frontiers;
+use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
+use loro_common::{ContainerID, LoroResult};
+
+use super::base::{install_forwarders, HeadOwner};
+use super::ROOT_HEAD_ID;
+use super::*;
+
+// A head commit fires the injected txn on-commit hook (see `DocOwner`), which
+// calls `MultiHeadDoc::on_head_committed`. That callback needs the registry
+// lock. When the commit was itself triggered from INSIDE a registry operation
+// (a `flip_to_shared` that flushes a head's pending ops before marking it
+// immutable), taking the lock again on the same thread would be reentrant. This
+// thread-local depth counter lets the callback detect that case and defer: the
+// in-progress registry op re-keys `by_tip` itself, so nothing is lost.
+thread_local! {
+    static REG_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+pub(crate) fn in_registry_op() -> bool {
+    REG_DEPTH.with(|c| c.get() > 0)
+}
+
+pub(super) struct RegOpGuard;
+impl RegOpGuard {
+    pub(super) fn enter() -> Self {
+        REG_DEPTH.with(|c| c.set(c.get() + 1));
+        RegOpGuard
+    }
+}
+impl Drop for RegOpGuard {
+    fn drop(&mut self) {
+        REG_DEPTH.with(|c| c.set(c.get() - 1));
+    }
+}
+
+/// A materialized state at one tip: a `LoroDoc` over the shared `OpLog`.
+pub(super) struct Head {
+    pub(super) doc: LoroDoc,
+    pub(super) tip: Frontiers,
+    /// Number of `bound` entries pointing here. The whole sharing rule:
+    /// `1` = uniquely owned (writable in place); `> 1` = shared (immutable);
+    /// `0` = retired (removed) -- except the pinned root, which rests at `0`.
+    pub(super) refs: usize,
+    /// Per-head forwarders that feed this head's local commits / first-commits
+    /// into the doc-level `history_subs` / `first_commit_subs`. Kept alive for
+    /// the head's lifetime; dropped (unsubscribed) when the head is evicted.
+    pub(super) _forward: Vec<Subscription>,
+}
+
+/// The head registry. Guarded by a single `LockKind::BranchRegistry` lock,
+/// acquired before any head lock so `resolve` can copy/rebind (taking head
+/// `Txn`/`DocState` locks) while holding it, and never held into an actual
+/// content op.
+pub(super) struct Registry {
+    pub(super) heads: FxHashMap<HeadId, Head>,
+    /// Resting heads by tip: the sharing lookup. A freshly copied head is
+    /// ABSENT until its first commit re-keys it (invariant I3).
+    pub(super) by_tip: FxHashMap<Frontiers, HeadId>,
+    /// Branch -> the head it currently uses.
+    pub(super) bound: FxHashMap<BranchId, HeadId>,
+    /// Branch-scoped subscriptions, registry-owned so they can be RE-INSTALLED
+    /// on the branch's new head across a rebind (copy-on-divergence / merge),
+    /// instead of going silent on the old head.
+    pub(super) subs: FxHashMap<BranchId, Vec<BranchSub>>,
+    pub(super) next_id: HeadId,
+    pub(super) next_sub_id: u64,
+}
+
+/// A registry-owned branch subscription: its callback re-installed on the
+/// branch's head whenever the branch rebinds. `installed` is the handle on the
+/// CURRENT head (dropped -> unsubscribed) and is replaced on each rebind.
+pub(super) struct BranchSub {
+    pub(super) id: u64,
+    /// The container to watch, or `None` for a root subscription.
+    pub(super) target: Option<ContainerID>,
+    pub(super) cb: Subscriber,
+    pub(super) installed: Option<Subscription>,
+}
+
+impl Registry {
+    fn alloc_id(&mut self) -> HeadId {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
+impl<P: HeadPolicy> MultiHeadDoc<P> {
+    // --- head construction -------------------------------------------------
+
+    /// Structurally copy a head: a new `LoroDocInner` over the SAME
+    /// `Arc<OpLog>`, arena, config, and lock group, with `fork_in_group` for
+    /// the state (fresh peer, fresh `DiffCalculator`, `Private`), its registry
+    /// back-pointer and history forwarders installed. Inserted with `refs == 0`
+    /// and absent from `by_tip` (invariant I3) until a caller binds/commits it.
+    pub(super) fn copy_head(&self, reg: &mut Registry, src_id: HeadId) -> HeadId {
+        let id = reg.alloc_id();
+        let src_state = reg.heads[&src_id].doc.state.clone();
+        let head_mode = Arc::new(AtomicU8::new(HEAD_MODE_PRIVATE));
+        let arena = self.arena.clone();
+        let config = self.config.clone();
+        let lg = self.lock_group.clone();
+        let owner: Arc<dyn DocOwner> = Arc::new(HeadOwner {
+            inner: Arc::downgrade(&self.inner),
+            head_id: id,
+        });
+        let doc = LoroDoc::build_head(
+            self.oplog.clone(),
+            arena.clone(),
+            config.clone(),
+            &self.lock_group,
+            self.visible_op_count.clone(),
+            head_mode,
+            Some(owner),
+            move |cyclic, hm| {
+                src_state.lock().fork_in_group(
+                    cyclic.clone(),
+                    arena.clone(),
+                    config.clone(),
+                    &lg,
+                    hm.clone(),
+                )
+            },
+            true,
+        );
+        let forward = install_forwarders(&Arc::downgrade(&self.inner), &doc);
+        let tip = doc.state_frontiers();
+        reg.heads.insert(
+            id,
+            Head {
+                doc,
+                tip,
+                refs: 0,
+                _forward: forward,
+            },
+        );
+        id
+    }
+
+    // --- refs / mode flips -------------------------------------------------
+
+    fn inc_refs(&self, reg: &mut Registry, id: HeadId) {
+        let refs = {
+            let h = reg.heads.get_mut(&id).expect("head exists");
+            h.refs += 1;
+            h.refs
+        };
+        if refs == 2 {
+            self.flip_to_shared(reg, id);
+        }
+    }
+
+    pub(super) fn dec_refs(&self, reg: &mut Registry, id: HeadId) {
+        let refs = {
+            let h = reg.heads.get_mut(&id).expect("head exists");
+            h.refs -= 1;
+            h.refs
+        };
+        if refs == 1 {
+            self.flip_to_private(reg, id);
+        } else if refs == 0 {
+            self.retire(reg, id);
+        }
+    }
+
+    /// `1 -> 2`: commit any pending transaction (so a shared head never has an
+    /// open transaction, invariant I2), re-key `by_tip` if that commit moved
+    /// the tip, then mark the head `Shared`. The flush's on-commit hook defers
+    /// (we are inside a registry op), so we re-key here.
+    fn flip_to_shared(&self, reg: &mut Registry, id: HeadId) {
+        let h = reg.heads.get_mut(&id).expect("head exists");
+        let old_tip = h.tip.clone();
+        let (_opts, guard) = h.doc.implicit_commit_then_stop();
+        let new_tip = h.doc.state_frontiers();
+        h.doc.set_head_shared(true);
+        h.tip = new_tip.clone();
+        drop(guard);
+        if old_tip != new_tip {
+            if reg.by_tip.get(&old_tip) == Some(&id) {
+                reg.by_tip.remove(&old_tip);
+            }
+            reg.by_tip.insert(new_tip, id);
+        }
+    }
+
+    /// `2 -> 1`: the head is uniquely owned again; make it writable and renew
+    /// its auto-commit transaction.
+    fn flip_to_private(&self, reg: &mut Registry, id: HeadId) {
+        let h = reg.heads.get(&id).expect("head exists");
+        h.doc.set_head_shared(false);
+        h.doc.renew_txn_if_auto_commit(None);
+    }
+
+    /// A non-root head reached `refs == 0`: retire it (remove from `by_tip` and
+    /// `heads`, dropping its materialized state). The PINNED ROOT is never
+    /// dropped -- it stays a resting head so `by_tip` / `materialize` / `import`
+    /// / `export` always have an anchor over the shared op log. The head's
+    /// already-COMMITTED ops remain in history, so its tip stays reachable by
+    /// `materialize` replay.
+    ///
+    /// Drop-commit hazard: removing the head drops its `LoroDoc`, whose `Drop`
+    /// implicit-commits an open auto-commit transaction. We ASSERT the head has
+    /// no pending local ops here rather than clearing them: the base commits
+    /// every `write()` before returning and only rebinds at operation
+    /// boundaries, so a head reaching `refs == 0` always has an empty
+    /// auto-commit txn. An empty commit inserts NO change (`Transaction::_commit`
+    /// aborts on empty `local_ops`), so the ensuing drop is a clean no-op and
+    /// appends nothing to shared history. Asserting (rather than committing)
+    /// keeps a spurious out-of-contract pending op loud instead of silently
+    /// polluting history.
+    fn retire(&self, reg: &mut Registry, id: HeadId) {
+        if id == ROOT_HEAD_ID {
+            return; // pinned: keep the root as a resting head at refs == 0
+        }
+        if let Some(h) = reg.heads.get(&id) {
+            debug_assert_eq!(
+                h.doc.get_pending_txn_len(),
+                0,
+                "a head reaching refs == 0 must have no pending local ops \
+                 (they would spuriously commit on drop)"
+            );
+            let tip = h.tip.clone();
+            if reg.by_tip.get(&tip) == Some(&id) {
+                reg.by_tip.remove(&tip);
+            }
+        }
+        reg.heads.remove(&id); // drops the LoroDoc; empty txn => clean no-op commit
+    }
+
+    // --- binding -----------------------------------------------------------
+
+    /// Bind branch `b` to `new_id`, adjusting refs (and thus shared/private
+    /// mode) on both the old and new heads.
+    pub(super) fn rebind(&self, reg: &mut Registry, b: &BranchId, new_id: HeadId) {
+        if let Some(&old) = reg.bound.get(b) {
+            if old == new_id {
+                return;
+            }
+            self.dec_refs(reg, old);
+        }
+        reg.bound.insert(b.clone(), new_id);
+        self.inc_refs(reg, new_id);
+        self.reinstall_subs(reg, b, new_id);
+    }
+
+    /// Re-install branch `b`'s registry-owned subscriptions on head `new_id`
+    /// (its new bound head after a rebind): drop each handle on the old head and
+    /// re-subscribe the same callback on the new head, so a subscription placed
+    /// before a copy-on-divergence keeps firing on the branch's live head.
+    fn reinstall_subs(&self, reg: &mut Registry, b: &BranchId, new_id: HeadId) {
+        let head = match reg.heads.get(&new_id) {
+            Some(h) => h.doc.clone(),
+            None => return,
+        };
+        if let Some(subs) = reg.subs.get_mut(b) {
+            for s in subs.iter_mut() {
+                s.installed = None; // unsubscribe from the old head
+                let installed = match &s.target {
+                    Some(cid) => head.subscribe(cid, s.cb.clone()),
+                    None => head.subscribe_root(s.cb.clone()),
+                };
+                s.installed = Some(installed);
+            }
+        }
+    }
+
+    // --- resolution --------------------------------------------------------
+
+    /// Resolve branch `b` to the head it should use, copying-and-rebinding when
+    /// a `Write` reaches a shared head. Returns the head id and a handle.
+    ///
+    /// Low-level: hands back a raw `LoroDoc`; only the `OwnedHeadOp` gates and
+    /// the sink guard protect it. Consumers go through `Branch`.
+    #[doc(hidden)]
+    pub fn resolve(&self, b: &BranchId, intent: Intent) -> LoroResult<(HeadId, LoroDoc)> {
+        self.with_reg(|this, reg| {
+            let target = this.inner.policy.target(this, b)?;
+
+            let mut id = match reg.bound.get(b).copied() {
+                Some(h) if reg.heads[&h].tip == target => h,
+                cur => match reg.by_tip.get(&target).copied() {
+                    Some(h2) => {
+                        this.rebind(reg, b, h2);
+                        h2
+                    }
+                    None => match cur {
+                        Some(h) if reg.heads[&h].refs == 1 => {
+                            // Catch-up arm: the branch's bound LIVE head (refs==1)
+                            // advances IN PLACE to its policy-computed target
+                            // (e.g. `after_import` moving a branch to its lineage
+                            // join). `advance_in_place` checks out, which leaves
+                            // the head `detached` with its auto-commit txn stopped
+                            // -> a subsequent local write (record_head after a
+                            // remote import) would fail `AutoCommitNotStarted` and
+                            // silently drop the record. The head is now the
+                            // branch's live writable head sitting at the frontier
+                            // the policy chose, so re-enable editing. This is a
+                            // registry-internal move, so it correctly bypasses the
+                            // external E1-A `attach`/`checkout_to_latest` gate.
+                            this.advance_in_place(reg, h, &target)?;
+                            let doc = &reg.heads[&h].doc;
+                            doc.set_detached(false);
+                            doc.renew_txn_if_auto_commit(None);
+                            h
+                        }
+                        Some(h) => {
+                            // Copy+advance arm: a SHARED head (refs>1) whose
+                            // branch target moved off the shared tip. Copy it,
+                            // advance the copy to the policy target, and hand it
+                            // to the branch as its live writable head. Like the
+                            // catch-up arm, `advance_in_place` checks out and
+                            // leaves the copy detached with its txn stopped, so a
+                            // subsequent local write would fail
+                            // `AutoCommitNotStarted` (data loss). Clear it here in
+                            // the caller (registry-internal, bypasses the E1-A
+                            // gate). See the `advance_in_place` NOTE.
+                            let c = this.copy_head(reg, h);
+                            this.advance_in_place(reg, c, &target)?;
+                            let doc = &reg.heads[&c].doc;
+                            doc.set_detached(false);
+                            doc.renew_txn_if_auto_commit(None);
+                            this.rebind(reg, b, c);
+                            c
+                        }
+                        None => {
+                            // Materialize arm: a cold/unbound branch resolves to
+                            // its policy frontier via a fresh head. `materialize`
+                            // checks out (detached). This head becomes the
+                            // branch's live bound head at its policy target, so a
+                            // first WRITE on it (a cold content branch created
+                            // then diverged after its parent moved on) must
+                            // succeed. Clear detached here too, unifying all three
+                            // advancing arms: any head handed back as the branch's
+                            // bound head at its policy target is writable. (This
+                            // extends the round-6 determination, which found
+                            // "materialize read-only" only because the index/base
+                            // never wrote to a materialized head; content branches
+                            // do.)
+                            let m = this.materialize(reg, &target)?;
+                            let doc = &reg.heads[&m].doc;
+                            doc.set_detached(false);
+                            doc.renew_txn_if_auto_commit(None);
+                            this.rebind(reg, b, m);
+                            m
+                        }
+                    },
+                },
+            };
+
+            if intent == Intent::Write && reg.heads[&id].refs > 1 {
+                debug_assert!(
+                    P::COPY == CopyMode::OnDivergence,
+                    "an Eager head is born refs == 1 and never reaches the Write copy arm"
+                );
+                let c = this.copy_head(reg, id);
+                this.rebind(reg, b, c);
+                id = c;
+            }
+
+            Ok((id, reg.heads[&id].doc.clone()))
+        })
+    }
+
+    /// Move a UNIQUELY-owned head to `target` by applying `diff(tip, target)`
+    /// (a checkout on the shared history). Precondition: `refs == 1`.
+    fn advance_in_place(
+        &self,
+        reg: &mut Registry,
+        id: HeadId,
+        target: &Frontiers,
+    ) -> LoroResult<()> {
+        let h = reg.heads.get_mut(&id).expect("head exists");
+        let old_tip = h.tip.clone();
+        if old_tip == *target {
+            return Ok(());
+        }
+        // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `checkout` leaves
+        // the head's `detached` flag set (state != the shared union) with its
+        // auto-commit txn stopped. Clearing that is the CALLER's decision, not
+        // this shared helper's, because it depends on whether the resulting head
+        // is the branch's live writable head or a read-only view:
+        //   - the resolve CATCH-UP arm (refs==1 bound live head) CLEARS it after
+        //     this returns: the head is the branch's writable head at its policy
+        //     target, and a local write must not fail `AutoCommitNotStarted`
+        //     (the import-then-record data-loss path);
+        //   - the resolve copy+advance arm (refs>1 shared head advanced onto a
+        //     fresh copy) CLEARS after this returns, by the same live-writable
+        //     reasoning (the copy is the branch's writable head at its policy
+        //     target);
+        //   - the resolve materialize arm (fresh head for a cold/unbound branch)
+        //     ALSO CLEARS: a cold content branch's first write materializes to
+        //     its live policy frontier and must be writable. (An explicit
+        //     read-only history VIEW is `create_branch_at` / the checkout RFP,
+        //     not this live-frontier resolve.)
+        // In short: EVERY arm that hands back the branch's bound head at its
+        // policy target clears; `advance_in_place` itself stays neutral.
+        h.doc.checkout(target)?;
+        let new_tip = h.doc.state_frontiers();
+        h.tip = new_tip.clone();
+        if reg.by_tip.get(&old_tip) == Some(&id) {
+            reg.by_tip.remove(&old_tip);
+        }
+        reg.by_tip.insert(new_tip, id);
+        Ok(())
+    }
+
+    /// SECONDARY path: a frontier no live head sits at. Build a head by copying
+    /// the PINNED ROOT and replaying (checkout) to `target`. Logically correct,
+    /// not cheap: no nearest-source scan and no warm/orphan reuse.
+    ///
+    /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): nearest-source
+    /// selection and periodic checkpoints that make this path cheap are DEFERRED
+    /// to the persistent-DocState follow-up SoW
+    /// (`cdocs/proposals/2026-09-14-multiheaddoc-api-snapshots-persistent-state.md`).
+    /// The root always exists (pinned), so this is always available.
+    fn materialize(&self, reg: &mut Registry, target: &Frontiers) -> LoroResult<HeadId> {
+        let c = self.copy_head(reg, ROOT_HEAD_ID);
+        self.advance_in_place(reg, c, target)?;
+        Ok(c)
+    }
+}
