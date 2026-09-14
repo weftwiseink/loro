@@ -1795,4 +1795,71 @@ mod tests {
             "join of lineage peers kept session B's record"
         );
     }
+
+    /// Number of `docs[doc].heads` entries visible on `branch` (0 if absent).
+    fn head_count(md: &IndexDoc, branch: &BranchId, doc: &str) -> usize {
+        md.read(branch, |d| {
+            d.get_deep_value()
+                .as_map()
+                .and_then(|root| root.get("docs").cloned())
+                .and_then(|v| v.into_map().ok())
+                .and_then(|m| m.get(doc).cloned())
+                .and_then(|v| v.as_map().cloned())
+                .and_then(|per| per.get("heads").cloned())
+                .and_then(|v| v.into_map().ok())
+                .map(|h| h.len())
+                .unwrap_or(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn index_record_head_same_doc_converges_across_sessions() {
+        // Two sessions on the SAME branch record a head for the SAME doc "G"
+        // under different head-peer keys. With mergeable map-key children,
+        // docs["G"].heads is the SAME container on both sides, so both records
+        // survive a cross-import. (Divergent op-id children would LWW-drop one.)
+        let a = IndexDoc::new(SelfRooted::new());
+        a.init_genesis(&b("main")).unwrap();
+        a.create_index_branch(&b("shared"), &b("main")).unwrap();
+        a.record_head(&b("shared"), &d("G"), 111, 1).unwrap();
+
+        let bb = IndexDoc::new(SelfRooted::new());
+        bb.init_genesis(&b("main")).unwrap();
+        bb.create_index_branch(&b("shared"), &b("main")).unwrap();
+        bb.record_head(&b("shared"), &d("G"), 222, 2).unwrap();
+
+        let a_updates = a.export(ExportMode::all_updates()).unwrap();
+        let b_updates = bb.export(ExportMode::all_updates()).unwrap();
+        a.import(&b_updates).unwrap();
+        bb.import(&a_updates).unwrap();
+
+        // The discriminating assertion: no head record is lost -- the same
+        // mergeable heads container carries BOTH sessions' records on both sides.
+        assert_eq!(
+            head_count(&a, &b("shared"), "G"),
+            2,
+            "session A: both head records converged (mergeable child, not LWW-dropped)"
+        );
+        assert_eq!(
+            head_count(&bb, &b("shared"), "G"),
+            2,
+            "session B: both head records converged"
+        );
+        // The docs subtree is byte-identical across sessions.
+        let docs_of = |md: &IndexDoc| {
+            md.read(&b("shared"), |d| {
+                d.get_deep_value()
+                    .as_map()
+                    .and_then(|r| r.get("docs").cloned())
+            })
+            .unwrap()
+        };
+        let a_docs = docs_of(&a);
+        let b_docs = docs_of(&bb);
+        assert_eq!(
+            a_docs, b_docs,
+            "docs subtree converges to an identical value"
+        );
+    }
 }
