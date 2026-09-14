@@ -264,6 +264,14 @@ impl LoroDoc {
     ///   It also doesn't change the version of the [DocState]. The changes will be
     ///   recorded into [OpLog] only. You need to call `checkout` to make it take effect.
     pub fn set_detached_editing(&self, enable: bool) {
+        // SEAM NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `config` is
+        // Arc-SHARED across every head of a MultiHeadDoc, so this flips detached
+        // editing for ALL heads at once and is not branch-scoped. It is absent
+        // from `BranchingDocHead` (a config/attachment op) and reachable only via
+        // the raw `doc()` seam; the registry never calls it. Left ungated for
+        // now (it does not by itself move a head to the union — the checkout /
+        // attach / import gates cover the actual corruption vectors). Flagged for
+        // the checkout-affordances RFP with the rest of the detached surface.
         self.config.set_detached_editing(enable);
         if enable && self.is_detached() {
             self.with_barrier(|| {
@@ -1023,6 +1031,13 @@ impl LoroDoc {
     /// only supports backward compatibility but not forward compatibility.
     #[tracing::instrument(skip_all)]
     pub fn import_json_updates<T: TryInto<JsonSchema>>(&self, json: T) -> LoroResult<ImportStatus> {
+        // Gated on a registry-owned head like `import`/`import_batch`: this is a
+        // history-merging import that would apply a diff to this head's state
+        // from the shared union (E1). History enters a registry doc through the
+        // repo's `import_to_history` under the all-heads barrier, never on a head.
+        if self.is_owned() {
+            return Err(LoroError::OwnedHeadOp("import"));
+        }
         let json = json.try_into().map_err(|_| LoroError::InvalidJsonSchema)?;
         self.with_barrier(|| {
             let result = self.import_changes_and_apply_delta_to_state_if_needed(

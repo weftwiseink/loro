@@ -109,6 +109,8 @@ pub enum LoroError {
     HeadShared,
     #[error("Operation '{0}' is not allowed directly on a MultiHeadDoc head; go through the registry (history via import_to_history; peer fixed at fork).")]
     OwnedHeadOp(&'static str),
+    #[error("One of the given frontiers is not included in the document's history, so they cannot be compared.")]
+    FrontiersNotIncluded,
 }
 
 impl LoroError {

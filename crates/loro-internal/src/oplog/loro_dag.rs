@@ -1374,6 +1374,12 @@ impl Display for FrontiersNotIncluded {
     }
 }
 
+impl From<FrontiersNotIncluded> for loro_common::LoroError {
+    fn from(_: FrontiersNotIncluded) -> Self {
+        loro_common::LoroError::FrontiersNotIncluded
+    }
+}
+
 #[cfg(test)]
 mod ensure_vv_for_tests {
     use super::*;

@@ -596,13 +596,42 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                             h
                         }
                         Some(h) => {
+                            // Copy+advance arm: a SHARED head (refs>1) whose
+                            // branch target moved off the shared tip. Copy it,
+                            // advance the copy to the policy target, and hand it
+                            // to the branch as its live writable head. Like the
+                            // catch-up arm, `advance_in_place` checks out and
+                            // leaves the copy detached with its txn stopped, so a
+                            // subsequent local write would fail
+                            // `AutoCommitNotStarted` (data loss). Clear it here in
+                            // the caller (registry-internal, bypasses the E1-A
+                            // gate). See the `advance_in_place` NOTE.
                             let c = this.copy_head(reg, h);
                             this.advance_in_place(reg, c, &target)?;
+                            let doc = &reg.heads[&c].doc;
+                            doc.set_detached(false);
+                            doc.renew_txn_if_auto_commit(None);
                             this.rebind(reg, b, c);
                             c
                         }
                         None => {
+                            // Materialize arm: a cold/unbound branch resolves to
+                            // its policy frontier via a fresh head. `materialize`
+                            // checks out (detached). This head becomes the
+                            // branch's live bound head at its policy target, so a
+                            // first WRITE on it (a cold content branch created
+                            // then diverged after its parent moved on) must
+                            // succeed. Clear detached here too, unifying all three
+                            // advancing arms: any head handed back as the branch's
+                            // bound head at its policy target is writable. (This
+                            // extends the round-6 determination, which found
+                            // "materialize read-only" only because the index/base
+                            // never wrote to a materialized head; content branches
+                            // do.)
                             let m = this.materialize(reg, &target)?;
+                            let doc = &reg.heads[&m].doc;
+                            doc.set_detached(false);
+                            doc.renew_txn_if_auto_commit(None);
                             this.rebind(reg, b, m);
                             m
                         }
@@ -646,15 +675,17 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         //     this returns: the head is the branch's writable head at its policy
         //     target, and a local write must not fail `AutoCommitNotStarted`
         //     (the import-then-record data-loss path);
-        //   - `materialize` (a fresh `copy_head` + advance, for a cold/unbound
-        //     branch or an explicit historical view) deliberately does NOT clear:
-        //     it stays a read-only view (the full read-only-head taxonomy is the
-        //     checkout RFP's);
         //   - the resolve copy+advance arm (refs>1 shared head advanced onto a
-        //     fresh copy) has the same detached property, but is NOT exercised in
-        //     this unit (SelfRooted index heads are Eager/refs==1; the Delegated
-        //     content policy that produces shared+advanced heads is Phase-3 body)
-        //     -- it clears there when built, by the same live-writable reasoning.
+        //     fresh copy) CLEARS after this returns, by the same live-writable
+        //     reasoning (the copy is the branch's writable head at its policy
+        //     target);
+        //   - the resolve materialize arm (fresh head for a cold/unbound branch)
+        //     ALSO CLEARS: a cold content branch's first write materializes to
+        //     its live policy frontier and must be writable. (An explicit
+        //     read-only history VIEW is `create_branch_at` / the checkout RFP,
+        //     not this live-frontier resolve.)
+        // In short: EVERY arm that hands back the branch's bound head at its
+        // policy target clears; `advance_in_place` itself stays neutral.
         h.doc.checkout(target)?;
         let new_tip = h.doc.state_frontiers();
         h.tip = new_tip.clone();
@@ -1369,9 +1400,243 @@ impl MultiHeadDoc<SelfRooted> {
         })?
     }
 
+    /// Record every id of frontier `f` into `docs[doc].heads` on `b`'s index
+    /// head (advance / merge / ingest: the durable per-branch content frontier).
+    pub fn record_frontier(&self, b: &BranchId, doc: &DocId, f: &Frontiers) -> LoroResult<()> {
+        self.write(b, |d| {
+            let docs = d.get_map("docs");
+            let per_doc = docs.ensure_mergeable_map(doc.as_str())?;
+            let heads = per_doc.ensure_mergeable_map("heads")?;
+            for id in f.iter() {
+                heads.insert(&id.peer.to_string(), id.counter as i64)?;
+            }
+            Ok(())
+        })?
+    }
+
+    /// The raw `(peer, counter)` ids recorded in `docs[doc].heads` on `b`'s index
+    /// head (before any reduction against a content doc's history). Empty if the
+    /// branch or doc is unknown. `Delegated::target` reduces these against the
+    /// content doc's DAG.
+    pub fn recorded_ids(&self, b: &BranchId, doc: &DocId) -> LoroResult<Vec<ID>> {
+        self.read(b, |d| {
+            let mut ids = Vec::new();
+            let heads = d
+                .get_deep_value()
+                .as_map()
+                .and_then(|root| root.get("docs").cloned())
+                .and_then(|v| v.into_map().ok())
+                .and_then(|docs| docs.get(doc.as_str()).cloned())
+                .and_then(|v| v.into_map().ok())
+                .and_then(|per| per.get("heads").cloned())
+                .and_then(|v| v.into_map().ok());
+            if let Some(heads) = heads {
+                for (peer_str, counter) in heads.iter() {
+                    if let (Ok(peer), Some(c)) = (peer_str.parse::<PeerID>(), counter.as_i64()) {
+                        ids.push(ID::new(peer, *c as Counter));
+                    }
+                }
+            }
+            ids
+        })
+    }
+
     /// The branches this session knows, from the lineage map.
     pub fn branches(&self) -> Vec<BranchId> {
         self.policy().lineage(self).lock().keys().cloned().collect()
+    }
+}
+
+// ======================================================================
+// The content variant: BranchingDoc = MultiHeadDoc<Delegated>, and the repo.
+// ======================================================================
+
+/// The outcome of a `merge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// `into` already contains `from` (equal or ahead); nothing moved.
+    AlreadyContained,
+    /// `from` is strictly ahead of `into`; a fast-forward (no divergent diff).
+    FastForward,
+    /// `into` and `from` diverged; the join was computed and applied.
+    Merged,
+}
+
+/// A content doc's resolution policy: DELEGATE to the repo's index for "where is
+/// branch `b` for this doc", copying lazily on divergence. The index is the
+/// source of truth; a content head materializes at the recorded frontier.
+///
+/// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): the proposal's
+/// `frontier_cache` (a per-branch mirror of the index frontier refreshed by the
+/// index's history subscription) is a HOT-PATH OPTIMIZATION and is deferred:
+/// `target` reads the index directly each call (the source of truth), which is
+/// correct, just not cached. The cache is Phase-3 follow-up scope.
+#[allow(missing_debug_implementations)]
+pub struct Delegated {
+    id: DocId,
+    index: Arc<IndexDoc>,
+}
+
+impl Delegated {
+    pub fn new(id: DocId, index: Arc<IndexDoc>) -> Self {
+        Delegated { id, index }
+    }
+}
+
+impl HeadPolicy for Delegated {
+    const COPY: CopyMode = CopyMode::OnDivergence;
+
+    /// Where branch `b` is for this doc: the index's recorded ids reduced against
+    /// THIS doc's history -- drop ids the content history does not yet hold
+    /// ("skipped until held"), then shrink. Reads the index first (its locks
+    /// released), then the content DAG; the two docs' locks never nest.
+    fn target(&self, this: &MultiHeadDoc<Self>, b: &BranchId) -> LoroResult<Frontiers> {
+        let raw = self.index.recorded_ids(b, &self.id)?;
+        let ol = this.oplog.lock();
+        let held: Vec<ID> = raw
+            .into_iter()
+            .filter(|id| ol.vv().get_last(id.peer).is_some_and(|c| c >= id.counter))
+            .collect();
+        shrink_frontiers(&Frontiers::from(held), &ol.dag).map_err(LoroError::FrontiersNotFound)
+    }
+
+    /// Publish this commit's new tip into the index: `docs[doc].heads[peer] = c`.
+    fn after_commit(&self, _this: &MultiHeadDoc<Self>, b: &BranchId, last: ID) {
+        let _ = self.index.record_head(b, &self.id, last.peer, last.counter);
+    }
+
+    /// After a content import, re-resolve every branch the index knows: a branch
+    /// whose recorded ids for this doc just became held advances to them (the
+    /// ingest); ids still unheld are dropped by `target` and picked up next time.
+    fn after_import(&self, _this: &MultiHeadDoc<Self>, _status: &ImportStatus) -> Vec<BranchId> {
+        self.index.branches()
+    }
+}
+
+/// One content document: a `MultiHeadDoc` with delegated (index-backed) branch
+/// resolution and copy-on-divergence.
+pub type BranchingDoc = MultiHeadDoc<Delegated>;
+
+impl MultiHeadDoc<Delegated> {
+    fn doc_id(&self) -> &DocId {
+        &self.inner.policy.id
+    }
+    fn index(&self) -> &IndexDoc {
+        &self.inner.policy.index
+    }
+
+    /// This doc's content frontier for branch `b` (the reduced index record).
+    pub fn frontier_of(&self, b: &BranchId) -> LoroResult<Frontiers> {
+        self.inner.policy.target(self, b)
+    }
+
+    /// Whether branch `target` contains branch `source` (both of this doc).
+    pub fn contains(&self, target: &BranchId, source: &BranchId) -> LoroResult<bool> {
+        let ft = self.frontier_of(target)?;
+        let fs = self.frontier_of(source)?;
+        let ol = self.oplog.lock();
+        Ok(matches!(
+            ol.dag.cmp_frontiers(&fs, &ft).map_err(LoroError::from)?,
+            Some(Ordering::Less) | Some(Ordering::Equal)
+        ))
+    }
+
+    /// Move branch `b` to frontier `to`: record it in the index (durable state
+    /// leads the cache), then re-resolve to advance/rebind this doc's head.
+    pub fn advance(&self, b: &BranchId, to: &Frontiers) -> LoroResult<()> {
+        self.index().record_frontier(b, self.doc_id(), to)?;
+        let _ = self.resolve(b, Intent::Read)?;
+        Ok(())
+    }
+
+    /// Merge `from` into `into` as frontier advancement -- no new ops are created
+    /// and NO op is dropped: the applied frontier is the join (shrink of the
+    /// union of both branches' ids), so `into` advances to include every op of
+    /// `from`.
+    pub fn merge(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
+        let fi = self.frontier_of(into)?;
+        let ff = self.frontier_of(from)?;
+        let (outcome, join) = {
+            let ol = self.oplog.lock();
+            let outcome = match ol.dag.cmp_frontiers(&fi, &ff).map_err(LoroError::from)? {
+                Some(Ordering::Equal) | Some(Ordering::Greater) => {
+                    return Ok(MergeOutcome::AlreadyContained)
+                }
+                Some(Ordering::Less) => MergeOutcome::FastForward,
+                None => MergeOutcome::Merged,
+            };
+            // The join: shrink(union of both frontiers' ids). Every id of `from`
+            // is in the union, so nothing is dropped.
+            let mut u = fi.clone();
+            for id in ff.iter() {
+                u.push(id);
+            }
+            (
+                outcome,
+                shrink_frontiers(&u, &ol.dag).map_err(LoroError::FrontiersNotFound)?,
+            )
+        };
+        self.advance(into, &join)?;
+        Ok(outcome)
+    }
+}
+
+/// The repo: one loro index doc plus its content docs. Branch existence and
+/// "where each branch is for each doc" live in the index; content docs delegate.
+#[allow(missing_debug_implementations)]
+pub struct BranchingDocRepo {
+    index: Arc<IndexDoc>,
+    docs: std::sync::Mutex<FxHashMap<DocId, Arc<BranchingDoc>>>,
+}
+
+/// The genesis branch every repo opens with.
+pub const GENESIS_BRANCH: &str = "main";
+
+impl BranchingDocRepo {
+    /// Open a fresh repo with the genesis branch.
+    pub fn open() -> LoroResult<Self> {
+        let index = Arc::new(IndexDoc::new(SelfRooted::new()));
+        index.init_genesis(&GENESIS_BRANCH.into())?;
+        Ok(BranchingDocRepo {
+            index,
+            docs: std::sync::Mutex::new(FxHashMap::default()),
+        })
+    }
+
+    /// The index doc (pure ids / frontiers).
+    pub fn index(&self) -> &IndexDoc {
+        &self.index
+    }
+
+    /// The branches the repo knows (from the index lineage).
+    pub fn branches(&self) -> Vec<BranchId> {
+        self.index.branches()
+    }
+
+    /// Open (or get) a content doc. Idempotent per id.
+    pub fn open_doc(&self, id: DocId) -> Arc<BranchingDoc> {
+        let mut docs = self.docs.lock().unwrap();
+        if let Some(d) = docs.get(&id) {
+            return d.clone();
+        }
+        let bd = Arc::new(MultiHeadDoc::new(Delegated::new(
+            id.clone(),
+            self.index.clone(),
+        )));
+        docs.insert(id, bd.clone());
+        bd
+    }
+
+    /// Drop the in-memory content doc (its recorded frontiers stay in the index;
+    /// reopening re-materializes lazily).
+    pub fn close_doc(&self, id: &DocId) {
+        self.docs.lock().unwrap().remove(id);
+    }
+
+    /// Repo-wide branch creation: eager-copy the index head for `new` from
+    /// `from`; content docs bind `new` lazily on first access (free creation).
+    pub fn create_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
+        self.index.create_index_branch(new, from)
     }
 }
 
@@ -2334,34 +2599,27 @@ mod tests {
     }
 
     #[test]
-    fn e1_attach_noop_on_owned_detached_head() {
-        // A materialized head (built via the internal advance/checkout path) is
-        // DETACHED and read-only. `attach`/`checkout_to_latest` on it would move
-        // it to the shared union; the gate refuses (no-op) on an owned head.
+    fn e1_detach_noop_on_owned_head() {
+        // `detach()` is gated (no-op) on a registry-owned head -- part of the
+        // deferred checkout/attach/detach trio: a branch head's attachment is the
+        // registry's, not the raw doc's, to change.
+        //
+        // (The attach/checkout_to_latest no-op gates are defense-in-depth: after
+        // the resolve arms all clear `detached`, and external checkout/detach are
+        // gated, no reachable owned head is left detached to observe them on --
+        // the discriminating case returns with the deferred create_branch_at
+        // read-only-view head. The observable E1-A guard is the raw-checkout-seam
+        // test above.)
         let md = MultiHeadDoc::new(Manual::new());
         md.bind(&b("main"), 0);
         md.write(&b("main"), |d| {
             d.get_text("t").insert_unicode(0, "M").unwrap()
         })
-        .unwrap(); // root advances to a non-empty union
-
-        // `reader` targets the empty frontier -> materialize (copy root, then an
-        // internal checkout to empty) -> a detached, owned head.
-        md.policy().set_target(&b("reader"), Frontiers::default());
-        let (rid, _) = md.resolve(&b("reader"), Intent::Read).unwrap();
-        assert_ne!(rid, 0);
-        let head = md.head_doc(rid).unwrap();
-        assert!(
-            head.is_detached(),
-            "materialized head is detached (read-only)"
-        );
-        assert_eq!(head.get_text("t").to_string(), "", "at the empty state");
-
-        // The E1 site A gate: attach is a no-op on the owned head; it is NOT
-        // re-attached to the union and does not absorb main's op.
-        head.attach();
-        assert!(head.is_detached(), "attach refused (no-op) on owned head");
-        assert_eq!(head.get_text("t").to_string(), "", "not moved to the union");
+        .unwrap();
+        let head = md.head_doc(0).unwrap();
+        assert!(!head.is_detached(), "owned head starts attached");
+        head.detach();
+        assert!(!head.is_detached(), "detach refused (no-op) on owned head");
     }
 
     #[test]
@@ -2448,6 +2706,163 @@ mod tests {
                 .read(|h| h.get_text("t").to_string())
                 .unwrap(),
             "M"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3 body: refs>1 copy+advance detached-clear (base), and the
+    // Delegated engine (repo create / write / read / merge / advance).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn refs_gt1_copy_advance_clears_detached() {
+        // The refs>1 copy+advance arm: a SHARED head whose branch target moved
+        // off the shared tip is copied and advanced (checkout -> detached). The
+        // copy is the branch's live writable head, so a subsequent write must
+        // succeed (the clear); WITHOUT it the write fails on a detached head.
+        let md = MultiHeadDoc::new(Manual::new());
+        // main + feat SHARE the root head; bind `x` too, then `x` diverges (root
+        // is shared, so its write copies off) onto its own head and builds "AB",
+        // leaving root empty and shared by main + feat (refs 2).
+        md.bind(&b("main"), 0);
+        md.bind(&b("feat"), 0);
+        md.bind(&b("x"), 0);
+        md.write(&b("x"), |d| d.get_text("t").insert_unicode(0, "A").unwrap())
+            .unwrap(); // x diverges off the shared root onto its own head
+        let t_a = md.head_tip(md.bound_head(&b("x")).unwrap()).unwrap();
+        md.write(&b("x"), |d| d.get_text("t").insert_unicode(1, "B").unwrap())
+            .unwrap();
+        assert_eq!(md.refs_of(&b("main")), Some(2));
+
+        // main's target -> the intermediate frontier: resolve(Write) hits the
+        // refs>1 copy+advance arm.
+        md.policy().set_target(&b("main"), t_a.clone());
+        let inner = md
+            .write(&b("main"), |d| d.get_text("t").insert_unicode(0, "M"))
+            .unwrap();
+        assert!(
+            inner.is_ok(),
+            "write on the advanced shared-copy head succeeded (detached cleared): {inner:?}"
+        );
+        assert_eq!(
+            md.read(&b("main"), |d| d.get_text("t").to_string())
+                .unwrap(),
+            "MA",
+            "the advanced head materialized 'A' and accepted 'M'"
+        );
+        assert_eq!(
+            md.read(&b("feat"), |d| d.get_text("t").to_string())
+                .unwrap(),
+            "",
+            "feat, still on the shared root, is unaffected"
+        );
+    }
+
+    #[test]
+    fn repo_create_write_read_free_creation() {
+        let repo = BranchingDocRepo::open().unwrap();
+        let doc = repo.open_doc("G".into());
+        doc.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "main").unwrap())
+            .unwrap();
+
+        // Free creation: draft shares main's content head until it writes.
+        repo.create_branch(&b("draft"), &b(GENESIS_BRANCH)).unwrap();
+        assert!(repo.branches().contains(&b("draft")));
+        assert_eq!(
+            doc.branch("draft")
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "main",
+            "draft sees main's content (shared head, no copy)"
+        );
+
+        // draft diverges (copy-on-divergence); main is unaffected.
+        doc.branch("draft")
+            .write(|h| h.get_text("t").insert_unicode(4, "-draft").unwrap())
+            .unwrap();
+        assert_eq!(
+            doc.branch("draft")
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "main-draft"
+        );
+        assert_eq!(
+            doc.branch(GENESIS_BRANCH)
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "main",
+            "main unaffected by draft's divergent write"
+        );
+    }
+
+    #[test]
+    fn merge_does_not_drop_ops() {
+        let repo = BranchingDocRepo::open().unwrap();
+        let doc = repo.open_doc("G".into());
+        doc.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+            .unwrap();
+        repo.create_branch(&b("feature"), &b(GENESIS_BRANCH))
+            .unwrap();
+
+        // Both branches diverge with a concurrent edit at the same position.
+        doc.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(4, "M").unwrap())
+            .unwrap();
+        doc.branch("feature")
+            .write(|h| h.get_text("t").insert_unicode(4, "F").unwrap())
+            .unwrap();
+        assert!(!doc.contains(&b(GENESIS_BRANCH), &b("feature")).unwrap());
+
+        let outcome = doc.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap();
+        assert_eq!(outcome, MergeOutcome::Merged);
+
+        // main now contains BOTH edits -- no dropped op.
+        let text = doc
+            .branch(GENESIS_BRANCH)
+            .read(|h| h.get_text("t").to_string())
+            .unwrap();
+        assert_eq!(
+            text.chars().count(),
+            6,
+            "base + both 1-char edits, got {text:?}"
+        );
+        assert!(
+            text.starts_with("base") && text.contains('M') && text.contains('F'),
+            "merge kept both branches' ops, got {text:?}"
+        );
+        // feature is now contained in main.
+        assert!(doc.contains(&b(GENESIS_BRANCH), &b("feature")).unwrap());
+    }
+
+    #[test]
+    fn merge_fast_forward_and_already_contained() {
+        let repo = BranchingDocRepo::open().unwrap();
+        let doc = repo.open_doc("G".into());
+        doc.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "x").unwrap())
+            .unwrap();
+        repo.create_branch(&b("feature"), &b(GENESIS_BRANCH))
+            .unwrap();
+        // Only feature advances; main is behind -> fast-forward.
+        doc.branch("feature")
+            .write(|h| h.get_text("t").insert_unicode(1, "y").unwrap())
+            .unwrap();
+        assert_eq!(
+            doc.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+            MergeOutcome::FastForward
+        );
+        assert_eq!(
+            doc.branch(GENESIS_BRANCH)
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "xy"
+        );
+        // Merging again: already contained.
+        assert_eq!(
+            doc.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+            MergeOutcome::AlreadyContained
         );
     }
 }
