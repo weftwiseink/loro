@@ -1680,6 +1680,189 @@ impl LoroDoc {
     }
 }
 
+/// The public, head-safe branch-facing surface: a pass-through newtype over
+/// [`LoroDoc`] that exposes ONLY the methods that read or write a resolved
+/// branch head's materialized state or transaction, and deliberately OMITS
+/// every history / position / attachment / identity / config op
+/// (`import*`, `export*`, `checkout`, `attach`, `detach`, `checkout_to_latest`,
+/// `fork*`, `oplog_*`, `frontiers`, `set_peer_id`, `config*`, `diff`, ...).
+///
+/// This is the public `loro`-crate mirror of `loro_internal::multi_head::
+/// BranchingDocHead`; the wasm class and the `Equals<Omit<LoroDoc, HistoryKeys>>`
+/// `.d.ts` drift guard build on it. The absence is a type-level guarantee: the
+/// omitted ops do not exist on this type and do not compile, e.g.:
+///
+/// ```compile_fail
+/// # use loro::BranchingDocHead;
+/// fn history_op_is_absent(head: &BranchingDocHead) {
+///     // ERROR: no method `import` / `checkout` / `attach` on BranchingDocHead
+///     head.import(&[]).unwrap();
+/// }
+/// ```
+///
+/// A head-safe op is present:
+///
+/// ```
+/// # use loro::BranchingDocHead;
+/// fn head_safe_op(head: &BranchingDocHead) {
+///     let _ = head.get_deep_value();
+///     let _t = head.get_text("t");
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct BranchingDocHead(LoroDoc);
+
+// Every method here forwards verbatim to the identically-named `LoroDoc` method
+// (see its docs); the head-safe SURFACE is documented on the type above.
+// `from_doc`/`from_inner` are the (not-yet-wired) constructors the public branch
+// read/write closures will use once that surface lands.
+#[allow(missing_docs, dead_code)]
+impl BranchingDocHead {
+    /// Wrap a resolved branch head. Crate-internal: consumers receive a
+    /// `&BranchingDocHead` from a branch read/write closure, never construct one.
+    pub(crate) fn from_doc(doc: LoroDoc) -> Self {
+        Self(doc)
+    }
+
+    /// Wrap a raw internal head doc (a `MultiHeadDoc` head) as the public
+    /// head-safe surface.
+    pub(crate) fn from_inner(inner: InnerLoroDoc) -> Self {
+        Self(LoroDoc::_new(inner))
+    }
+
+    // --- container access ---
+    pub fn get_text<I: IntoContainerId>(&self, id: I) -> LoroText {
+        self.0.get_text(id)
+    }
+    pub fn get_map<I: IntoContainerId>(&self, id: I) -> LoroMap {
+        self.0.get_map(id)
+    }
+    pub fn get_list<I: IntoContainerId>(&self, id: I) -> LoroList {
+        self.0.get_list(id)
+    }
+    pub fn get_movable_list<I: IntoContainerId>(&self, id: I) -> LoroMovableList {
+        self.0.get_movable_list(id)
+    }
+    pub fn get_tree<I: IntoContainerId>(&self, id: I) -> LoroTree {
+        self.0.get_tree(id)
+    }
+    pub fn get_counter<I: IntoContainerId>(&self, id: I) -> LoroCounter {
+        self.0.get_counter(id)
+    }
+    pub fn try_get_text<I: IntoContainerId>(&self, id: I) -> Option<LoroText> {
+        self.0.try_get_text(id)
+    }
+    pub fn try_get_map<I: IntoContainerId>(&self, id: I) -> Option<LoroMap> {
+        self.0.try_get_map(id)
+    }
+    pub fn try_get_list<I: IntoContainerId>(&self, id: I) -> Option<LoroList> {
+        self.0.try_get_list(id)
+    }
+    pub fn try_get_movable_list<I: IntoContainerId>(&self, id: I) -> Option<LoroMovableList> {
+        self.0.try_get_movable_list(id)
+    }
+    pub fn try_get_tree<I: IntoContainerId>(&self, id: I) -> Option<LoroTree> {
+        self.0.try_get_tree(id)
+    }
+    pub fn try_get_counter<I: IntoContainerId>(&self, id: I) -> Option<LoroCounter> {
+        self.0.try_get_counter(id)
+    }
+    pub fn get_container(&self, id: ContainerID) -> Option<Container> {
+        self.0.get_container(id)
+    }
+    pub fn has_container(&self, id: &ContainerID) -> bool {
+        self.0.has_container(id)
+    }
+    pub fn get_by_path(&self, path: &[Index]) -> Option<ValueOrContainer> {
+        self.0.get_by_path(path)
+    }
+    pub fn get_by_str_path(&self, path: &str) -> Option<ValueOrContainer> {
+        self.0.get_by_str_path(path)
+    }
+    #[cfg(feature = "jsonpath")]
+    pub fn jsonpath(&self, path: &str) -> Result<Vec<ValueOrContainer>, JsonPathError> {
+        self.0.jsonpath(path)
+    }
+
+    // --- state reads ---
+    pub fn get_value(&self) -> LoroValue {
+        self.0.get_value()
+    }
+    pub fn get_deep_value(&self) -> LoroValue {
+        self.0.get_deep_value()
+    }
+    pub fn get_deep_value_with_id(&self) -> LoroValue {
+        self.0.get_deep_value_with_id()
+    }
+    pub fn state_frontiers(&self) -> Frontiers {
+        self.0.state_frontiers()
+    }
+    pub fn state_vv(&self) -> VersionVector {
+        self.0.state_vv()
+    }
+    pub fn cmp_with_frontiers(&self, other: &Frontiers) -> Ordering {
+        self.0.cmp_with_frontiers(other)
+    }
+    pub fn get_cursor_pos(
+        &self,
+        cursor: &Cursor,
+    ) -> Result<PosQueryResult, CannotFindRelativePosition> {
+        self.0.get_cursor_pos(cursor)
+    }
+    pub fn get_path_to_container(&self, id: &ContainerID) -> Option<Vec<(ContainerID, Index)>> {
+        self.0.get_path_to_container(id)
+    }
+    pub fn get_pending_txn_len(&self) -> usize {
+        self.0.get_pending_txn_len()
+    }
+    pub fn peer_id(&self) -> PeerID {
+        self.0.peer_id()
+    }
+    pub fn len_ops(&self) -> usize {
+        self.0.len_ops()
+    }
+    pub fn len_changes(&self) -> usize {
+        self.0.len_changes()
+    }
+
+    // --- local write ---
+    pub fn commit(&self) {
+        self.0.commit()
+    }
+    pub fn commit_with(&self, options: CommitOptions) {
+        self.0.commit_with(options)
+    }
+    pub fn set_next_commit_message(&self, msg: &str) {
+        self.0.set_next_commit_message(msg)
+    }
+    pub fn set_next_commit_origin(&self, origin: &str) {
+        self.0.set_next_commit_origin(origin)
+    }
+    pub fn set_next_commit_timestamp(&self, timestamp: Timestamp) {
+        self.0.set_next_commit_timestamp(timestamp)
+    }
+    pub fn set_next_commit_options(&self, options: CommitOptions) {
+        self.0.set_next_commit_options(options)
+    }
+    pub fn clear_next_commit_options(&self) {
+        self.0.clear_next_commit_options()
+    }
+    pub fn apply_diff(&self, diff: DiffBatch) -> LoroResult<()> {
+        self.0.apply_diff(diff)
+    }
+    pub fn revert_to(&self, version: &Frontiers) -> LoroResult<()> {
+        self.0.revert_to(version)
+    }
+
+    // --- per-head hooks ---
+    pub fn subscribe_pre_commit(&self, callback: PreCommitCallback) -> Subscription {
+        self.0.subscribe_pre_commit(callback)
+    }
+    pub fn free_diff_calculator(&self) {
+        self.0.free_diff_calculator()
+    }
+}
+
 /// It's used to prevent the user from implementing the trait directly.
 #[allow(private_bounds)]
 trait SealedTrait {}
