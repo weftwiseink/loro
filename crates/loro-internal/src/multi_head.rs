@@ -176,7 +176,23 @@ struct Registry {
     by_tip: FxHashMap<Frontiers, HeadId>,
     /// Branch -> the head it currently uses.
     bound: FxHashMap<BranchId, HeadId>,
+    /// Branch-scoped subscriptions, registry-owned so they can be RE-INSTALLED
+    /// on the branch's new head across a rebind (copy-on-divergence / merge),
+    /// instead of going silent on the old head.
+    subs: FxHashMap<BranchId, Vec<BranchSub>>,
     next_id: HeadId,
+    next_sub_id: u64,
+}
+
+/// A registry-owned branch subscription: its callback re-installed on the
+/// branch's head whenever the branch rebinds. `installed` is the handle on the
+/// CURRENT head (dropped -> unsubscribed) and is replaced on each rebind.
+struct BranchSub {
+    id: u64,
+    /// The container to watch, or `None` for a root subscription.
+    target: Option<ContainerID>,
+    cb: Subscriber,
+    installed: Option<Subscription>,
 }
 
 impl Registry {
@@ -340,7 +356,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                         heads,
                         by_tip,
                         bound: FxHashMap::default(),
+                        subs: FxHashMap::default(),
                         next_id: ROOT_HEAD_ID + 1,
+                        next_sub_id: 0,
                     },
                     LockKind::BranchRegistry,
                 ),
@@ -532,6 +550,28 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         }
         reg.bound.insert(b.clone(), new_id);
         self.inc_refs(reg, new_id);
+        self.reinstall_subs(reg, b, new_id);
+    }
+
+    /// Re-install branch `b`'s registry-owned subscriptions on head `new_id`
+    /// (its new bound head after a rebind): drop each handle on the old head and
+    /// re-subscribe the same callback on the new head, so a subscription placed
+    /// before a copy-on-divergence keeps firing on the branch's live head.
+    fn reinstall_subs(&self, reg: &mut Registry, b: &BranchId, new_id: HeadId) {
+        let head = match reg.heads.get(&new_id) {
+            Some(h) => h.doc.clone(),
+            None => return,
+        };
+        if let Some(subs) = reg.subs.get_mut(b) {
+            for s in subs.iter_mut() {
+                s.installed = None; // unsubscribe from the old head
+                let installed = match &s.target {
+                    Some(cid) => head.subscribe(cid, s.cb.clone()),
+                    None => head.subscribe_root(s.cb.clone()),
+                };
+                s.installed = Some(installed);
+            }
+        }
     }
 
     /// Bind a branch directly to an existing head (test / low-level entry).
@@ -549,6 +589,48 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 this.dec_refs(reg, old);
             }
         });
+    }
+
+    /// Install a registry-owned, rebind-surviving subscription on branch `b`
+    /// (`target = None` for a root subscription). It fires on `b`'s CURRENT head
+    /// and is re-installed on the new head whenever `b` rebinds. Dropping the
+    /// returned [`BranchSubscription`] removes it.
+    #[doc(hidden)]
+    pub fn subscribe_branch(
+        &self,
+        b: &BranchId,
+        target: Option<ContainerID>,
+        cb: Subscriber,
+    ) -> LoroResult<BranchSubscription> {
+        let (_, head) = self.resolve(b, Intent::Read)?;
+        let installed = match &target {
+            Some(cid) => head.subscribe(cid, cb.clone()),
+            None => head.subscribe_root(cb.clone()),
+        };
+        let sub_id = self.with_reg(|_, reg| {
+            let sub_id = reg.next_sub_id;
+            reg.next_sub_id += 1;
+            reg.subs.entry(b.clone()).or_default().push(BranchSub {
+                id: sub_id,
+                target,
+                cb,
+                installed: Some(installed),
+            });
+            sub_id
+        });
+        let weak = Arc::downgrade(&self.inner);
+        let branch = b.clone();
+        Ok(BranchSubscription {
+            remove: Some(Box::new(move || {
+                if let Some(inner) = weak.upgrade() {
+                    MultiHeadDoc { inner }.with_reg(|_, reg| {
+                        if let Some(v) = reg.subs.get_mut(&branch) {
+                            v.retain(|s| s.id != sub_id);
+                        }
+                    });
+                }
+            })),
+        })
     }
 
     /// Create branch `new` bound to wherever `from` currently resolves: the
@@ -1132,6 +1214,31 @@ impl BranchingDocHead {
     }
 }
 
+/// Handle for a registry-owned branch subscription (from `Branch::subscribe` /
+/// `subscribe_root`). Unlike a raw `Subscription` on one head, this one follows
+/// the branch across rebinds (copy-on-divergence / merge). Dropping it removes
+/// the subscription from the registry (and unsubscribes its current head
+/// handle).
+#[allow(missing_debug_implementations)]
+pub struct BranchSubscription {
+    remove: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl BranchSubscription {
+    /// Stop the subscription immediately (same as dropping it).
+    pub fn unsubscribe(self) {
+        drop(self)
+    }
+}
+
+impl Drop for BranchSubscription {
+    fn drop(&mut self) {
+        if let Some(f) = self.remove.take() {
+            f();
+        }
+    }
+}
+
 /// A branch handle: a NAME plus its `MultiHeadDoc`. Every operation re-resolves
 /// the branch's head at call time. This is the frozen consumer contract: no
 /// public signature here names `LoroDoc` except `fork` (the escape hatch).
@@ -1174,15 +1281,13 @@ impl<P: HeadPolicy> Branch<'_, P> {
     /// > subscription on the new head across a copy-on-divergence / merge rebind
     /// > (registry-owned `subs`, proposal L183/L411) is the Phase-3 BODY; this
     /// > unit freezes the signature and installs on the current head.
-    pub fn subscribe(&self, cid: &ContainerID, cb: Subscriber) -> LoroResult<Subscription> {
-        let (_, head) = self.doc.resolve(&self.name, Intent::Read)?;
-        Ok(head.subscribe(cid, cb))
+    pub fn subscribe(&self, cid: &ContainerID, cb: Subscriber) -> LoroResult<BranchSubscription> {
+        self.doc.subscribe_branch(&self.name, Some(cid.clone()), cb)
     }
 
     /// Branch-scoped root subscription (see `subscribe`).
-    pub fn subscribe_root(&self, cb: Subscriber) -> LoroResult<Subscription> {
-        let (_, head) = self.doc.resolve(&self.name, Intent::Read)?;
-        Ok(head.subscribe_root(cb))
+    pub fn subscribe_root(&self, cb: Subscriber) -> LoroResult<BranchSubscription> {
+        self.doc.subscribe_branch(&self.name, None, cb)
     }
 
     /// The gated escape hatch: EJECT a standalone `LoroDoc` (independent op log,
@@ -1466,6 +1571,13 @@ impl MultiHeadDoc<SelfRooted> {
         self.unbind(name);
         self.policy().lineage(self).lock().remove(name);
     }
+
+    /// The registry HeadId of branch `b`'s (self-rooted) index head, resolving
+    /// it from lineage if not yet bound. (`Head` itself is registry-internal, so
+    /// this hands back the id rather than the proposal's `Arc<Head>`.)
+    pub fn head_of(&self, b: &BranchId) -> LoroResult<HeadId> {
+        Ok(self.resolve(b, Intent::Read)?.0)
+    }
 }
 
 // ======================================================================
@@ -1567,6 +1679,28 @@ impl MultiHeadDoc<Delegated> {
     pub fn advance(&self, b: &BranchId, to: &Frontiers) -> LoroResult<()> {
         self.index().record_frontier(b, self.doc_id(), to)?;
         let _ = self.resolve(b, Intent::Read)?;
+        Ok(())
+    }
+
+    /// Create branch `name` as a WRITABLE fork of THIS doc at a chosen historical
+    /// frontier `at` (the `forkAt`-shaped affordance). The branch is registered
+    /// in the index (off genesis if new) and `at` is recorded as its content
+    /// frontier for this doc, overriding the inherited record; it is cold until
+    /// first access, when it materializes to `at` as a live writable head.
+    ///
+    /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): this is the RFP's
+    /// use-case 3 ("branch off a past version to start work" = a writable NEW
+    /// branch), NOT a read-only history VIEW (RFP use-cases 1/2). Since the
+    /// materialized fork is a live writable head (iter-1 unify), no read-only
+    /// detached-owned head is produced here -- so the `attach`/`checkout_to_latest`
+    /// no-op gates (N2) stay DEFENSE-IN-DEPTH, unexercised, until the separate
+    /// read-only-history-view affordance lands.
+    pub fn create_branch_at(&self, name: &BranchId, at: &Frontiers) -> LoroResult<()> {
+        if !self.index().branches().contains(name) {
+            self.index()
+                .create_index_branch(name, &GENESIS_BRANCH.into())?;
+        }
+        self.index().record_frontier(name, self.doc_id(), at)?;
         Ok(())
     }
 
@@ -2991,5 +3125,78 @@ mod tests {
             "base",
             "main unaffected by the delete"
         );
+    }
+
+    #[test]
+    fn create_branch_at_writable_fork_at_historical_frontier() {
+        let repo = BranchingDocRepo::open().unwrap();
+        let doc = repo.open_doc("G".into());
+        // main: "A" then "AB"; capture the frontier after "A".
+        doc.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "A").unwrap())
+            .unwrap();
+        let at_a = doc.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+        doc.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(1, "B").unwrap())
+            .unwrap();
+
+        // Fork a new branch at the historical "A" frontier.
+        doc.create_branch_at(&b("hist"), &at_a).unwrap();
+        assert!(repo.branches().contains(&b("hist")));
+        // hist materializes to the CHOSEN frontier ("A"), not main's current "AB".
+        assert_eq!(
+            doc.branch("hist")
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "A"
+        );
+        // head_of resolves hist's index head to a valid id.
+        assert!(repo.index().head_of(&b("hist")).is_ok());
+        // It is a WRITABLE fork (RFP use-case 3): a write succeeds and diverges.
+        doc.branch("hist")
+            .write(|h| h.get_text("t").insert_unicode(1, "X").unwrap())
+            .unwrap();
+        assert_eq!(
+            doc.branch("hist")
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "AX"
+        );
+        // main is unaffected.
+        assert_eq!(
+            doc.branch(GENESIS_BRANCH)
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "AB"
+        );
+    }
+
+    #[test]
+    fn subscribe_survives_rebind() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let md = MultiHeadDoc::new(Manual::new());
+        md.bind(&b("main"), 0);
+        md.bind(&b("feat"), 0); // root shared, refs 2
+
+        // Subscribe on feat BEFORE it diverges (installed on the shared root).
+        let count = Arc::new(AtomicUsize::new(0));
+        let c2 = count.clone();
+        let sub = md
+            .branch("feat")
+            .subscribe_root(Arc::new(move |_ev: crate::event::DiffEvent| {
+                c2.fetch_add(1, SeqCst);
+            }))
+            .unwrap();
+
+        // feat writes -> copy-on-divergence -> feat rebinds to a NEW head. The
+        // subscription must re-install on the new head and fire for this write.
+        md.branch("feat")
+            .write(|h| h.get_text("t").insert_unicode(0, "F").unwrap())
+            .unwrap();
+        assert!(
+            count.load(SeqCst) >= 1,
+            "subscription fired on feat's new head after copy-on-divergence rebind"
+        );
+        drop(sub);
     }
 }
