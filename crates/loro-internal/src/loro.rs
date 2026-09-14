@@ -640,6 +640,13 @@ impl LoroDoc {
 
     #[inline(always)]
     pub fn detach(&self) {
+        // Part of the deferred checkout/attach/detach trio: prevented on a
+        // registry-owned head (a branch has no free-standing detach; the
+        // registry owns head attachment). No-op with an observable warning.
+        if self.is_owned() {
+            warn!("detach() ignored on a registry-owned head (deferred to the branching RFP)");
+            return;
+        }
         self.with_barrier(|| self.set_detached(true));
     }
 
@@ -1735,12 +1742,17 @@ impl LoroDoc {
         // branch's tip, not this head's, so attaching an owned head would apply
         // a diff from the wrong base and corrupt it (the sink guard does NOT
         // fire here because an owned head is Private). An owned head advances
-        // only through its registry (`Branch::checkout` / `advance`); this is
+        // only through its registry (internal `advance_in_place`); this is
         // the runtime backstop for the `ContainerTrait::doc()` re-entry path
         // (`BranchingDocHead` omits `attach`/`checkout_to_latest` at the type
         // level). No-op rather than error to keep the `()` signature the
-        // `loro`/wasm wrappers depend on (see the unit report).
+        // `loro`/wasm wrappers depend on (see the unit report). Part of the
+        // deferred checkout/attach/checkout_to_latest trio.
         if self.is_owned() {
+            warn!(
+                "attach()/checkout_to_latest() ignored on a registry-owned head \
+                 (deferred to the branching RFP)"
+            );
             return;
         }
         let (options, _guard) = self.implicit_commit_then_stop();
@@ -1816,6 +1828,15 @@ impl LoroDoc {
     /// This will make the current [DocState] detached from the latest version of [OpLog].
     /// Any further import will not be reflected on the [DocState], until user call [LoroDoc::attach()]
     pub fn checkout(&self, frontiers: &Frontiers) -> LoroResult<()> {
+        // Gate the raw `doc()`-seam: an external checkout of a registry-owned
+        // head would move its state WITHOUT re-keying the registry's `tip` /
+        // `by_tip`, desyncing it (a sibling bound to the head would then read
+        // the wrong state). The registry's OWN advance runs inside a registry op
+        // (`in_registry_op`) and is allowed. `Branch::checkout` is deferred to an
+        // RFP and not exposed, so this only fires on the raw-seam re-entry.
+        if self.is_owned() && !crate::multi_head::in_registry_op() {
+            return Err(LoroError::OwnedHeadOp("checkout"));
+        }
         let was_detached = self.is_detached();
         let (options, guard) = self.implicit_commit_then_stop();
         let result = self._checkout_without_emitting(frontiers, true, true);

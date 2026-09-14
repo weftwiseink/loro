@@ -134,7 +134,7 @@ thread_local! {
     static REG_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-fn in_registry_op() -> bool {
+pub(crate) fn in_registry_op() -> bool {
     REG_DEPTH.with(|c| c.get() > 0)
 }
 
@@ -622,6 +622,20 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         if old_tip == *target {
             return Ok(());
         }
+        // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `checkout` leaves
+        // the head's `detached` flag set (its state != the shared union). This
+        // is INTENTIONAL for the currently-exercised paths, verified by probe:
+        //   - copy-on-divergence heads (the WRITABLE path) come from
+        //     `fork_in_group` in `copy_head`, NOT from here, and are attached
+        //     (detached == false) and writable (a second write succeeds);
+        //   - heads reached via `advance_in_place` (`materialize`, ingest) are
+        //     the read-only secondary path, and nothing currently WRITES to them.
+        // So no currently-exercised writable path is stuck read-only, and we do
+        // NOT clear `detached` here. A future WRITABLE advance/checkout contract
+        // (where a branch writes after advancing to a branch-local target) is
+        // Phase-3-body / RFP scope; it would clear `detached` via a
+        // registry-side `set_detached(false)` AFTER landing the branch-local
+        // target. Adding that now would be a speculative, untested change.
         h.doc.checkout(target)?;
         let new_tip = h.doc.state_frontiers();
         h.tip = new_tip.clone();
@@ -955,6 +969,25 @@ impl BranchingDocHead {
     pub fn get_counter<I: IntoContainerId>(&self, id: I) -> CounterHandler {
         self.0.get_counter(id)
     }
+    pub fn try_get_text<I: IntoContainerId>(&self, id: I) -> Option<TextHandler> {
+        self.0.try_get_text(id)
+    }
+    pub fn try_get_map<I: IntoContainerId>(&self, id: I) -> Option<MapHandler> {
+        self.0.try_get_map(id)
+    }
+    pub fn try_get_list<I: IntoContainerId>(&self, id: I) -> Option<ListHandler> {
+        self.0.try_get_list(id)
+    }
+    pub fn try_get_movable_list<I: IntoContainerId>(&self, id: I) -> Option<MovableListHandler> {
+        self.0.try_get_movable_list(id)
+    }
+    pub fn try_get_tree<I: IntoContainerId>(&self, id: I) -> Option<TreeHandler> {
+        self.0.try_get_tree(id)
+    }
+    #[cfg(feature = "counter")]
+    pub fn try_get_counter<I: IntoContainerId>(&self, id: I) -> Option<CounterHandler> {
+        self.0.try_get_counter(id)
+    }
     pub fn get_by_path(&self, path: &[Index]) -> Option<ValueOrHandler> {
         self.0.get_by_path(path)
     }
@@ -1062,14 +1095,15 @@ impl<P: HeadPolicy> Branch<'_, P> {
             .write(&self.name, |d| f(&BranchingDocHead::from_head(d.clone())))
     }
 
-    /// Read-only time travel: a Write-intent resolve (copies if shared) then a
-    /// checkout that re-keys `Head.tip` / `by_tip`. A registry op, NOT a
-    /// `BranchingDocHead` method (a raw checkout would desync the registry).
-    pub fn checkout(&self, frontiers: &Frontiers) -> LoroResult<()> {
-        let (id, _) = self.doc.resolve(&self.name, Intent::Write)?;
-        self.doc
-            .with_reg(|this, reg| this.advance_in_place(reg, id, frontiers))
-    }
+    // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `Branch::checkout`
+    // (and `attach`/`checkout_to_latest`) are DEFERRED to an RFP and NOT exposed
+    // here. They are a bundled "move the head, then reset from the oplog" surface
+    // that does not map to branch scope: a branch has no single "latest", and
+    // loro's `attach` snaps to the shared UNION, which corrupts an owned head.
+    // The whole trio is prevented for now (the raw `LoroDoc` seam gates them);
+    // the writable-after-checkout contract is the RFP's to define, so there is
+    // nothing to freeze on `Branch`. `fork` / `fork_at` (eject) stay as the
+    // history-adjacent affordance we keep.
 
     /// Branch-scoped container subscription. A registry op: installed on the
     /// branch's current head.
@@ -1092,9 +1126,17 @@ impl<P: HeadPolicy> Branch<'_, P> {
     /// The gated escape hatch: EJECT a standalone `LoroDoc` (independent op log,
     /// full surface) that aliases no registry head. This is the only `Branch`
     /// signature that names `LoroDoc`.
+    ///
+    /// Ejects via `fork_at(&head.state_frontiers())`, NOT `LoroDoc::fork()`:
+    /// `fork()` assumes `!is_detached()` implies `state == oplog.frontiers()`,
+    /// but a registry head is behind the shared union while attached, so `fork()`
+    /// would label the ejected snapshot with the union frontier while its state
+    /// is only this head's -- an incoherent doc that panics on first `checkout`
+    /// (`richtext_state.rs`). `fork_at` snapshots AT the head's own frontier, so
+    /// the ejected doc's state matches its frontier label and is checkout-able.
     pub fn fork(&self) -> LoroResult<LoroDoc> {
         let (_, head) = self.doc.resolve(&self.name, Intent::Read)?;
-        Ok(head.fork())
+        head.fork_at(&head.state_frontiers())
     }
 }
 
@@ -1375,6 +1417,7 @@ impl HeadPolicy for Manual {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::HandlerTrait;
     use crate::lock::{LockKind, LoroLockGroup};
     use loro_common::LoroError;
     use std::sync::{Arc, Mutex};
@@ -1561,10 +1604,13 @@ mod tests {
             matches!(r_op, Err(LoroError::HeadShared)),
             "leaked local op after flip refused, got {r_op:?}"
         );
+        // A leaked raw checkout is now refused earlier, by the owned-head
+        // checkout gate (before it can reach the apply_diff sink), so the error
+        // is `OwnedHeadOp` rather than `HeadShared`. Either way: refused.
         let r_checkout = leaked.checkout(&Frontiers::default());
         assert!(
-            matches!(r_checkout, Err(LoroError::HeadShared)),
-            "leaked checkout (apply_diff) after flip refused, got {r_checkout:?}"
+            matches!(r_checkout, Err(LoroError::OwnedHeadOp("checkout"))),
+            "leaked checkout after flip refused, got {r_checkout:?}"
         );
         // The co-owner still reads only the pre-flip content ("A", len 1).
         // (`bind` is a low-level entry that does not update the Manual target,
@@ -1790,12 +1836,13 @@ mod tests {
         );
 
         // A direct checkout of the shared head to the imported frontier would be
-        // a materialization; the sink guard refuses it.
+        // a materialization; the owned-head checkout gate refuses it (before the
+        // apply_diff sink guard would).
         let shared = md.head_doc(0).unwrap();
         let r = shared.checkout(&f);
         assert!(
-            matches!(r, Err(LoroError::HeadShared)),
-            "checkout (apply_diff) on a shared head refused, got {r:?}"
+            matches!(r, Err(LoroError::OwnedHeadOp("checkout"))),
+            "checkout on a shared owned head refused, got {r:?}"
         );
         assert_eq!(
             tlen(&md, &main),
@@ -2196,45 +2243,70 @@ mod tests {
     }
 
     #[test]
-    fn e1_site_a_attach_refused_on_owned_head() {
-        // A sibling diverges (so `oplog.frontiers()` is a union that includes
-        // feat's ops), main writes, then main's owned head time-travels
-        // (detaches) to the empty frontier. `attach`/`checkout_to_latest` on a
-        // DETACHED head would move it to the shared union -- pulling in feat's
-        // ops (E1 site A). The gate refuses it on an owned head.
+    fn e1_raw_checkout_seam_refused_on_owned_head() {
+        // The `doc()` re-entry seam: `head.get_text("t").doc()` hands back the
+        // raw owned `LoroDoc`. A raw `checkout` on it would move the head's state
+        // WITHOUT re-keying the registry, desyncing `tip`/`by_tip` (a sibling
+        // bound to the head would read the moved-away state while the registry
+        // still says the head's tip). The gate refuses it.
         let md = MultiHeadDoc::new(Manual::new());
         md.bind(&b("main"), 0);
-        md.bind(&b("feat"), 0); // shared
-        md.write(&b("feat"), |d| {
-            d.get_text("t").insert_unicode(0, "F").unwrap()
-        })
-        .unwrap(); // feat -> own head; main keeps root
         md.write(&b("main"), |d| {
             d.get_text("t").insert_unicode(0, "M").unwrap()
         })
         .unwrap();
 
-        let head = md.head_doc(0).unwrap(); // main's owned, private head
-        head.checkout(&Frontiers::default()).unwrap(); // detach to the empty state
-        assert!(head.is_detached());
-        assert_eq!(
-            head.get_text("t").to_string(),
-            "",
-            "detached at empty state"
+        // Drive the raw seam from inside a read closure.
+        let r: LoroResult<()> = md
+            .branch("main")
+            .read(|head| {
+                let raw = head.get_text("t").doc().expect("handler has a doc");
+                raw.checkout(&Frontiers::default())
+            })
+            .unwrap();
+        assert!(
+            matches!(r, Err(LoroError::OwnedHeadOp("checkout"))),
+            "raw checkout on an owned head refused, got {r:?}"
         );
+        // The registry is NOT desynced: main still reads its own state.
+        assert_eq!(
+            md.branch("main")
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "M",
+            "the head was not moved out from under the registry"
+        );
+    }
 
-        // E1 site A gate: attach is refused (no-op) on the owned head, so it is
-        // NOT re-attached to the union and does NOT absorb feat's op.
-        head.attach();
+    #[test]
+    fn e1_attach_noop_on_owned_detached_head() {
+        // A materialized head (built via the internal advance/checkout path) is
+        // DETACHED and read-only. `attach`/`checkout_to_latest` on it would move
+        // it to the shared union; the gate refuses (no-op) on an owned head.
+        let md = MultiHeadDoc::new(Manual::new());
+        md.bind(&b("main"), 0);
+        md.write(&b("main"), |d| {
+            d.get_text("t").insert_unicode(0, "M").unwrap()
+        })
+        .unwrap(); // root advances to a non-empty union
+
+        // `reader` targets the empty frontier -> materialize (copy root, then an
+        // internal checkout to empty) -> a detached, owned head.
+        md.policy().set_target(&b("reader"), Frontiers::default());
+        let (rid, _) = md.resolve(&b("reader"), Intent::Read).unwrap();
+        assert_ne!(rid, 0);
+        let head = md.head_doc(rid).unwrap();
         assert!(
             head.is_detached(),
-            "attach refused on owned head (still detached)"
+            "materialized head is detached (read-only)"
         );
-        assert_eq!(
-            head.get_text("t").to_string(),
-            "",
-            "the head was not moved to the shared union"
-        );
+        assert_eq!(head.get_text("t").to_string(), "", "at the empty state");
+
+        // The E1 site A gate: attach is a no-op on the owned head; it is NOT
+        // re-attached to the union and does not absorb main's op.
+        head.attach();
+        assert!(head.is_detached(), "attach refused (no-op) on owned head");
+        assert_eq!(head.get_text("t").to_string(), "", "not moved to the union");
     }
 
     #[test]
@@ -2283,6 +2355,44 @@ mod tests {
         assert_ne!(
             to, union,
             "new_version is NOT the shared union (feat excluded)"
+        );
+    }
+
+    #[test]
+    fn branch_fork_ejects_coherent_checkout_able_doc() {
+        // main's head is behind the shared union (feat diverged), yet still
+        // "attached" (detached flag false). `Branch::fork` must eject via
+        // `fork_at(&state_frontiers())` so the ejected snapshot's state matches
+        // its own frontier label -- not `LoroDoc::fork()`, which would label
+        // main's content with the union frontier (incoherent -> panics on
+        // checkout).
+        let md = MultiHeadDoc::new(Manual::new());
+        md.bind(&b("main"), 0);
+        md.bind(&b("feat"), 0); // shared
+        md.write(&b("feat"), |d| {
+            d.get_text("t").insert_unicode(0, "F").unwrap()
+        })
+        .unwrap(); // feat diverges; union advances
+        md.write(&b("main"), |d| {
+            d.get_text("t").insert_unicode(0, "M").unwrap()
+        })
+        .unwrap(); // main behind the union
+
+        let forked = md.branch("main").fork().unwrap();
+        assert_eq!(forked.get_text("t").to_string(), "M");
+        // The ejected doc is coherent and checkout-able (would panic if the
+        // state/frontier label were mismatched).
+        let f = forked.state_frontiers();
+        forked.checkout(&Frontiers::default()).unwrap();
+        assert_eq!(forked.get_text("t").to_string(), "");
+        forked.checkout(&f).unwrap();
+        assert_eq!(forked.get_text("t").to_string(), "M");
+        // It aliases no registry head: main is untouched.
+        assert_eq!(
+            md.branch("main")
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "M"
         );
     }
 }
