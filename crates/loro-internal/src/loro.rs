@@ -1730,6 +1730,19 @@ impl LoroDoc {
     }
 
     pub fn checkout_to_latest(&self) {
+        // E1 site A gate: a registry-owned head must never be moved to the
+        // shared union frontier. `oplog.frontiers()` is the union of every
+        // branch's tip, not this head's, so attaching an owned head would apply
+        // a diff from the wrong base and corrupt it (the sink guard does NOT
+        // fire here because an owned head is Private). An owned head advances
+        // only through its registry (`Branch::checkout` / `advance`); this is
+        // the runtime backstop for the `ContainerTrait::doc()` re-entry path
+        // (`BranchingDocHead` omits `attach`/`checkout_to_latest` at the type
+        // level). No-op rather than error to keep the `()` signature the
+        // `loro`/wasm wrappers depend on (see the unit report).
+        if self.is_owned() {
+            return;
+        }
         let (options, _guard) = self.implicit_commit_then_stop();
         if !self.is_detached() {
             drop(_guard);

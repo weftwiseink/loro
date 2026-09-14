@@ -31,6 +31,7 @@
 //! never materializing into a live head.
 
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -38,19 +39,32 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::arena::SharedArena;
+use crate::change::Timestamp;
 use crate::configure::Configure;
+use crate::container::IntoContainerId;
 use crate::encoding::{ExportMode, ImportStatus};
+use crate::event::Index;
+#[cfg(feature = "counter")]
+use crate::handler::counter::CounterHandler;
+use crate::handler::{
+    ListHandler, MapHandler, MovableListHandler, TextHandler, TreeHandler, ValueOrHandler,
+};
 use crate::lock::{LockKind, LoroLockGroup, LoroMutex};
+use crate::loro::CommitOptions;
 use crate::oplog::OpLog;
-use crate::pre_commit::{FirstCommitFromPeerCallback, FirstCommitFromPeerPayload};
+use crate::pre_commit::{
+    FirstCommitFromPeerCallback, FirstCommitFromPeerPayload, PreCommitCallback,
+};
 use crate::state::DocState;
+use crate::subscription::Subscriber;
 use crate::sync::{AtomicU64, AtomicU8, AtomicUsize};
+use crate::undo::DiffBatch;
 use crate::utils::subscription::{SubscriberSetWithQueue, Subscription};
-use crate::version::{shrink_frontiers, Frontiers};
+use crate::version::{shrink_frontiers, Frontiers, VersionVector};
 use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
 use loro_common::{
-    ContainerID, Counter, IdSpan, InternalString, LoroEncodeError, LoroError, LoroResult, PeerID,
-    ID,
+    ContainerID, Counter, IdSpan, InternalString, LoroEncodeError, LoroError, LoroResult,
+    LoroValue, PeerID, ID,
 };
 
 pub type BranchId = InternalString;
@@ -546,6 +560,10 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
 
     /// Resolve branch `b` to the head it should use, copying-and-rebinding when
     /// a `Write` reaches a shared head. Returns the head id and a handle.
+    ///
+    /// Low-level: hands back a raw `LoroDoc`; only the `OwnedHeadOp` gates and
+    /// the sink guard protect it. Consumers go through `Branch`.
+    #[doc(hidden)]
     pub fn resolve(&self, b: &BranchId, intent: Intent) -> LoroResult<(HeadId, LoroDoc)> {
         self.with_reg(|this, reg| {
             let target = this.inner.policy.target(this, b)?;
@@ -632,16 +650,35 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     // --- read / write ------------------------------------------------------
 
     /// Resolve `b` for read (never copies) and run `f` on the resolved head. A
-    /// mutation inside `f` on a shared head errors from the sink.
+    /// mutation inside `f` on a shared head errors from the sink; on a Private
+    /// head it is a normal local edit, COMMITTED on exit (proposal L375). The
+    /// exit-commit makes the retire-time "no pending ops" assertion a true
+    /// invariant: no uncommitted op survives to a `retire`.
+    ///
+    /// Low-level: hands back a raw `LoroDoc`. The consumer surface is
+    /// `Branch::read`, which wraps this and hands a `BranchingDocHead`.
+    #[doc(hidden)]
     pub fn read<R>(&self, b: &BranchId, f: impl FnOnce(&LoroDoc) -> R) -> LoroResult<R> {
         let (_, doc) = self.resolve(b, Intent::Read)?;
-        Ok(f(&doc))
+        let r = f(&doc);
+        // Commit-on-exit: a mutation inside a read closure on a Private head is
+        // committed as a normal local edit (the injected on-commit hook re-keys
+        // `by_tip`). A Shared head refused the op at the sink, so nothing is
+        // pending there.
+        if doc.get_pending_txn_len() > 0 {
+            doc.commit_then_renew();
+        }
+        Ok(r)
     }
 
     /// Resolve `b` for write (copies if shared, handing back a `Private` head),
     /// run `f`, then commit. The commit fires the injected on-commit hook
     /// (`on_head_committed`), which re-keys `by_tip` and notifies the policy;
     /// there is no synchronous re-keying here.
+    ///
+    /// Low-level: hands back a raw `LoroDoc`. The consumer surface is
+    /// `Branch::write`.
+    #[doc(hidden)]
     pub fn write<R>(&self, b: &BranchId, f: impl FnOnce(&LoroDoc) -> R) -> LoroResult<R> {
         let (_, doc) = self.resolve(b, Intent::Write)?;
         let r = f(&doc);
@@ -788,6 +825,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         self.reg.lock().heads.len()
     }
 
+    /// Low-level: a raw `LoroDoc` head handle (test / diagnostics; models a
+    /// handle "leaked" out of a closure). Consumers go through `Branch`.
+    #[doc(hidden)]
     pub fn head_doc(&self, id: HeadId) -> Option<LoroDoc> {
         self.reg.lock().heads.get(&id).map(|h| h.doc.clone())
     }
@@ -818,6 +858,243 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             .get(b)
             .and_then(|id| reg.heads.get(id))
             .map(|h| h.doc.is_head_shared())
+    }
+
+    /// A handle to branch `name`: a NAME, resolved per operation. This is the
+    /// consumer surface; every op re-resolves because the head a branch uses
+    /// can change underneath the handle (a copy, a rebind).
+    pub fn branch(&self, name: impl Into<BranchId>) -> Branch<'_, P> {
+        Branch {
+            doc: self,
+            name: name.into(),
+        }
+    }
+}
+
+// ======================================================================
+// The consumer surface: BranchingDocHead + Branch.
+// ======================================================================
+
+/// The head-safe, branch-facing surface handed to a `Branch::read` / `write`
+/// closure: a pass-through newtype over a resolved head's `LoroDoc` exposing
+/// ONLY the methods that read or write THIS head's materialized state or
+/// transaction and leave the registry's view consistent.
+///
+/// It deliberately has NO `Deref`, NO `From`/inner accessor, and does NOT
+/// forward the history / attachment / identity ops (`import*`, `export*`,
+/// `checkout`, `attach`, `checkout_to_latest`, `detach`, `oplog_*`, `fork`,
+/// `set_peer_id`, `diff`, config setters, ...). Those touch the shared op log or
+/// the head's attachment and are incoherent on a registry head, so they are
+/// ABSENT AT THE TYPE LEVEL: `head.import(..)` / `head.checkout(..)` /
+/// `head.attach()` do not compile. `subscribe*` and `checkout` are head-safe but
+/// NOT branch-correct (they must re-key/re-install on rebind) and so live on
+/// `Branch`, not here.
+///
+/// > NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): This is the RUST
+/// > overlay over `loro_internal::LoroDoc`. The API-shape report recommends a
+/// > sibling `loro`-crate `BranchingDocHead(loro::LoroDoc)` with the wasm class
+/// > + `.d.ts` `Equals<Omit<LoroDoc, HistoryKeys>>` drift check; that public
+/// > mirror is a Phase-4 artifact and can wrap or forward to this one. Placement
+/// > here is what lets `Branch::read`/`write` be generic over
+/// > `MultiHeadDoc<P>` and tested now against `Manual`/`SelfRooted`.
+///
+/// A head-safe method is present and works:
+///
+/// ```
+/// use loro_internal::multi_head::{Manual, MultiHeadDoc};
+/// let md = MultiHeadDoc::new(Manual::new());
+/// md.bind(&"main".into(), md.root_head_id());
+/// let text = md
+///     .branch("main")
+///     .write(|head| {
+///         head.get_text("t").insert_unicode(0, "hi").unwrap();
+///         head.get_text("t").to_string()
+///     })
+///     .unwrap();
+/// assert_eq!(text, "hi");
+/// ```
+///
+/// A history / attachment op is ABSENT at the type level (does not compile):
+///
+/// ```compile_fail
+/// use loro_internal::multi_head::{Manual, MultiHeadDoc};
+/// let md = MultiHeadDoc::new(Manual::new());
+/// md.bind(&"main".into(), md.root_head_id());
+/// md.branch("main")
+///     .read(|head| {
+///         // no method `import` / `checkout` / `attach` on BranchingDocHead
+///         head.import(&[]).unwrap();
+///     })
+///     .unwrap();
+/// ```
+#[allow(missing_debug_implementations)]
+pub struct BranchingDocHead(LoroDoc);
+
+impl BranchingDocHead {
+    pub(crate) fn from_head(doc: LoroDoc) -> Self {
+        Self(doc)
+    }
+
+    // --- container access ---
+    pub fn get_text<I: IntoContainerId>(&self, id: I) -> TextHandler {
+        self.0.get_text(id)
+    }
+    pub fn get_map<I: IntoContainerId>(&self, id: I) -> MapHandler {
+        self.0.get_map(id)
+    }
+    pub fn get_list<I: IntoContainerId>(&self, id: I) -> ListHandler {
+        self.0.get_list(id)
+    }
+    pub fn get_movable_list<I: IntoContainerId>(&self, id: I) -> MovableListHandler {
+        self.0.get_movable_list(id)
+    }
+    pub fn get_tree<I: IntoContainerId>(&self, id: I) -> TreeHandler {
+        self.0.get_tree(id)
+    }
+    #[cfg(feature = "counter")]
+    pub fn get_counter<I: IntoContainerId>(&self, id: I) -> CounterHandler {
+        self.0.get_counter(id)
+    }
+    pub fn get_by_path(&self, path: &[Index]) -> Option<ValueOrHandler> {
+        self.0.get_by_path(path)
+    }
+    pub fn get_by_str_path(&self, path: &str) -> Option<ValueOrHandler> {
+        self.0.get_by_str_path(path)
+    }
+    pub fn has_container(&self, id: &ContainerID) -> bool {
+        self.0.has_container(id)
+    }
+
+    // --- state reads ---
+    pub fn get_value(&self) -> LoroValue {
+        self.0.get_value()
+    }
+    pub fn get_deep_value(&self) -> LoroValue {
+        self.0.get_deep_value()
+    }
+    pub fn get_deep_value_with_id(&self) -> LoroValue {
+        self.0.get_deep_value_with_id()
+    }
+    pub fn state_frontiers(&self) -> Frontiers {
+        self.0.state_frontiers()
+    }
+    pub fn state_vv(&self) -> VersionVector {
+        self.0.state_vv()
+    }
+    pub fn cmp_with_frontiers(&self, other: &Frontiers) -> Ordering {
+        self.0.cmp_with_frontiers(other)
+    }
+    pub fn get_path_to_container(&self, id: &ContainerID) -> Option<Vec<(ContainerID, Index)>> {
+        self.0.get_path_to_container(id)
+    }
+    pub fn get_pending_txn_len(&self) -> usize {
+        self.0.get_pending_txn_len()
+    }
+    pub fn peer_id(&self) -> PeerID {
+        self.0.peer_id()
+    }
+    pub fn len_ops(&self) -> usize {
+        self.0.len_ops()
+    }
+    pub fn len_changes(&self) -> usize {
+        self.0.len_changes()
+    }
+
+    // --- local write ---
+    /// Commit this head's pending transaction and start the next (the head-safe
+    /// commit; `commit_with`'s internal form leaks a lock guard and is omitted).
+    pub fn commit(&self) -> Option<CommitOptions> {
+        self.0.commit_then_renew()
+    }
+    pub fn set_next_commit_message(&self, message: &str) {
+        self.0.set_next_commit_message(message)
+    }
+    pub fn set_next_commit_origin(&self, origin: &str) {
+        self.0.set_next_commit_origin(origin)
+    }
+    pub fn set_next_commit_timestamp(&self, timestamp: Timestamp) {
+        self.0.set_next_commit_timestamp(timestamp)
+    }
+    pub fn set_next_commit_options(&self, options: CommitOptions) {
+        self.0.set_next_commit_options(options)
+    }
+    pub fn clear_next_commit_options(&self) {
+        self.0.clear_next_commit_options()
+    }
+    pub fn apply_diff(&self, diff: DiffBatch) -> LoroResult<()> {
+        self.0.apply_diff(diff)
+    }
+    pub fn revert_to(&self, target: &Frontiers) -> LoroResult<()> {
+        self.0.revert_to(target)
+    }
+
+    // --- per-head hooks ---
+    pub fn subscribe_pre_commit(&self, callback: PreCommitCallback) -> Subscription {
+        self.0.subscribe_pre_commit(callback)
+    }
+    pub fn free_diff_calculator(&self) {
+        self.0.free_diff_calculator()
+    }
+}
+
+/// A branch handle: a NAME plus its `MultiHeadDoc`. Every operation re-resolves
+/// the branch's head at call time. This is the frozen consumer contract: no
+/// public signature here names `LoroDoc` except `fork` (the escape hatch).
+#[allow(missing_debug_implementations)]
+pub struct Branch<'a, P: HeadPolicy> {
+    doc: &'a MultiHeadDoc<P>,
+    name: BranchId,
+}
+
+impl<P: HeadPolicy> Branch<'_, P> {
+    /// Resolve the branch's head for read and run `f` on its `BranchingDocHead`.
+    /// A mutation inside `f` on a Private head is committed on exit (see
+    /// `MultiHeadDoc::read`); on a shared head it errors at the sink.
+    pub fn read<R>(&self, f: impl FnOnce(&BranchingDocHead) -> R) -> LoroResult<R> {
+        self.doc
+            .read(&self.name, |d| f(&BranchingDocHead::from_head(d.clone())))
+    }
+
+    /// Resolve the branch's head for write (copy-on-divergence if shared), run
+    /// `f`, then commit.
+    pub fn write<R>(&self, f: impl FnOnce(&BranchingDocHead) -> R) -> LoroResult<R> {
+        self.doc
+            .write(&self.name, |d| f(&BranchingDocHead::from_head(d.clone())))
+    }
+
+    /// Read-only time travel: a Write-intent resolve (copies if shared) then a
+    /// checkout that re-keys `Head.tip` / `by_tip`. A registry op, NOT a
+    /// `BranchingDocHead` method (a raw checkout would desync the registry).
+    pub fn checkout(&self, frontiers: &Frontiers) -> LoroResult<()> {
+        let (id, _) = self.doc.resolve(&self.name, Intent::Write)?;
+        self.doc
+            .with_reg(|this, reg| this.advance_in_place(reg, id, frontiers))
+    }
+
+    /// Branch-scoped container subscription. A registry op: installed on the
+    /// branch's current head.
+    ///
+    /// > NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): re-installing the
+    /// > subscription on the new head across a copy-on-divergence / merge rebind
+    /// > (registry-owned `subs`, proposal L183/L411) is the Phase-3 BODY; this
+    /// > unit freezes the signature and installs on the current head.
+    pub fn subscribe(&self, cid: &ContainerID, cb: Subscriber) -> LoroResult<Subscription> {
+        let (_, head) = self.doc.resolve(&self.name, Intent::Read)?;
+        Ok(head.subscribe(cid, cb))
+    }
+
+    /// Branch-scoped root subscription (see `subscribe`).
+    pub fn subscribe_root(&self, cb: Subscriber) -> LoroResult<Subscription> {
+        let (_, head) = self.doc.resolve(&self.name, Intent::Read)?;
+        Ok(head.subscribe_root(cb))
+    }
+
+    /// The gated escape hatch: EJECT a standalone `LoroDoc` (independent op log,
+    /// full surface) that aliases no registry head. This is the only `Branch`
+    /// signature that names `LoroDoc`.
+    pub fn fork(&self) -> LoroResult<LoroDoc> {
+        let (_, head) = self.doc.resolve(&self.name, Intent::Read)?;
+        Ok(head.fork())
     }
 }
 
@@ -1860,6 +2137,152 @@ mod tests {
         assert_eq!(
             a_docs, b_docs,
             "docs subtree converges to an identical value"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase-3 precondition: BranchingDocHead surface, Branch signatures,
+    // read-exit-commit, and the two E1 closures.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn branching_doc_head_surface_read_write() {
+        // read/write hand the closure a &BranchingDocHead exposing head-safe
+        // methods (container access, state reads, local write). The history /
+        // attachment methods (import/export/checkout/attach/detach/oplog_*/
+        // set_peer_id/fork/diff) are ABSENT at the type level -- see the
+        // `compile_fail` doctest on `BranchingDocHead`.
+        let md = MultiHeadDoc::new(Manual::new());
+        md.bind(&b("main"), 0);
+        let br = md.branch("main");
+        br.write(|head: &BranchingDocHead| {
+            head.get_text("t").insert_unicode(0, "hi").unwrap();
+        })
+        .unwrap();
+        let (text, deep_is_map, frontier_nonempty) = br
+            .read(|head: &BranchingDocHead| {
+                // Exercise head-safe reads (peer_id/len_ops are callable too).
+                let _ = head.peer_id();
+                let _ = head.len_ops();
+                (
+                    head.get_text("t").to_string(),
+                    head.get_deep_value().is_map(),
+                    !head.state_frontiers().is_empty(),
+                )
+            })
+            .unwrap();
+        assert_eq!(text, "hi");
+        assert!(deep_is_map, "get_deep_value returns the doc map");
+        assert!(frontier_nonempty, "state advanced after the write");
+    }
+
+    #[test]
+    fn read_exit_commits_pending_mutation() {
+        let md = MultiHeadDoc::new(Manual::new());
+        md.bind(&b("main"), 0);
+        let br = md.branch("main");
+        // A mutation inside `read` is committed as a normal local edit on exit.
+        br.read(|head| head.get_text("t").insert_unicode(0, "X").unwrap())
+            .unwrap();
+        // After the read returns nothing is left pending, and the edit persists.
+        let (pending, text) = br
+            .read(|head| (head.get_pending_txn_len(), head.get_text("t").to_string()))
+            .unwrap();
+        assert_eq!(
+            pending, 0,
+            "read committed pending ops on exit (nothing left)"
+        );
+        assert_eq!(text, "X", "the mutation persisted");
+    }
+
+    #[test]
+    fn e1_site_a_attach_refused_on_owned_head() {
+        // A sibling diverges (so `oplog.frontiers()` is a union that includes
+        // feat's ops), main writes, then main's owned head time-travels
+        // (detaches) to the empty frontier. `attach`/`checkout_to_latest` on a
+        // DETACHED head would move it to the shared union -- pulling in feat's
+        // ops (E1 site A). The gate refuses it on an owned head.
+        let md = MultiHeadDoc::new(Manual::new());
+        md.bind(&b("main"), 0);
+        md.bind(&b("feat"), 0); // shared
+        md.write(&b("feat"), |d| {
+            d.get_text("t").insert_unicode(0, "F").unwrap()
+        })
+        .unwrap(); // feat -> own head; main keeps root
+        md.write(&b("main"), |d| {
+            d.get_text("t").insert_unicode(0, "M").unwrap()
+        })
+        .unwrap();
+
+        let head = md.head_doc(0).unwrap(); // main's owned, private head
+        head.checkout(&Frontiers::default()).unwrap(); // detach to the empty state
+        assert!(head.is_detached());
+        assert_eq!(
+            head.get_text("t").to_string(),
+            "",
+            "detached at empty state"
+        );
+
+        // E1 site A gate: attach is refused (no-op) on the owned head, so it is
+        // NOT re-attached to the union and does NOT absorb feat's op.
+        head.attach();
+        assert!(
+            head.is_detached(),
+            "attach refused on owned head (still detached)"
+        );
+        assert_eq!(
+            head.get_text("t").to_string(),
+            "",
+            "the head was not moved to the shared union"
+        );
+    }
+
+    #[test]
+    fn e1_site_b_branch_scoped_new_version() {
+        let md = MultiHeadDoc::new(Manual::new());
+        md.bind(&b("main"), 0);
+        md.bind(&b("feat"), 0); // shared
+        md.write(&b("feat"), |d| {
+            d.get_text("t").insert_unicode(0, "F").unwrap()
+        })
+        .unwrap(); // feat -> own head; main keeps root
+        md.write(&b("main"), |d| {
+            d.get_text("t").insert_unicode(0, "M").unwrap()
+        })
+        .unwrap();
+
+        let captured: Arc<Mutex<Option<Frontiers>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let sub = md
+            .branch("main")
+            .subscribe_root(Arc::new(move |ev: crate::event::DiffEvent| {
+                *cap.lock().unwrap() = Some(ev.event_meta.to.clone());
+            }))
+            .unwrap();
+
+        // A sibling advances the shared union; main's subscriber must not adopt it.
+        md.write(&b("feat"), |d| {
+            d.get_text("t").insert_unicode(1, "2").unwrap()
+        })
+        .unwrap();
+        // main commits -> its subscriber fires with a BRANCH-SCOPED new_version.
+        md.write(&b("main"), |d| {
+            d.get_text("t").insert_unicode(1, "2").unwrap()
+        })
+        .unwrap();
+        drop(sub);
+
+        let to = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("main's subscriber fired");
+        let main_frontier = md.branch("main").read(|h| h.state_frontiers()).unwrap();
+        let union = md.head_doc(0).unwrap().oplog().lock().frontiers().clone();
+        assert_eq!(to, main_frontier, "new_version is main's own frontier");
+        assert_ne!(
+            to, union,
+            "new_version is NOT the shared union (feat excluded)"
         );
     }
 }

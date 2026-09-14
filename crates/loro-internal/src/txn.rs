@@ -528,7 +528,18 @@ impl Transaction {
                         })
                         .collect(),
                 ),
-                new_version: Cow::Borrowed(oplog.frontiers()),
+                // E1 site B: a registry-owned head's commit event must carry
+                // THIS head's new frontier (branch-scoped), not the shared
+                // union `oplog.frontiers()`. `last_id` is this head's last
+                // committed op, so `Frontiers::from_id(last_id)` is the branch's
+                // frontier. A branch-scoped subscriber (`Branch::subscribe`)
+                // would otherwise see a `to` version polluted by other branches'
+                // concurrent ops. Unbranched docs keep the union (unchanged).
+                new_version: if doc.is_owned() {
+                    Cow::Owned(Frontiers::from_id(last_id))
+                } else {
+                    Cow::Borrowed(oplog.frontiers())
+                },
             }),
         );
         drop(state);
