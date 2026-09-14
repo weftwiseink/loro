@@ -2480,6 +2480,221 @@ impl LoroDoc {
     }
 }
 
+/// A materialized, head-safe view of a branching document's head.
+///
+/// `BranchingDocHead` exposes only the head-safe subset of `LoroDoc`: reads of the
+/// current state, forward local edits, and commits. The history-bearing surface
+/// (`import*`, `export*`, `checkout`, `detach`/`attach`, `fork`, oplog/version-travel,
+/// and doc-wide config) is intentionally absent, because a head is a shared, live
+/// materialization owned by the branching engine.
+///
+/// The head-safe/history partition is drift-guarded at compile time in `index.ts`
+/// (`Equals<keyof Omit<LoroDoc, HistoryKeys>, keyof BranchingDocHead>` plus a
+/// mutual-assignability check): adding a history method here, or dropping a head-safe
+/// one, trips `tsc`.
+///
+/// > NOTE(claude-opus-4-8/branchingdocrepo): this wraps the wasm `LoroDoc` and delegates,
+/// > rather than the loro-crate `loro::BranchingDocHead`. Wrapping the latter would force a
+/// > public full-`LoroDoc` accessor on it, which would punch a head-safety hole in slice-1's
+/// > compile-time guarantee; delegating to the wasm `LoroDoc` reuses the exact method bodies
+/// > (identical `js_name`s and signatures) and leaves the drift guard as the wasm-layer
+/// > enforcement, which is its designed purpose.
+#[wasm_bindgen]
+pub struct BranchingDocHead(LoroDoc);
+
+impl BranchingDocHead {
+    /// Wrap a materialized head. Internal plumbing; a future slice wires this to the repo.
+    #[allow(dead_code)]
+    pub(crate) fn from_loro_doc(doc: LoroDoc) -> Self {
+        Self(doc)
+    }
+}
+
+#[wasm_bindgen]
+impl BranchingDocHead {
+    #[wasm_bindgen(js_name = "getText")]
+    pub fn get_text(&self, cid: &JsIntoContainerID) -> JsResult<LoroText> {
+        self.0.get_text(cid)
+    }
+
+    #[wasm_bindgen(js_name = "getMap", skip_typescript)]
+    pub fn get_map(&self, cid: &JsIntoContainerID) -> JsResult<LoroMap> {
+        self.0.get_map(cid)
+    }
+
+    #[wasm_bindgen(js_name = "getList", skip_typescript)]
+    pub fn get_list(&self, cid: &JsIntoContainerID) -> JsResult<LoroList> {
+        self.0.get_list(cid)
+    }
+
+    #[wasm_bindgen(skip_typescript)]
+    pub fn getMovableList(&self, cid: &JsIntoContainerID) -> JsResult<LoroMovableList> {
+        self.0.getMovableList(cid)
+    }
+
+    #[wasm_bindgen(js_name = "getTree", skip_typescript)]
+    pub fn get_tree(&self, cid: &JsIntoContainerID) -> JsResult<LoroTree> {
+        self.0.get_tree(cid)
+    }
+
+    #[wasm_bindgen(js_name = "getCounter")]
+    pub fn get_counter(&self, cid: &JsIntoContainerID) -> JsResult<LoroCounter> {
+        self.0.get_counter(cid)
+    }
+
+    #[wasm_bindgen(skip_typescript, js_name = "getContainerById")]
+    pub fn get_container_by_id(&self, container_id: JsContainerID) -> JsResult<JsValue> {
+        self.0.get_container_by_id(container_id)
+    }
+
+    #[wasm_bindgen]
+    pub fn hasContainer(&self, container_id: JsContainerID) -> bool {
+        self.0.hasContainer(container_id)
+    }
+
+    #[wasm_bindgen(js_name = "getByPath")]
+    pub fn get_by_path(&self, path: &str) -> JsResult<JsValueOrContainerOrUndefined> {
+        self.0.get_by_path(path)
+    }
+
+    #[wasm_bindgen(js_name = "JSONPath")]
+    pub fn json_path(&self, jsonpath: &str) -> JsResult<Array> {
+        self.0.json_path(jsonpath)
+    }
+
+    #[wasm_bindgen(js_name = "getShallowValue")]
+    pub fn get_shallow_value(&self) -> JsResult<JsLoroRootShallowValue> {
+        self.0.get_shallow_value()
+    }
+
+    #[wasm_bindgen(js_name = "toJSON")]
+    pub fn to_json(&self) -> JsResult<JsValue> {
+        self.0.to_json()
+    }
+
+    #[wasm_bindgen(js_name = "getDeepValueWithID")]
+    pub fn get_deep_value_with_id(&self) -> JsValue {
+        self.0.get_deep_value_with_id()
+    }
+
+    #[wasm_bindgen]
+    pub fn frontiers(&self) -> JsResult<JsIDs> {
+        self.0.frontiers()
+    }
+
+    #[wasm_bindgen]
+    pub fn version(&self) -> VersionVector {
+        self.0.version()
+    }
+
+    #[wasm_bindgen(js_name = "cmpWithFrontiers")]
+    pub fn cmp_with_frontiers(&self, frontiers: Vec<JsID>) -> JsResult<i32> {
+        self.0.cmp_with_frontiers(frontiers)
+    }
+
+    #[wasm_bindgen]
+    pub fn getCursorPos(&self, cursor: &Cursor) -> JsResult<JsCursorQueryAns> {
+        self.0.getCursorPos(cursor)
+    }
+
+    #[wasm_bindgen(js_name = "getPathToContainer")]
+    pub fn get_path_to_container(&self, id: JsContainerID) -> JsResult<Option<JsContainerPath>> {
+        self.0.get_path_to_container(id)
+    }
+
+    #[wasm_bindgen(js_name = "getPendingTxnLength")]
+    pub fn get_pending_txn_len(&self) -> usize {
+        self.0.get_pending_txn_len()
+    }
+
+    #[wasm_bindgen(js_name = "peerId", getter)]
+    pub fn peer_id(&self) -> u64 {
+        self.0.peer_id()
+    }
+
+    #[wasm_bindgen(js_name = "peerIdStr", getter)]
+    pub fn peer_id_str(&self) -> JsStrPeerID {
+        self.0.peer_id_str()
+    }
+
+    #[wasm_bindgen]
+    pub fn opCount(&self) -> usize {
+        self.0.opCount()
+    }
+
+    #[wasm_bindgen]
+    pub fn changeCount(&self) -> usize {
+        self.0.changeCount()
+    }
+
+    #[wasm_bindgen]
+    pub fn commit(&self, options: Option<JsCommitOption>) -> JsResult<()> {
+        self.0.commit(options)
+    }
+
+    #[wasm_bindgen(js_name = "setNextCommitMessage")]
+    pub fn set_next_commit_message(&self, msg: &str) {
+        self.0.set_next_commit_message(msg)
+    }
+
+    #[wasm_bindgen(js_name = "setNextCommitOrigin")]
+    pub fn set_next_commit_origin(&self, origin: &str) {
+        self.0.set_next_commit_origin(origin)
+    }
+
+    #[wasm_bindgen(js_name = "setNextCommitTimestamp")]
+    pub fn set_next_commit_timestamp(&self, timestamp: f64) {
+        self.0.set_next_commit_timestamp(timestamp)
+    }
+
+    #[wasm_bindgen(js_name = "setNextCommitOptions")]
+    pub fn set_next_commit_options(&self, options: JsCommitOption) -> JsResult<()> {
+        self.0.set_next_commit_options(options)
+    }
+
+    #[wasm_bindgen(js_name = "clearNextCommitOptions")]
+    pub fn clear_next_commit_options(&self) {
+        self.0.clear_next_commit_options()
+    }
+
+    #[wasm_bindgen(js_name = "applyDiff")]
+    pub fn apply_diff(&self, diff: JsDiffBatch) -> JsResult<()> {
+        self.0.apply_diff(diff)
+    }
+
+    #[wasm_bindgen(js_name = "revertTo")]
+    pub fn revert_to(&self, frontiers: Vec<JsID>) -> JsResult<()> {
+        self.0.revert_to(frontiers)
+    }
+
+    #[wasm_bindgen(js_name = "subscribePreCommit", skip_typescript)]
+    pub fn subscribe_pre_commit(&self, f: js_sys::Function) -> JsValue {
+        self.0.subscribe_pre_commit(f)
+    }
+}
+
+/// Hand-written TypeScript for `BranchingDocHead`'s `skip_typescript` methods, mirroring
+/// the corresponding `LoroDoc` interface-merge blocks (minus the history surface) so the
+/// generic container getters, `getContainerById`, `subscribePreCommit`, and the
+/// prototype-patched `toJsonWithReplacer` are usable and typed from TS.
+#[wasm_bindgen(typescript_custom_section)]
+const BRANCHING_DOC_HEAD_TYPES: &str = r#"
+interface BranchingDocHead {
+    /**
+     *  Get the container corresponding to the container id
+     */
+    getContainerById(id: ContainerID): Container | undefined;
+    subscribePreCommit(f: (e: { changeMeta: Change, origin: string, modifier: ChangeModifier }) => void): () => void
+    toJsonWithReplacer(replacer: (key: string | index, value: Value | Container) => Value | Container | undefined): Value;
+}
+interface BranchingDocHead<T extends Record<string, Container> = Record<string, Container>> {
+    getMap<Key extends keyof T | ContainerID>(name: Key): T[Key] extends LoroMap ? T[Key] : LoroMap;
+    getList<Key extends keyof T | ContainerID>(name: Key): T[Key] extends LoroList ? T[Key] : LoroList;
+    getMovableList<Key extends keyof T | ContainerID>(name: Key): T[Key] extends LoroMovableList ? T[Key] : LoroMovableList;
+    getTree<Key extends keyof T | ContainerID>(name: Key): T[Key] extends LoroTree ? T[Key] : LoroTree;
+}
+"#;
+
 struct PendingCall {
     observer: observer::Observer,
     args: Vec<SafeJsValue>,

@@ -2,6 +2,7 @@ export * from "loro-wasm";
 export type * from "loro-wasm";
 import {
   AwarenessWasm,
+  BranchingDocHead,
   EphemeralStoreWasm,
   PeerID,
   Container,
@@ -413,6 +414,10 @@ LoroDoc.prototype.toJsonWithReplacer = function (
   return run(layer);
 };
 
+// A head exposes the same head-safe `toJsonWithReplacer` as a doc; reuse the exact impl.
+BranchingDocHead.prototype.toJsonWithReplacer =
+  LoroDoc.prototype.toJsonWithReplacer;
+
 export function idStrToId(idStr: `${number}@${PeerID}`): OpId {
   const [counter, peer] = idStr.split("@");
   return {
@@ -525,3 +530,99 @@ decorateMethods(EphemeralStoreWasm.prototype, [
 ]);
 
 decorateMethods(UndoManager.prototype, ["undo", "redo"]);
+
+// A head shares LoroDoc's pending-event decoration for the head-safe mutating methods.
+decorateMethods(BranchingDocHead.prototype, [
+  "commit",
+  "getCursorPos",
+  "revertTo",
+  "applyDiff",
+]);
+
+// ---------------------------------------------------------------------------
+// Head-safety drift guard (compile-time).
+//
+// `BranchingDocHead` must expose exactly LoroDoc's surface MINUS the history-bearing
+// methods (`HistoryKeys`). Two checks enforce this at `tsc` time:
+//   1. name-set exactness: every history method is absent from the head and every
+//      head-safe method is present (adding/removing either flips the keyof set);
+//   2. signature-shape compatibility of the head-safe surface.
+// This is the wasm-layer enforcement of the head-safe/history partition. It deliberately
+// does NOT use an exact `Equals<Omit<LoroDoc, HistoryKeys>, BranchingDocHead>`: LoroDoc's
+// published type is a class+generic-interface declaration-merge that only type-checks
+// under `skipLibCheck`, so an independently-generated `BranchingDocHead` cannot reach
+// exact structural identity with an `Omit` of it. See the branchingdocrepo devlog.
+type _Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B
+  ? 1
+  : 2)
+  ? true
+  : false;
+type _MutualExtends<A, B> = [A] extends [B]
+  ? [B] extends [A]
+    ? true
+    : false
+  : false;
+
+// The exact excluded set: every LoroDoc instance method that is NOT head-safe.
+// A LoroDoc method that is neither forwarded onto the head nor listed here trips the
+// name-set check below — that is the drift signal.
+type HistoryKeys =
+  | "setDetachedEditing"
+  | "isDetachedEditingEnabled"
+  | "setRecordTimestamp"
+  | "setChangeMergeInterval"
+  | "configTextStyle"
+  | "configDefaultTextStyle"
+  | "attach"
+  | "isDetached"
+  | "detach"
+  | "fork"
+  | "forkAt"
+  | "checkoutToLatest"
+  | "travelChangeAncestors"
+  | "findIdSpansBetween"
+  | "checkout"
+  | "setPeerId"
+  | "subscribeJsonpath"
+  | "shallowSinceVV"
+  | "isShallow"
+  | "shallowSinceFrontiers"
+  | "oplogVersion"
+  | "oplogFrontiers"
+  | "cmpFrontiers"
+  | "export"
+  | "exportJsonUpdates"
+  | "exportJsonInIdSpan"
+  | "importJsonUpdates"
+  | "import"
+  | "importUpdateBatch"
+  | "importBatch"
+  | "subscribe"
+  | "subscribeLocalUpdates"
+  | "debugHistory"
+  | "getAllChanges"
+  | "getChangeAt"
+  | "getChangeAtLamport"
+  | "getOpsInChange"
+  | "frontiersToVV"
+  | "vvToFrontiers"
+  | "getChangedContainersIn"
+  | "diff"
+  | "getUncommittedOpsAsJson"
+  | "subscribeFirstCommitFromPeer"
+  | "deleteRootContainer"
+  | "setHideEmptyRootContainers"
+  | "toContainerTree";
+
+// (C.1) name-set exactness.
+const _headKeysMatchOmit: _Equals<
+  keyof Omit<LoroDoc, HistoryKeys>,
+  keyof BranchingDocHead
+> = true;
+// (C.2) signature-shape compatibility of the head-safe surface.
+const _headShapeMatchesOmit: _MutualExtends<
+  Omit<LoroDoc, HistoryKeys>,
+  BranchingDocHead
+> = true;
+void _headKeysMatchOmit;
+void _headShapeMatchesOmit;
