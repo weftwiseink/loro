@@ -31,7 +31,6 @@
 //! never materializing into a live head.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Weak};
 
@@ -52,6 +51,15 @@ use loro_common::{IdSpan, InternalString, LoroEncodeError, LoroResult, ID};
 
 pub type BranchId = InternalString;
 pub type HeadId = u64;
+
+/// The pinned root head's id. Created at `refs == 0` and NEVER dropped: it is
+/// the anchor `import` / `export` / `materialize` lean on (they need at least
+/// one live head over the shared op log to operate through).
+///
+/// Refcount invariant for every OTHER head: a head is live while `refs >= 1`,
+/// and is retired (removed from `heads` and `by_tip`) the moment `refs` reaches
+/// `0`. There is no `refs == 0` resting/orphan state except the pinned root.
+const ROOT_HEAD_ID: HeadId = 0;
 
 /// One event per new change landing in the shared history (a head commit or an
 /// import), carrying that change's update bytes. Mirrors `LocalUpdateCallback`.
@@ -130,7 +138,7 @@ struct Head {
     tip: Frontiers,
     /// Number of `bound` entries pointing here. The whole sharing rule:
     /// `1` = uniquely owned (writable in place); `> 1` = shared (immutable);
-    /// `0` = orphan.
+    /// `0` = retired (removed) -- except the pinned root, which rests at `0`.
     refs: usize,
     /// Per-head forwarders that feed this head's local commits / first-commits
     /// into the doc-level `history_subs` / `first_commit_subs`. Kept alive for
@@ -149,10 +157,6 @@ struct Registry {
     by_tip: FxHashMap<Frontiers, HeadId>,
     /// Branch -> the head it currently uses.
     bound: FxHashMap<BranchId, HeadId>,
-    /// `refs == 0` heads, bounded by `warm_budget`, kept as nearest-source
-    /// candidates then dropped.
-    orphans: VecDeque<HeadId>,
-    warm_budget: usize,
     next_id: HeadId,
 }
 
@@ -294,8 +298,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
 
             let mut heads = FxHashMap::default();
             let mut by_tip = FxHashMap::default();
+            // The pinned root head: born at refs == 0 and never retired.
             heads.insert(
-                0,
+                ROOT_HEAD_ID,
                 Head {
                     doc: root,
                     tip: tip.clone(),
@@ -303,7 +308,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                     _forward: forward,
                 },
             );
-            by_tip.insert(tip, 0);
+            by_tip.insert(tip, ROOT_HEAD_ID);
 
             MultiHeadInner {
                 oplog: oplog.clone(),
@@ -316,9 +321,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                         heads,
                         by_tip,
                         bound: FxHashMap::default(),
-                        orphans: VecDeque::new(),
-                        warm_budget: 8,
-                        next_id: 1,
+                        next_id: ROOT_HEAD_ID + 1,
                     },
                     LockKind::BranchRegistry,
                 ),
@@ -336,13 +339,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         &self.inner.policy
     }
 
-    /// The id of the empty root head created by [`new`](Self::new).
+    /// The id of the pinned root head created by [`new`](Self::new).
     pub fn root_head_id(&self) -> HeadId {
-        0
-    }
-
-    pub fn set_warm_budget(&self, orphans: usize) {
-        self.with_reg(|_, reg| reg.warm_budget = orphans);
+        ROOT_HEAD_ID
     }
 
     /// The head whose state a `Snapshot` export carries.
@@ -414,7 +413,6 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     // --- refs / mode flips -------------------------------------------------
 
     fn inc_refs(&self, reg: &mut Registry, id: HeadId) {
-        reg.orphans.retain(|o| *o != id);
         let refs = {
             let h = reg.heads.get_mut(&id).expect("head exists");
             h.refs += 1;
@@ -434,7 +432,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         if refs == 1 {
             self.flip_to_private(reg, id);
         } else if refs == 0 {
-            self.orphan(reg, id);
+            self.retire(reg, id);
         }
     }
 
@@ -466,19 +464,40 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         h.doc.renew_txn_if_auto_commit(None);
     }
 
-    fn orphan(&self, reg: &mut Registry, id: HeadId) {
+    /// A non-root head reached `refs == 0`: retire it (remove from `by_tip` and
+    /// `heads`, dropping its materialized state). The PINNED ROOT is never
+    /// dropped -- it stays a resting head so `by_tip` / `materialize` / `import`
+    /// / `export` always have an anchor over the shared op log. The head's
+    /// already-COMMITTED ops remain in history, so its tip stays reachable by
+    /// `materialize` replay.
+    ///
+    /// Drop-commit hazard: removing the head drops its `LoroDoc`, whose `Drop`
+    /// implicit-commits an open auto-commit transaction. We ASSERT the head has
+    /// no pending local ops here rather than clearing them: the base commits
+    /// every `write()` before returning and only rebinds at operation
+    /// boundaries, so a head reaching `refs == 0` always has an empty
+    /// auto-commit txn. An empty commit inserts NO change (`Transaction::_commit`
+    /// aborts on empty `local_ops`), so the ensuing drop is a clean no-op and
+    /// appends nothing to shared history. Asserting (rather than committing)
+    /// keeps a spurious out-of-contract pending op loud instead of silently
+    /// polluting history.
+    fn retire(&self, reg: &mut Registry, id: HeadId) {
+        if id == ROOT_HEAD_ID {
+            return; // pinned: keep the root as a resting head at refs == 0
+        }
         if let Some(h) = reg.heads.get(&id) {
+            debug_assert_eq!(
+                h.doc.get_pending_txn_len(),
+                0,
+                "a head reaching refs == 0 must have no pending local ops \
+                 (they would spuriously commit on drop)"
+            );
             let tip = h.tip.clone();
             if reg.by_tip.get(&tip) == Some(&id) {
                 reg.by_tip.remove(&tip);
             }
         }
-        reg.orphans.push_back(id);
-        while reg.orphans.len() > reg.warm_budget {
-            if let Some(evict) = reg.orphans.pop_front() {
-                reg.heads.remove(&evict);
-            }
-        }
+        reg.heads.remove(&id); // drops the LoroDoc; empty txn => clean no-op commit
     }
 
     // --- binding -----------------------------------------------------------
@@ -589,17 +608,17 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         Ok(())
     }
 
-    /// SECONDARY path: build a head at `target` from the nearest existing head
-    /// (or the root), then advance it. No checkpoint code (deferred).
+    /// SECONDARY path: a frontier no live head sits at. Build a head by copying
+    /// the PINNED ROOT and replaying (checkout) to `target`. Logically correct,
+    /// not cheap: no nearest-source scan and no warm/orphan reuse.
+    ///
+    /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): nearest-source
+    /// selection and periodic checkpoints that make this path cheap are DEFERRED
+    /// to the persistent-DocState follow-up SoW
+    /// (`cdocs/proposals/2026-09-14-multiheaddoc-api-snapshots-persistent-state.md`).
+    /// The root always exists (pinned), so this is always available.
     fn materialize(&self, reg: &mut Registry, target: &Frontiers) -> LoroResult<HeadId> {
-        let src = reg
-            .by_tip
-            .values()
-            .next()
-            .copied()
-            .or_else(|| reg.heads.keys().next().copied())
-            .expect("the root head always exists");
-        let c = self.copy_head(reg, src);
+        let c = self.copy_head(reg, ROOT_HEAD_ID);
         self.advance_in_place(reg, c, target)?;
         Ok(c)
     }
@@ -1369,5 +1388,89 @@ mod tests {
         let restored2 = LoroDoc::new();
         restored2.import(&updates).unwrap();
         assert_eq!(restored2.get_text("t").to_string(), "hello");
+    }
+
+    // ------------------------------------------------------------------
+    // refs==0 retirement: non-root heads are dropped, the root is pinned.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dead_tip_rematerializes_via_replay_after_head_dropped() {
+        let md = MultiHeadDoc::new(Manual::new());
+        let (main, feature) = (b("main"), b("feature"));
+        md.bind(&main, 0);
+        md.bind(&feature, 0); // root shared, refs 2
+
+        // feature diverges onto its OWN sole-owner (non-root) head H.
+        md.write(&feature, |d| {
+            d.get_text("t").insert_unicode(0, "F").unwrap()
+        })
+        .unwrap();
+        let h = md.bound_head(&feature).unwrap();
+        assert_ne!(h, md.root_head_id(), "feature is on a non-root head");
+        assert_eq!(md.refs_of(&feature), Some(1), "H is feature's sole owner");
+        let h_tip = md.head_tip(h).unwrap();
+        let pre_value = md.read(&feature, |d| d.get_text("t").to_string()).unwrap();
+        assert_eq!(pre_value, "F");
+
+        // Rebind feature OFF H (target back to the root's empty tip): H reaches
+        // refs 0 and is RETIRED (dropped), root is not.
+        md.policy().set_target(&feature, Frontiers::default());
+        md.resolve(&feature, Intent::Read).unwrap();
+        assert!(
+            md.head_doc(h).is_none(),
+            "sole-owner head retired at refs 0"
+        );
+        assert!(
+            md.head_doc(md.root_head_id()).is_some(),
+            "root head is never retired"
+        );
+
+        // A later access to H's now-dead tip re-materializes correctly via
+        // replay from the pinned root (value equality with the pre-drop state).
+        let reader = b("reader");
+        md.policy().set_target(&reader, h_tip.clone());
+        let seen = md.read(&reader, |d| d.get_text("t").to_string()).unwrap();
+        assert_eq!(
+            seen, pre_value,
+            "dead tip re-materialized to the same value via replay"
+        );
+        assert_ne!(
+            md.bound_head(&reader).unwrap(),
+            h,
+            "re-materialization built a fresh head, not the dropped one"
+        );
+    }
+
+    #[test]
+    fn root_head_is_pinned_never_retired() {
+        let md = MultiHeadDoc::new(Manual::new());
+        let (main, x) = (b("main"), b("x"));
+        md.bind(&main, 0);
+        md.bind(&x, 0); // root shared, refs 2
+
+        // x diverges onto its own head Hx; root drops to refs 1 (main only).
+        md.write(&x, |d| d.get_text("t").insert_unicode(0, "X").unwrap())
+            .unwrap();
+        let hx = md.bound_head(&x).unwrap();
+        assert_ne!(hx, 0);
+
+        // Move main onto Hx too, driving the root head to refs 0.
+        md.policy().set_target(&main, md.head_tip(hx).unwrap());
+        md.resolve(&main, Intent::Read).unwrap();
+        assert_ne!(md.bound_head(&main), Some(0), "main left the root head");
+
+        // The root reached refs 0 but is PINNED: still present and still the
+        // materialize/import/export anchor.
+        assert!(
+            md.head_doc(0).is_some(),
+            "root head is pinned and survives refs == 0"
+        );
+        // It still anchors resolution: a branch targeting the root's (empty) tip
+        // shares it rather than hitting a missing head.
+        let cold = b("cold");
+        md.policy().set_target(&cold, Frontiers::default());
+        let seen = md.read(&cold, |d| d.get_text("t").to_string()).unwrap();
+        assert_eq!(seen, "", "pinned root still resolvable at its empty tip");
     }
 }
