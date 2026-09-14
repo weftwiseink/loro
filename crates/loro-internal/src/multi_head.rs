@@ -577,7 +577,22 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                     }
                     None => match cur {
                         Some(h) if reg.heads[&h].refs == 1 => {
+                            // Catch-up arm: the branch's bound LIVE head (refs==1)
+                            // advances IN PLACE to its policy-computed target
+                            // (e.g. `after_import` moving a branch to its lineage
+                            // join). `advance_in_place` checks out, which leaves
+                            // the head `detached` with its auto-commit txn stopped
+                            // -> a subsequent local write (record_head after a
+                            // remote import) would fail `AutoCommitNotStarted` and
+                            // silently drop the record. The head is now the
+                            // branch's live writable head sitting at the frontier
+                            // the policy chose, so re-enable editing. This is a
+                            // registry-internal move, so it correctly bypasses the
+                            // external E1-A `attach`/`checkout_to_latest` gate.
                             this.advance_in_place(reg, h, &target)?;
+                            let doc = &reg.heads[&h].doc;
+                            doc.set_detached(false);
+                            doc.renew_txn_if_auto_commit(None);
                             h
                         }
                         Some(h) => {
@@ -623,19 +638,23 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             return Ok(());
         }
         // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `checkout` leaves
-        // the head's `detached` flag set (its state != the shared union). This
-        // is INTENTIONAL for the currently-exercised paths, verified by probe:
-        //   - copy-on-divergence heads (the WRITABLE path) come from
-        //     `fork_in_group` in `copy_head`, NOT from here, and are attached
-        //     (detached == false) and writable (a second write succeeds);
-        //   - heads reached via `advance_in_place` (`materialize`, ingest) are
-        //     the read-only secondary path, and nothing currently WRITES to them.
-        // So no currently-exercised writable path is stuck read-only, and we do
-        // NOT clear `detached` here. A future WRITABLE advance/checkout contract
-        // (where a branch writes after advancing to a branch-local target) is
-        // Phase-3-body / RFP scope; it would clear `detached` via a
-        // registry-side `set_detached(false)` AFTER landing the branch-local
-        // target. Adding that now would be a speculative, untested change.
+        // the head's `detached` flag set (state != the shared union) with its
+        // auto-commit txn stopped. Clearing that is the CALLER's decision, not
+        // this shared helper's, because it depends on whether the resulting head
+        // is the branch's live writable head or a read-only view:
+        //   - the resolve CATCH-UP arm (refs==1 bound live head) CLEARS it after
+        //     this returns: the head is the branch's writable head at its policy
+        //     target, and a local write must not fail `AutoCommitNotStarted`
+        //     (the import-then-record data-loss path);
+        //   - `materialize` (a fresh `copy_head` + advance, for a cold/unbound
+        //     branch or an explicit historical view) deliberately does NOT clear:
+        //     it stays a read-only view (the full read-only-head taxonomy is the
+        //     checkout RFP's);
+        //   - the resolve copy+advance arm (refs>1 shared head advanced onto a
+        //     fresh copy) has the same detached property, but is NOT exercised in
+        //     this unit (SelfRooted index heads are Eager/refs==1; the Delegated
+        //     content policy that produces shared+advanced heads is Phase-3 body)
+        //     -- it clears there when built, by the same live-writable reasoning.
         h.doc.checkout(target)?;
         let new_tip = h.doc.state_frontiers();
         h.tip = new_tip.clone();
@@ -2184,6 +2203,42 @@ mod tests {
         assert_eq!(
             a_docs, b_docs,
             "docs subtree converges to an identical value"
+        );
+    }
+
+    #[test]
+    fn index_import_then_record_converges() {
+        // The import-THEN-record ordering real peer sync produces (the existing
+        // convergence test records BEFORE importing, which masked this). A
+        // session first receives a remote import -- advancing its refs==1 bound
+        // index head via the resolve CATCH-UP arm (checkout -> detached) -- THEN
+        // records locally on that head. Without the catch-up detached-clear, the
+        // local record fails `AutoCommitNotStarted` and its head record is
+        // dropped (head_count wrong). With it, the record lands and converges.
+        let a = IndexDoc::new(SelfRooted::new());
+        a.init_genesis(&b("main")).unwrap();
+        a.create_index_branch(&b("shared"), &b("main")).unwrap();
+        a.record_head(&b("shared"), &d("G"), 111, 1).unwrap();
+        let a_updates = a.export(ExportMode::all_updates()).unwrap();
+
+        let bb = IndexDoc::new(SelfRooted::new());
+        bb.init_genesis(&b("main")).unwrap();
+        bb.create_index_branch(&b("shared"), &b("main")).unwrap();
+
+        // IMPORT FIRST: advances bb's `shared` index head (refs==1) to the
+        // lineage join through the catch-up arm.
+        bb.import(&a_updates).unwrap();
+        assert!(
+            doc_has_key(&bb, &b("shared"), "G"),
+            "import advanced the head to A's record"
+        );
+
+        // THEN record locally on that just-advanced head. This must succeed.
+        bb.record_head(&b("shared"), &d("G"), 222, 2).unwrap();
+        assert_eq!(
+            head_count(&bb, &b("shared"), "G"),
+            2,
+            "import-then-record kept BOTH head records (no dropped record)"
         );
     }
 
