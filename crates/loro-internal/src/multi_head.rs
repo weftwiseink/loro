@@ -539,6 +539,18 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         self.with_reg(|this, reg| this.rebind(reg, b, head_id));
     }
 
+    /// Unbind a branch: drop its `bound` entry and decrement its head's refs
+    /// (retiring the head if it reaches 0, unless it is the pinned root). Leaves
+    /// no dangling `bound`/`by_tip` entry. No-op if the branch is not bound
+    /// (a content doc binds a branch only lazily on first access).
+    pub fn unbind(&self, b: &BranchId) {
+        self.with_reg(|this, reg| {
+            if let Some(old) = reg.bound.remove(b) {
+                this.dec_refs(reg, old);
+            }
+        });
+    }
+
     /// Create branch `new` bound to wherever `from` currently resolves: the
     /// free, O(1) branch-from-a-live-head path (share `from`'s head).
     ///
@@ -1445,6 +1457,15 @@ impl MultiHeadDoc<SelfRooted> {
     pub fn branches(&self) -> Vec<BranchId> {
         self.policy().lineage(self).lock().keys().cloned().collect()
     }
+
+    /// Remove a branch from the index: unbind its index head (retiring it) and
+    /// drop its lineage entry, so `branches()` no longer lists it and no
+    /// `bound`/`by_tip` entry dangles. (The durable cross-peer "discard" is the
+    /// wrapper's lifecycle log; this is the local registry cleanup.)
+    pub fn delete_index_branch(&self, name: &BranchId) {
+        self.unbind(name);
+        self.policy().lineage(self).lock().remove(name);
+    }
 }
 
 // ======================================================================
@@ -1637,6 +1658,18 @@ impl BranchingDocRepo {
     /// `from`; content docs bind `new` lazily on first access (free creation).
     pub fn create_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
         self.index.create_index_branch(new, from)
+    }
+
+    /// Repo-wide branch deletion: unbind the branch from every open content doc
+    /// AND the index, and drop its index lineage. `branches()` then excludes it
+    /// with no dangling `bound`/`by_tip` entry anywhere; the pinned root is never
+    /// removed. Its committed ops stay in each doc's history (unreferenced).
+    pub fn delete_branch(&self, name: &BranchId) -> LoroResult<()> {
+        for doc in self.docs.lock().unwrap().values() {
+            doc.unbind(name);
+        }
+        self.index.delete_index_branch(name);
+        Ok(())
     }
 }
 
@@ -2863,6 +2896,100 @@ mod tests {
         assert_eq!(
             doc.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
             MergeOutcome::AlreadyContained
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // N1: two-peer Delegated content-sync convergence (the raison d'etre).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn two_peer_content_sync_converges() {
+        // Peer A edits branch main on doc G; export A's index + content; peer B
+        // imports both. B's `after_import` (Delegated) must re-resolve main so its
+        // branch head converges to A's ACTUAL content -- not merely a matching
+        // index head_count.
+        let a = BranchingDocRepo::open().unwrap();
+        let ga = a.open_doc("G".into());
+        ga.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "hello").unwrap())
+            .unwrap();
+        let a_index = a.index().export(ExportMode::all_updates()).unwrap();
+        let a_content = ga.export(ExportMode::all_updates()).unwrap();
+
+        let bb = BranchingDocRepo::open().unwrap();
+        let gb = bb.open_doc("G".into());
+        assert_eq!(
+            gb.branch(GENESIS_BRANCH)
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "",
+            "B starts empty"
+        );
+
+        // Sync: index first (B learns where main is), then content (the ops).
+        bb.index().import(&a_index).unwrap();
+        gb.import(&a_content).unwrap();
+
+        // Inspect main's bound head DIRECTLY (no branch read/resolve), so this
+        // isolates `after_import`'s EAGER re-resolve/advance -- a lazy read would
+        // re-resolve and converge on its own, masking the ingest.
+        let head_id = gb.bound_head(&GENESIS_BRANCH.into()).expect("main bound");
+        let head_content = gb.head_doc(head_id).unwrap().get_text("t").to_string();
+        assert_eq!(
+            head_content, "hello",
+            "after_import eagerly advanced main's head to A's actual content"
+        );
+    }
+
+    #[test]
+    fn delete_branch_no_dangling_registry() {
+        let repo = BranchingDocRepo::open().unwrap();
+        let doc = repo.open_doc("G".into());
+        doc.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+            .unwrap();
+        repo.create_branch(&b("draft"), &b(GENESIS_BRANCH)).unwrap();
+        // Access draft on the content doc so it binds AND diverges onto its own
+        // head (refs 1) -- the case a broken delete would leave dangling.
+        doc.branch("draft")
+            .write(|h| h.get_text("t").insert_unicode(4, "-d").unwrap())
+            .unwrap();
+        assert!(repo.branches().contains(&b("draft")));
+        assert!(
+            repo.index().bound_head(&b("draft")).is_some(),
+            "index binds draft"
+        );
+        assert!(
+            doc.bound_head(&b("draft")).is_some(),
+            "content doc binds draft"
+        );
+
+        repo.delete_branch(&b("draft")).unwrap();
+
+        // No dangling / desynced entry anywhere.
+        assert!(
+            !repo.branches().contains(&b("draft")),
+            "draft removed from index lineage"
+        );
+        assert_eq!(
+            repo.index().bound_head(&b("draft")),
+            None,
+            "index: draft unbound (no dangling bound entry)"
+        );
+        assert_eq!(
+            doc.bound_head(&b("draft")),
+            None,
+            "content doc: draft unbound (no dangling bound entry)"
+        );
+        // Pinned root intact; the other branch is unaffected.
+        assert!(doc.head_doc(0).is_some(), "pinned root intact");
+        assert_eq!(
+            doc.branch(GENESIS_BRANCH)
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "base",
+            "main unaffected by the delete"
         );
     }
 }
