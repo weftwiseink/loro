@@ -1517,13 +1517,41 @@ impl MultiHeadDoc<SelfRooted> {
         })?
     }
 
-    /// Record every id of frontier `f` into `docs[doc].heads` on `b`'s index
-    /// head (advance / merge / ingest: the durable per-branch content frontier).
+    /// ADDITIVELY record every id of frontier `f` into `docs[doc].heads` on `b`'s
+    /// index head: `heads[peer] = counter` per id, MERGING into existing entries
+    /// (a per-writer max in effect). This is correct for forward accumulation --
+    /// `advance` / `merge` / ingest move a LIVE branch forward, and each keeps the
+    /// other peers' recorded positions. It is NOT correct for setting a branch to
+    /// an exact frontier that must EXCLUDE other peers -- see `set_frontier`.
     pub fn record_frontier(&self, b: &BranchId, doc: &DocId, f: &Frontiers) -> LoroResult<()> {
         self.write(b, |d| {
             let docs = d.get_map("docs");
             let per_doc = docs.ensure_mergeable_map(doc.as_str())?;
             let heads = per_doc.ensure_mergeable_map("heads")?;
+            for id in f.iter() {
+                heads.insert(&id.peer.to_string(), id.counter as i64)?;
+            }
+            Ok(())
+        })?
+    }
+
+    /// Set `docs[doc].heads` on `b`'s index head to EXACTLY frontier `f`: clear
+    /// every existing entry first, then record `f`'s ids. Unlike the additive
+    /// `record_frontier`, this OVERRIDES -- the recorded frontier becomes `f` and
+    /// nothing else. `create_branch_at` needs this: eager `create_index_branch`
+    /// seeds the fork with the parent's (possibly multi-peer) recorded frontier,
+    /// and forking at a single-peer historical `at` must not leave stale
+    /// other-peer entries (which would silently pull those peers' ops into the
+    /// fork).
+    pub fn set_frontier(&self, b: &BranchId, doc: &DocId, f: &Frontiers) -> LoroResult<()> {
+        self.write(b, |d| {
+            let docs = d.get_map("docs");
+            let per_doc = docs.ensure_mergeable_map(doc.as_str())?;
+            let heads = per_doc.ensure_mergeable_map("heads")?;
+            let existing: Vec<InternalString> = heads.keys().collect();
+            for k in existing {
+                heads.delete(k.as_str())?;
+            }
             for id in f.iter() {
                 heads.insert(&id.peer.to_string(), id.counter as i64)?;
             }
@@ -1575,6 +1603,12 @@ impl MultiHeadDoc<SelfRooted> {
     /// The registry HeadId of branch `b`'s (self-rooted) index head, resolving
     /// it from lineage if not yet bound. (`Head` itself is registry-internal, so
     /// this hands back the id rather than the proposal's `Arc<Head>`.)
+    ///
+    /// CAVEATS: this calls `resolve` (a Read), so it has the same side effects
+    /// (it may bind/advance/materialize `b`'s head). The returned `HeadId` is
+    /// SESSION-LOCAL and rebind-mutable: a later copy-on-divergence / merge
+    /// rebinds `b` to a DIFFERENT head, so a caller MUST NOT cache the id across
+    /// any operation that could rebind `b` -- re-resolve instead.
     pub fn head_of(&self, b: &BranchId) -> LoroResult<HeadId> {
         Ok(self.resolve(b, Intent::Read)?.0)
     }
@@ -1676,6 +1710,11 @@ impl MultiHeadDoc<Delegated> {
 
     /// Move branch `b` to frontier `to`: record it in the index (durable state
     /// leads the cache), then re-resolve to advance/rebind this doc's head.
+    ///
+    /// Uses ADDITIVE `record_frontier` (not `set_frontier`): `advance` / `merge`
+    /// move a LIVE branch FORWARD, accumulating per-peer positions -- a merge's
+    /// join must keep every peer's op. This is the opposite of `create_branch_at`,
+    /// which SETS an exact frontier and must exclude other peers (`set_frontier`).
     pub fn advance(&self, b: &BranchId, to: &Frontiers) -> LoroResult<()> {
         self.index().record_frontier(b, self.doc_id(), to)?;
         let _ = self.resolve(b, Intent::Read)?;
@@ -1695,12 +1734,22 @@ impl MultiHeadDoc<Delegated> {
     /// detached-owned head is produced here -- so the `attach`/`checkout_to_latest`
     /// no-op gates (N2) stay DEFENSE-IN-DEPTH, unexercised, until the separate
     /// read-only-history-view affordance lands.
+    ///
+    /// Errors if `name` already exists (no silent reposition). The fork's
+    /// recorded frontier is set to EXACTLY `at` via `set_frontier` -- overriding,
+    /// not additively merging into, the parent frontier the eager
+    /// `create_index_branch` copy seeds. Additive merge would leave stale
+    /// other-peer entries under a MULTI-PEER parent, silently pulling those peers'
+    /// ops into the fork.
     pub fn create_branch_at(&self, name: &BranchId, at: &Frontiers) -> LoroResult<()> {
-        if !self.index().branches().contains(name) {
-            self.index()
-                .create_index_branch(name, &GENESIS_BRANCH.into())?;
+        if self.index().branches().contains(name) {
+            return Err(LoroError::ArgErr(
+                format!("cannot create_branch_at: branch '{name}' already exists").into_boxed_str(),
+            ));
         }
-        self.index().record_frontier(name, self.doc_id(), at)?;
+        self.index()
+            .create_index_branch(name, &GENESIS_BRANCH.into())?;
+        self.index().set_frontier(name, self.doc_id(), at)?;
         Ok(())
     }
 
@@ -1798,6 +1847,13 @@ impl BranchingDocRepo {
     /// AND the index, and drop its index lineage. `branches()` then excludes it
     /// with no dangling `bound`/`by_tip` entry anywhere; the pinned root is never
     /// removed. Its committed ops stay in each doc's history (unreferenced).
+    ///
+    /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): this is LOCAL-ONLY
+    /// registry cleanup. The branch's `lineage:<name>` ops remain in the shared
+    /// index history, so a later sync that re-imports them re-discovers the
+    /// branch (`SelfRooted::after_import`). Durable cross-peer deletion /
+    /// tombstoning is the wrapper's lifecycle-log job and a Phase-5 follow-up;
+    /// this method does not attempt it.
     pub fn delete_branch(&self, name: &BranchId) -> LoroResult<()> {
         for doc in self.docs.lock().unwrap().values() {
             doc.unbind(name);
@@ -3198,5 +3254,64 @@ mod tests {
             "subscription fired on feat's new head after copy-on-divergence rebind"
         );
         drop(sub);
+    }
+
+    #[test]
+    fn create_branch_at_multi_peer_parent_excludes_other_peers() {
+        // Peer A: main writes "A1" on G.
+        let a = BranchingDocRepo::open().unwrap();
+        let ga = a.open_doc("G".into());
+        ga.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "A1").unwrap())
+            .unwrap();
+        let at_a = ga.frontier_of(&b(GENESIS_BRANCH)).unwrap(); // only A's op
+        let a_index = a.index().export(ExportMode::all_updates()).unwrap();
+        let a_content = ga.export(ExportMode::all_updates()).unwrap();
+
+        // Peer B: main writes "B1", then syncs A in -> main is MULTI-PEER.
+        let bb = BranchingDocRepo::open().unwrap();
+        let gb = bb.open_doc("G".into());
+        gb.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "B1").unwrap())
+            .unwrap();
+        bb.index().import(&a_index).unwrap();
+        gb.import(&a_content).unwrap();
+        let main_content = gb
+            .branch(GENESIS_BRANCH)
+            .read(|h| h.get_text("t").to_string())
+            .unwrap();
+        assert!(
+            main_content.contains("A1") && main_content.contains("B1"),
+            "parent is multi-peer: {main_content:?}"
+        );
+
+        // Fork at A's single-peer frontier: must be A's op ONLY, not the parent's
+        // full multi-peer content (the additive record_frontier bug).
+        gb.create_branch_at(&b("hist"), &at_a).unwrap();
+        assert_eq!(
+            gb.branch("hist")
+                .read(|h| h.get_text("t").to_string())
+                .unwrap(),
+            "A1",
+            "fork at [A] excludes peer B's op"
+        );
+    }
+
+    #[test]
+    fn create_branch_at_existing_name_errors() {
+        let repo = BranchingDocRepo::open().unwrap();
+        let doc = repo.open_doc("G".into());
+        doc.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, "x").unwrap())
+            .unwrap();
+        let f = doc.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+        // genesis already exists -> error (no silent reposition).
+        assert!(doc.create_branch_at(&b(GENESIS_BRANCH), &f).is_err());
+        // a fresh name works; re-creating it errors.
+        doc.create_branch_at(&b("hist"), &f).unwrap();
+        assert!(
+            doc.create_branch_at(&b("hist"), &f).is_err(),
+            "re-create of an existing branch errors"
+        );
     }
 }
