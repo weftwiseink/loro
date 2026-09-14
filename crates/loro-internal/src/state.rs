@@ -1,6 +1,6 @@
 pub mod container_tree;
 
-use crate::sync::{AtomicU64, Mutex, RwLock};
+use crate::sync::{AtomicU64, AtomicU8, Mutex, RwLock};
 #[cfg(test)]
 use std::cell::Cell;
 use std::sync::{Arc, Weak};
@@ -174,6 +174,11 @@ pub struct DocState {
 
     dead_containers_cache: DeadContainersCache,
     alive_containers_cache: Option<AliveContainersCache>,
+    /// Copy-on-divergence sink guard, shared (same `Arc`) with the owning
+    /// `LoroDocInner.head_mode`. When `HEAD_MODE_SHARED`, the two mutation sinks
+    /// (`apply_local_op`, `apply_diff`) refuse with `LoroError::HeadShared`.
+    /// See `MultiHeadDoc`. Held here so the check needs no `Weak` upgrade.
+    head_mode: Arc<AtomicU8>,
 }
 
 struct AliveContainersCache {
@@ -463,6 +468,7 @@ impl DocState {
         arena: SharedArena,
         config: Configure,
         lock_group: &LoroLockGroup,
+        head_mode: Arc<AtomicU8>,
     ) -> Arc<LoroMutex<Self>> {
         let peer = DefaultRandom.next_u64();
         // TODO: maybe we should switch to certain version in oplog?
@@ -481,6 +487,7 @@ impl DocState {
                 event_recorder: Default::default(),
                 dead_containers_cache: Default::default(),
                 alive_containers_cache: None,
+                head_mode,
             },
             crate::lock::LockKind::DocState,
         ))
@@ -506,7 +513,66 @@ impl DocState {
             event_recorder: Default::default(),
             dead_containers_cache: Default::default(),
             alive_containers_cache: None,
+            head_mode: Arc::new(AtomicU8::new(crate::HEAD_MODE_PRIVATE)),
         }))
+    }
+
+    /// Lock-group-aware fork: the same body as [`fork_with_new_peer_id`], but
+    /// the forked state is installed as a `LoroMutex` in the SHARED
+    /// [`LoroLockGroup`] with `LockKind::DocState`, rather than a bare
+    /// `std::sync::Mutex` outside any group.
+    ///
+    /// This is the copy primitive of copy-on-divergence: every head over one
+    /// `OpLog` must have its `DocState`/`DiffCalculator`/`Txn` locks in the one
+    /// group the `OpLog` lock belongs to, or the `Txn -> OpLog -> DocState ->
+    /// DiffCalculator` order is unenforced across heads and the debug order
+    /// checker cannot see a cross-head inversion. `fork_with_new_peer_id`'s bare
+    /// `Mutex` sits outside that domain and must not be used to build a head.
+    ///
+    /// `head_mode` is the fresh (private) mode handle for the new head; the
+    /// caller stores the same `Arc` on the new `LoroDocInner`.
+    pub fn fork_in_group(
+        &mut self,
+        doc: Weak<LoroDocInner>,
+        arena: SharedArena,
+        config: Configure,
+        lock_group: &LoroLockGroup,
+        head_mode: Arc<AtomicU8>,
+    ) -> Arc<LoroMutex<Self>> {
+        let peer = Arc::new(AtomicU64::new(DefaultRandom.next_u64()));
+        let store = self.store.fork(arena.clone(), peer.clone(), config.clone());
+        Arc::new(lock_group.new_lock(
+            Self {
+                peer,
+                frontiers: self.frontiers.clone(),
+                store,
+                arena,
+                config,
+                doc,
+                in_txn: false,
+                changed_idx_in_txn: FxHashSet::default(),
+                event_recorder: Default::default(),
+                dead_containers_cache: Default::default(),
+                alive_containers_cache: None,
+                head_mode,
+            },
+            crate::lock::LockKind::DocState,
+        ))
+    }
+
+    /// The head-mode half of the copy-on-divergence sink guard.
+    ///
+    /// Returns `Err(LoroError::HeadShared)` when this state's head is bound to
+    /// more than one branch (immutable). Called at the head of both mutation
+    /// sinks so no path (handler op, import-apply, checkout, undo/redo, a
+    /// mutation inside a `read` closure, or a nested mutation from an event
+    /// callback) can mutate a shared head and corrupt a co-owning branch.
+    #[inline]
+    pub(crate) fn ensure_private(&self) -> LoroResult<()> {
+        if self.head_mode.load(Ordering::Acquire) == crate::HEAD_MODE_SHARED {
+            return Err(LoroError::HeadShared);
+        }
+        Ok(())
     }
 
     pub fn start_recording(&mut self) {
@@ -625,6 +691,8 @@ impl DocState {
         mut diff: InternalDocDiff<'static>,
         diff_mode: DiffMode,
     ) -> LoroResult<()> {
+        // Copy-on-divergence guard: a shared head is immutable. See `MultiHeadDoc`.
+        self.ensure_private()?;
         if self.in_txn {
             return Err(LoroError::TransactionError(
                 "apply_diff should not be called in a transaction"
@@ -939,6 +1007,8 @@ impl DocState {
     }
 
     pub fn apply_local_op(&mut self, raw_op: &RawOp, op: &Op) -> LoroResult<()> {
+        // Copy-on-divergence guard: a shared head is immutable. See `MultiHeadDoc`.
+        self.ensure_private()?;
         // set parent first, `MapContainer` will only be created for TreeID that does not contain
         self.set_container_parent_by_raw_op(raw_op);
         self.ensure_containers_created_by_op(op);

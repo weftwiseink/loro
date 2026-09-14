@@ -139,8 +139,15 @@ impl LoroDoc {
         let config: Configure = oplog.configure.clone();
         let lock_group = LoroLockGroup::new();
         let global_txn = Arc::new(lock_group.new_lock(None, LockKind::Txn));
+        let head_mode = Arc::new(crate::sync::AtomicU8::new(crate::HEAD_MODE_PRIVATE));
         let inner = Arc::new_cyclic(|w| {
-            let state = DocState::new_arc(w.clone(), arena.clone(), config.clone(), &lock_group);
+            let state = DocState::new_arc(
+                w.clone(),
+                arena.clone(),
+                config.clone(),
+                &lock_group,
+                head_mode.clone(),
+            );
             LoroDocInner {
                 oplog: Arc::new(lock_group.new_lock(oplog, LockKind::OpLog)),
                 state,
@@ -158,6 +165,7 @@ impl LoroDoc {
                 peer_id_change_subs: SubscriberSetWithQueue::new(),
                 pre_commit_subs: SubscriberSetWithQueue::new(),
                 first_commit_from_peer_subs: SubscriberSetWithQueue::new(),
+                head_mode,
             }
         });
         LoroDoc { inner }

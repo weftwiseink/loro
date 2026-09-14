@@ -90,10 +90,20 @@ pub struct LoroLockGroup {
 /// a consistent global ordering.
 pub enum LockKind {
     None = 0,
-    Txn = 1,
-    OpLog = 2,
-    DocState = 3,
-    DiffCalculator = 4,
+    /// The head registry of a `MultiHeadDoc`. Acquired before any head lock so
+    /// `resolve` can copy/rebind a head (taking its `Txn`/`DocState` locks)
+    /// while holding the registry.
+    BranchRegistry = 1,
+    Txn = 2,
+    OpLog = 3,
+    DocState = 4,
+    DiffCalculator = 5,
+    /// The self-rooted index's per-branch lineage map. A leaf acquired only
+    /// while the `OpLog` lock is already held (`OpLog -> Lineage`), never with a
+    /// registry or `DocState` lock. Ordered after `DiffCalculator` so the debug
+    /// order checker covers it. (Consumed by `MultiHeadDoc<SelfRooted>` in a
+    /// later phase; the variant is defined here with the rest of the ordering.)
+    Lineage = 6,
 }
 
 impl LoroLockGroup {
@@ -378,10 +388,12 @@ mod tests {
     #[test]
     fn test_lock_kind_enum_values() {
         assert_eq!(LockKind::None as u8, 0);
-        assert_eq!(LockKind::Txn as u8, 1);
-        assert_eq!(LockKind::OpLog as u8, 2);
-        assert_eq!(LockKind::DocState as u8, 3);
-        assert_eq!(LockKind::DiffCalculator as u8, 4);
+        assert_eq!(LockKind::BranchRegistry as u8, 1);
+        assert_eq!(LockKind::Txn as u8, 2);
+        assert_eq!(LockKind::OpLog as u8, 3);
+        assert_eq!(LockKind::DocState as u8, 4);
+        assert_eq!(LockKind::DiffCalculator as u8, 5);
+        assert_eq!(LockKind::Lineage as u8, 6);
     }
 
     #[test]

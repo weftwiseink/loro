@@ -105,6 +105,8 @@ pub enum LoroError {
     ContainersNotFound { containers: Box<Vec<ContainerID>> },
     #[error("Import failed: Deprecated encoding mode")]
     ImportUnsupportedEncodingMode,
+    #[error("Cannot mutate a shared head. A head bound to more than one branch is immutable; the writer must copy it before mutating (copy-on-divergence).")]
+    HeadShared,
 }
 
 impl LoroError {

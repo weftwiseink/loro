@@ -16,8 +16,16 @@ pub mod handler;
 pub mod sync;
 pub use state::container_tree;
 
-use crate::sync::{AtomicBool, AtomicUsize};
+use crate::sync::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::Arc;
+
+/// `head_mode` value: the head is owned by exactly one branch and may be
+/// mutated in place.
+pub(crate) const HEAD_MODE_PRIVATE: u8 = 0;
+/// `head_mode` value: the head is bound to more than one branch and is
+/// immutable. Any mutation reaching a `DocState` sink is refused with
+/// [`loro_common::LoroError::HeadShared`]; the writer must copy first.
+pub(crate) const HEAD_MODE_SHARED: u8 = 1;
 mod change_meta;
 pub(crate) mod lock;
 use arena::SharedArena;
@@ -171,6 +179,37 @@ pub struct LoroDocInner {
     first_commit_from_peer_subs:
         SubscriberSetWithQueue<(), FirstCommitFromPeerCallback, FirstCommitFromPeerPayload>,
     pre_commit_subs: SubscriberSetWithQueue<(), PreCommitCallback, PreCommitCallbackPayload>,
+    /// Copy-on-divergence sink guard (see `MultiHeadDoc`). `HEAD_MODE_PRIVATE`
+    /// or `HEAD_MODE_SHARED`. The same `Arc` is held by this inner's `DocState`,
+    /// so the two mutation sinks (`apply_local_op`, `apply_diff`) can check it
+    /// without upgrading the `Weak<LoroDocInner>` back-pointer on the hot path.
+    /// A plain `LoroDoc` (unbranched) is always `HEAD_MODE_PRIVATE`.
+    head_mode: Arc<AtomicU8>,
+}
+
+impl LoroDocInner {
+    /// Flip this head between private (writable) and shared (immutable). Called
+    /// by the `MultiHeadDoc` registry inside `rebind`; never on an unbranched
+    /// doc.
+    pub(crate) fn set_head_shared(&self, shared: bool) {
+        self.head_mode.store(
+            if shared {
+                HEAD_MODE_SHARED
+            } else {
+                HEAD_MODE_PRIVATE
+            },
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    pub(crate) fn is_head_shared(&self) -> bool {
+        self.head_mode.load(std::sync::atomic::Ordering::Acquire) == HEAD_MODE_SHARED
+    }
+
+    /// The shared mode handle, cloned onto a head's `DocState` at construction.
+    pub(crate) fn head_mode_arc(&self) -> Arc<AtomicU8> {
+        self.head_mode.clone()
+    }
 }
 
 /// The version of the loro crate

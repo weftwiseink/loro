@@ -205,6 +205,27 @@ impl PartialEq for Frontiers {
 
 impl Eq for Frontiers {}
 
+impl std::hash::Hash for Frontiers {
+    /// Order-independent hash, consistent with the set-equality `PartialEq`
+    /// above: two `Frontiers` holding the same id set (in any internal order)
+    /// hash equally. Required so `Frontiers` can key `Registry::by_tip`.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut acc: u64 = 0;
+        let mut len: u64 = 0;
+        for id in self.iter() {
+            // Combine each id into a commutative accumulator (wrapping add of a
+            // per-id hash) so the result does not depend on iteration order.
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&id.peer, &mut h);
+            std::hash::Hash::hash(&id.counter, &mut h);
+            acc = acc.wrapping_add(std::hash::Hasher::finish(&h));
+            len += 1;
+        }
+        state.write_u64(len);
+        state.write_u64(acc);
+    }
+}
+
 impl Frontiers {
     pub fn new() -> Self {
         Self::None
