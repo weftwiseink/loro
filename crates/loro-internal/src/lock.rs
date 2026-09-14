@@ -69,7 +69,7 @@ impl Display for LockInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// A group that defines a shared locking order domain.
 ///
 /// All [`LoroMutex`] created from the same group participate in a single,

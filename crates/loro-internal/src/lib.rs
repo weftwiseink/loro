@@ -67,6 +67,7 @@ pub mod id;
 pub mod jsonpath;
 pub mod kv_store;
 pub mod loro;
+pub mod multi_head;
 pub mod op;
 pub mod oplog;
 pub mod subscription;
@@ -204,11 +205,6 @@ impl LoroDocInner {
 
     pub(crate) fn is_head_shared(&self) -> bool {
         self.head_mode.load(std::sync::atomic::Ordering::Acquire) == HEAD_MODE_SHARED
-    }
-
-    /// The shared mode handle, cloned onto a head's `DocState` at construction.
-    pub(crate) fn head_mode_arc(&self) -> Arc<AtomicU8> {
-        self.head_mode.clone()
     }
 }
 

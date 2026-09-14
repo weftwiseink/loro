@@ -171,6 +171,59 @@ impl LoroDoc {
         LoroDoc { inner }
     }
 
+    /// Build a `LoroDoc` head that shares an existing `OpLog`, arena, config,
+    /// and `LoroLockGroup` with its sibling heads of a `MultiHeadDoc`.
+    ///
+    /// Each head gets its OWN `DocState` (built by `make_state`, so the caller
+    /// picks `DocState::new_arc` for the root head or `DocState::fork_in_group`
+    /// for a copy), its own `DiffCalculator`, `Txn` lock, observer, and
+    /// `head_mode`, all created in the shared `lock_group`. This is the one
+    /// construction site for a head over a shared op log; the fields mirror
+    /// `LoroDoc::new` exactly except for the shared vs. fresh oplog.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_head(
+        oplog: Arc<LoroMutex<OpLog>>,
+        arena: SharedArena,
+        config: Configure,
+        lock_group: &LoroLockGroup,
+        visible_op_count: Arc<AtomicUsize>,
+        head_mode: Arc<crate::sync::AtomicU8>,
+        make_state: impl FnOnce(
+            &std::sync::Weak<LoroDocInner>,
+            &Arc<crate::sync::AtomicU8>,
+        ) -> Arc<LoroMutex<DocState>>,
+        auto_commit: bool,
+    ) -> Self {
+        let txn = Arc::new(lock_group.new_lock(None, LockKind::Txn));
+        let diff_calculator =
+            Arc::new(lock_group.new_lock(DiffCalculator::new(true), LockKind::DiffCalculator));
+        let inner = Arc::new_cyclic(|w| {
+            let state = make_state(w, &head_mode);
+            LoroDocInner {
+                oplog,
+                state,
+                config: config.clone(),
+                visible_op_count,
+                detached: AtomicBool::new(false),
+                auto_commit: AtomicBool::new(false),
+                observer: Arc::new(Observer::new(arena.clone())),
+                diff_calculator,
+                txn,
+                arena,
+                local_update_subs: SubscriberSetWithQueue::new(),
+                peer_id_change_subs: SubscriberSetWithQueue::new(),
+                pre_commit_subs: SubscriberSetWithQueue::new(),
+                first_commit_from_peer_subs: SubscriberSetWithQueue::new(),
+                head_mode,
+            }
+        });
+        let doc = LoroDoc::from_inner(inner);
+        if auto_commit {
+            doc.start_auto_commit();
+        }
+        doc
+    }
+
     pub fn fork(&self) -> Self {
         if self.is_detached() {
             return self
