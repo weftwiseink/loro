@@ -107,6 +107,8 @@ pub enum LoroError {
     ImportUnsupportedEncodingMode,
     #[error("Cannot mutate a shared head. A head bound to more than one branch is immutable; the writer must copy it before mutating (copy-on-divergence).")]
     HeadShared,
+    #[error("Operation '{0}' is not allowed directly on a MultiHeadDoc head; go through the registry (history via import_to_history; peer fixed at fork).")]
+    OwnedHeadOp(&'static str),
 }
 
 impl LoroError {

@@ -68,6 +68,11 @@ impl crate::LoroDoc {
 
         let obs = self.observer.clone();
         let local_update_subs_weak = self.local_update_subs.downgrade();
+        // The registry back-pointer's on-commit tip-mirror hook (see `DocOwner`
+        // / `MultiHeadDoc`). `None` for a plain doc, so unbranched behaviour is
+        // unchanged. Runs after the head's locks drop, so it may take the
+        // registry lock to re-key its tip index and notify its policy.
+        let owner = self.owner.clone();
         txn.set_on_commit(Box::new(move |state, oplog, id_span| {
             let mut state = state.lock();
             let events = state.take_events();
@@ -85,6 +90,10 @@ impl crate::LoroDoc {
                     let bytes = { export_fast_updates_in_range(&oplog.lock(), &[id_span]) };
                     local_update_subs.emit(&(), bytes);
                 }
+            }
+
+            if let Some(owner) = &owner {
+                owner.on_head_commit(id_span);
             }
         }));
 

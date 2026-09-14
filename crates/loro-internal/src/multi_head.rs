@@ -18,30 +18,44 @@
 //!
 //! # Phase 1 scope
 //!
-//! This module is the Phase 1 foundational unit. It deliberately does NOT
-//! implement the index (`SelfRooted`), content docs (`Delegated`), the
+//! This module is the foundational unit. It deliberately does NOT implement
+//! the index (`SelfRooted`), content docs (`Delegated`), the
 //! `BranchingDoc`/`Branch` wrapper, `__fs__`, wasm, or persistent DocState.
-//! Branch-scoped subscription rebinding (`Registry::subs`) and true
-//! history-only `import` belong to later phases and are flagged where stubbed.
+//! Branch-scoped subscription rebinding on `rebind` belongs to a later phase
+//! (the base aggregates history / first-commit at the doc level instead).
+//!
+//! On-commit re-keying of `by_tip` and `HeadPolicy::after_commit` run through
+//! the INJECTED txn on-commit hook (see [`DocOwner`] / `on_head_committed`),
+//! not a synchronous call from `write`. `import` is history-only: ops enter the
+//! shared op log via `LoroDoc::import_to_history` under the all-heads barrier,
+//! never materializing into a live head.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, Weak};
 
 use rustc_hash::FxHashMap;
 
 use crate::arena::SharedArena;
 use crate::configure::Configure;
-use crate::encoding::ImportStatus;
+use crate::encoding::{ExportMode, ImportStatus};
 use crate::lock::{LockKind, LoroLockGroup, LoroMutex};
 use crate::oplog::OpLog;
+use crate::pre_commit::{FirstCommitFromPeerCallback, FirstCommitFromPeerPayload};
 use crate::state::DocState;
-use crate::sync::{AtomicU8, AtomicUsize};
+use crate::sync::{AtomicU64, AtomicU8, AtomicUsize};
+use crate::utils::subscription::{SubscriberSetWithQueue, Subscription};
 use crate::version::Frontiers;
-use crate::{LoroDoc, HEAD_MODE_PRIVATE};
-use loro_common::{InternalString, LoroError, LoroResult, ID};
+use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
+use loro_common::{IdSpan, InternalString, LoroEncodeError, LoroResult, ID};
 
 pub type BranchId = InternalString;
 pub type HeadId = u64;
+
+/// One event per new change landing in the shared history (a head commit or an
+/// import), carrying that change's update bytes. Mirrors `LocalUpdateCallback`.
+pub type HistoryCallback = Box<dyn Fn(&Vec<u8>) -> bool + Send + Sync + 'static>;
 
 /// When a `MultiHeadDoc` copies a head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,12 +88,40 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
     fn target(&self, this: &MultiHeadDoc<Self>, b: &BranchId) -> LoroResult<Frontiers>;
 
     /// Publish the new tip after `b`'s head commits `last`. May be a no-op (the
-    /// index's tip IS its record).
+    /// index's tip IS its record). Runs OUTSIDE the registry lock.
     fn after_commit(&self, this: &MultiHeadDoc<Self>, b: &BranchId, last: ID);
 
     /// Given the spans that just landed on import, return the branches whose
     /// binding should be re-resolved.
     fn after_import(&self, this: &MultiHeadDoc<Self>, status: &ImportStatus) -> Vec<BranchId>;
+}
+
+// A head commit fires the injected txn on-commit hook (see `DocOwner`), which
+// calls `MultiHeadDoc::on_head_committed`. That callback needs the registry
+// lock. When the commit was itself triggered from INSIDE a registry operation
+// (a `flip_to_shared` that flushes a head's pending ops before marking it
+// immutable), taking the lock again on the same thread would be reentrant. This
+// thread-local depth counter lets the callback detect that case and defer: the
+// in-progress registry op re-keys `by_tip` itself, so nothing is lost.
+thread_local! {
+    static REG_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+fn in_registry_op() -> bool {
+    REG_DEPTH.with(|c| c.get() > 0)
+}
+
+struct RegOpGuard;
+impl RegOpGuard {
+    fn enter() -> Self {
+        REG_DEPTH.with(|c| c.set(c.get() + 1));
+        RegOpGuard
+    }
+}
+impl Drop for RegOpGuard {
+    fn drop(&mut self) {
+        REG_DEPTH.with(|c| c.set(c.get() - 1));
+    }
 }
 
 /// A materialized state at one tip: a `LoroDoc` over the shared `OpLog`.
@@ -90,6 +132,10 @@ struct Head {
     /// `1` = uniquely owned (writable in place); `> 1` = shared (immutable);
     /// `0` = orphan.
     refs: usize,
+    /// Per-head forwarders that feed this head's local commits / first-commits
+    /// into the doc-level `history_subs` / `first_commit_subs`. Kept alive for
+    /// the head's lifetime; dropped (unsubscribed) when the head is evicted.
+    _forward: Vec<Subscription>,
 }
 
 /// The head registry. Guarded by a single `LockKind::BranchRegistry` lock,
@@ -118,10 +164,10 @@ impl Registry {
     }
 }
 
-/// The shared base: one op log, the head registry, the copy machinery, the sink
-/// guard. Written once; both variants build on it.
+/// The shared innards of a `MultiHeadDoc`, held behind an `Arc` so a head's
+/// injected on-commit hook can hold a `Weak` back to it (see `HeadOwner`).
 #[allow(missing_debug_implementations)] // holds LoroMutex<OpLog>/live heads; no useful Debug
-pub struct MultiHeadDoc<P: HeadPolicy> {
+pub struct MultiHeadInner<P: HeadPolicy> {
     oplog: Arc<LoroMutex<OpLog>>,
     arena: SharedArena,
     config: Configure,
@@ -129,6 +175,77 @@ pub struct MultiHeadDoc<P: HeadPolicy> {
     visible_op_count: Arc<AtomicUsize>,
     reg: LoroMutex<Registry>,
     policy: P,
+    /// Head whose materialized state a `Snapshot` export carries (default: the
+    /// root head). Ops/history export is head-independent (shared op log).
+    snapshot_head: AtomicU64,
+    /// One event per new change in the shared history, aggregated over heads and
+    /// imports.
+    history_subs: SubscriberSetWithQueue<(), HistoryCallback, Vec<u8>>,
+    /// One event per first commit from a peer, aggregated over heads. Every head
+    /// copy mints a fresh peer, so this fires once per write slot.
+    first_commit_subs:
+        SubscriberSetWithQueue<(), FirstCommitFromPeerCallback, FirstCommitFromPeerPayload>,
+}
+
+/// The shared base: one op log, the head registry, the copy machinery, the sink
+/// guard. Written once; both variants build on it. Cheap to clone (an `Arc`).
+#[allow(missing_debug_implementations)]
+pub struct MultiHeadDoc<P: HeadPolicy> {
+    inner: Arc<MultiHeadInner<P>>,
+}
+
+impl<P: HeadPolicy> Clone for MultiHeadDoc<P> {
+    fn clone(&self) -> Self {
+        MultiHeadDoc {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<P: HeadPolicy> Deref for MultiHeadDoc<P> {
+    type Target = MultiHeadInner<P>;
+    fn deref(&self) -> &MultiHeadInner<P> {
+        &self.inner
+    }
+}
+
+/// The registry back-pointer installed on each head. The txn commit path calls
+/// `on_head_commit` after the head's locks drop; we re-key the tip index and
+/// notify the policy from there.
+struct HeadOwner<P: HeadPolicy> {
+    inner: Weak<MultiHeadInner<P>>,
+    head_id: HeadId,
+}
+
+impl<P: HeadPolicy> DocOwner for HeadOwner<P> {
+    fn on_head_commit(&self, _id_span: IdSpan) {
+        if let Some(inner) = self.inner.upgrade() {
+            MultiHeadDoc { inner }.on_head_committed(self.head_id);
+        }
+    }
+}
+
+/// Install the per-head forwarders that feed a head's local commits and
+/// first-commit-from-peer events into the doc-level aggregated subscriptions.
+fn install_forwarders<P: HeadPolicy>(
+    inner: &Weak<MultiHeadInner<P>>,
+    doc: &LoroDoc,
+) -> Vec<Subscription> {
+    let w1 = inner.clone();
+    let s1 = doc.subscribe_local_update(Box::new(move |bytes| {
+        if let Some(inner) = w1.upgrade() {
+            inner.history_subs.emit(&(), bytes.clone());
+        }
+        true
+    }));
+    let w2 = inner.clone();
+    let s2 = doc.subscribe_first_commit_from_peer(Box::new(move |payload| {
+        if let Some(inner) = w2.upgrade() {
+            inner.first_commit_subs.emit(&(), payload.clone());
+        }
+        true
+    }));
+    vec![s1, s2]
 }
 
 impl<P: HeadPolicy> MultiHeadDoc<P> {
@@ -142,89 +259,125 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         let lock_group = LoroLockGroup::new();
         let oplog = Arc::new(lock_group.new_lock(oplog, LockKind::OpLog));
 
-        let head_mode = Arc::new(AtomicU8::new(HEAD_MODE_PRIVATE));
-        let arena_c = arena.clone();
-        let config_c = config.clone();
-        let lg = lock_group.clone();
-        let root = LoroDoc::build_head(
-            oplog.clone(),
-            arena.clone(),
-            config.clone(),
-            &lock_group,
-            visible_op_count.clone(),
-            head_mode,
-            move |w, hm| {
-                DocState::new_arc(
-                    w.clone(),
-                    arena_c.clone(),
-                    config_c.clone(),
-                    &lg,
-                    hm.clone(),
-                )
-            },
-            true,
-        );
-        let tip = root.state_frontiers();
+        let inner = Arc::new_cyclic(|w: &Weak<MultiHeadInner<P>>| {
+            // Build the empty root head (id 0) over the shared op log, with its
+            // registry back-pointer and history forwarders installed.
+            let head_mode = Arc::new(AtomicU8::new(HEAD_MODE_PRIVATE));
+            let arena_c = arena.clone();
+            let config_c = config.clone();
+            let lg = lock_group.clone();
+            let owner: Arc<dyn DocOwner> = Arc::new(HeadOwner {
+                inner: w.clone(),
+                head_id: 0,
+            });
+            let root = LoroDoc::build_head(
+                oplog.clone(),
+                arena.clone(),
+                config.clone(),
+                &lock_group,
+                visible_op_count.clone(),
+                head_mode,
+                Some(owner),
+                move |cyclic, hm| {
+                    DocState::new_arc(
+                        cyclic.clone(),
+                        arena_c.clone(),
+                        config_c.clone(),
+                        &lg,
+                        hm.clone(),
+                    )
+                },
+                true,
+            );
+            let forward = install_forwarders(w, &root);
+            let tip = root.state_frontiers();
 
-        let mut heads = FxHashMap::default();
-        let mut by_tip = FxHashMap::default();
-        heads.insert(
-            0,
-            Head {
-                doc: root,
-                tip: tip.clone(),
-                refs: 0,
-            },
-        );
-        by_tip.insert(tip, 0);
+            let mut heads = FxHashMap::default();
+            let mut by_tip = FxHashMap::default();
+            heads.insert(
+                0,
+                Head {
+                    doc: root,
+                    tip: tip.clone(),
+                    refs: 0,
+                    _forward: forward,
+                },
+            );
+            by_tip.insert(tip, 0);
 
-        let reg = Registry {
-            heads,
-            by_tip,
-            bound: FxHashMap::default(),
-            orphans: VecDeque::new(),
-            warm_budget: 8,
-            next_id: 1,
-        };
+            MultiHeadInner {
+                oplog: oplog.clone(),
+                arena: arena.clone(),
+                config: config.clone(),
+                lock_group: lock_group.clone(),
+                visible_op_count: visible_op_count.clone(),
+                reg: lock_group.new_lock(
+                    Registry {
+                        heads,
+                        by_tip,
+                        bound: FxHashMap::default(),
+                        orphans: VecDeque::new(),
+                        warm_budget: 8,
+                        next_id: 1,
+                    },
+                    LockKind::BranchRegistry,
+                ),
+                policy,
+                snapshot_head: AtomicU64::new(0),
+                history_subs: SubscriberSetWithQueue::new(),
+                first_commit_subs: SubscriberSetWithQueue::new(),
+            }
+        });
 
-        MultiHeadDoc {
-            oplog,
-            arena,
-            config,
-            lock_group: lock_group.clone(),
-            visible_op_count,
-            reg: lock_group.new_lock(reg, LockKind::BranchRegistry),
-            policy,
-        }
+        MultiHeadDoc { inner }
     }
 
     pub fn policy(&self) -> &P {
-        &self.policy
+        &self.inner.policy
     }
 
     /// The id of the empty root head created by [`new`](Self::new).
     pub fn root_head_id(&self) -> HeadId {
-        // The root is always id 0.
         0
     }
 
     pub fn set_warm_budget(&self, orphans: usize) {
-        self.reg.lock().warm_budget = orphans;
+        self.with_reg(|_, reg| reg.warm_budget = orphans);
+    }
+
+    /// The head whose state a `Snapshot` export carries.
+    pub fn set_snapshot_head(&self, id: HeadId) {
+        self.snapshot_head
+            .store(id, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Run `f` under the registry lock, marking the current thread as inside a
+    /// registry op for the duration (so an on-commit hook fired by a
+    /// `flip_to_shared` flush defers rather than re-entering the lock).
+    fn with_reg<R>(&self, f: impl FnOnce(&Self, &mut Registry) -> R) -> R {
+        let _g = RegOpGuard::enter();
+        let mut reg = self.reg.lock();
+        f(self, &mut reg)
     }
 
     // --- head construction -------------------------------------------------
 
     /// Structurally copy a head: a new `LoroDocInner` over the SAME
     /// `Arc<OpLog>`, arena, config, and lock group, with `fork_in_group` for
-    /// the state (fresh peer, fresh `DiffCalculator`, `Private`). The copy is
-    /// inserted with `refs == 0` and is absent from `by_tip` (invariant I3)
-    /// until a caller binds and commits it.
+    /// the state (fresh peer, fresh `DiffCalculator`, `Private`), its registry
+    /// back-pointer and history forwarders installed. Inserted with `refs == 0`
+    /// and absent from `by_tip` (invariant I3) until a caller binds/commits it.
     fn copy_head(&self, reg: &mut Registry, src_id: HeadId) -> HeadId {
+        let id = reg.alloc_id();
         let src_state = reg.heads[&src_id].doc.state.clone();
         let head_mode = Arc::new(AtomicU8::new(HEAD_MODE_PRIVATE));
         let arena = self.arena.clone();
         let config = self.config.clone();
         let lg = self.lock_group.clone();
+        let owner: Arc<dyn DocOwner> = Arc::new(HeadOwner {
+            inner: Arc::downgrade(&self.inner),
+            head_id: id,
+        });
         let doc = LoroDoc::build_head(
             self.oplog.clone(),
             arena.clone(),
@@ -232,9 +385,10 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             &self.lock_group,
             self.visible_op_count.clone(),
             head_mode,
-            move |w, hm| {
+            Some(owner),
+            move |cyclic, hm| {
                 src_state.lock().fork_in_group(
-                    w.clone(),
+                    cyclic.clone(),
                     arena.clone(),
                     config.clone(),
                     &lg,
@@ -243,16 +397,23 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             },
             true,
         );
+        let forward = install_forwarders(&Arc::downgrade(&self.inner), &doc);
         let tip = doc.state_frontiers();
-        let id = reg.alloc_id();
-        reg.heads.insert(id, Head { doc, tip, refs: 0 });
+        reg.heads.insert(
+            id,
+            Head {
+                doc,
+                tip,
+                refs: 0,
+                _forward: forward,
+            },
+        );
         id
     }
 
     // --- refs / mode flips -------------------------------------------------
 
     fn inc_refs(&self, reg: &mut Registry, id: HeadId) {
-        // No longer an orphan if it was one.
         reg.orphans.retain(|o| *o != id);
         let refs = {
             let h = reg.heads.get_mut(&id).expect("head exists");
@@ -279,7 +440,8 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
 
     /// `1 -> 2`: commit any pending transaction (so a shared head never has an
     /// open transaction, invariant I2), re-key `by_tip` if that commit moved
-    /// the tip, then mark the head `Shared`.
+    /// the tip, then mark the head `Shared`. The flush's on-commit hook defers
+    /// (we are inside a registry op), so we re-key here.
     fn flip_to_shared(&self, reg: &mut Registry, id: HeadId) {
         let h = reg.heads.get_mut(&id).expect("head exists");
         let old_tip = h.tip.clone();
@@ -322,8 +484,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     // --- binding -----------------------------------------------------------
 
     /// Bind branch `b` to `new_id`, adjusting refs (and thus shared/private
-    /// mode) on both the old and new heads. Sharing a head (`refs` rising to 2)
-    /// flips it immutable; leaving one (`refs` falling to 1) flips it writable.
+    /// mode) on both the old and new heads.
     fn rebind(&self, reg: &mut Registry, b: &BranchId, new_id: HeadId) {
         if let Some(&old) = reg.bound.get(b) {
             if old == new_id {
@@ -337,82 +498,76 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
 
     /// Bind a branch directly to an existing head (test / low-level entry).
     pub fn bind(&self, b: &BranchId, head_id: HeadId) {
-        let mut reg = self.reg.lock();
-        self.rebind(&mut reg, b, head_id);
+        self.with_reg(|this, reg| this.rebind(reg, b, head_id));
     }
 
     /// Create branch `new` bound to wherever `from` currently resolves: the
-    /// free, O(1) branch-from-a-live-head path (share `from`'s head). For an
-    /// `Eager` policy this is where the caller would instead copy; the base
-    /// provides the shared-head bind and the policy decides.
+    /// free, O(1) branch-from-a-live-head path (share `from`'s head), or an
+    /// eager copy for an `Eager` policy.
     pub fn create_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
         let (from_head, _) = self.resolve(from, Intent::Read)?;
-        let mut reg = self.reg.lock();
-        if P::COPY == CopyMode::Eager {
-            // The index's degenerate case: every head born refs == 1.
-            let copy = self.copy_head(&mut reg, from_head);
-            self.rebind(&mut reg, new, copy);
-        } else {
-            self.rebind(&mut reg, new, from_head);
-        }
+        self.with_reg(|this, reg| {
+            if P::COPY == CopyMode::Eager {
+                let copy = this.copy_head(reg, from_head);
+                this.rebind(reg, new, copy);
+            } else {
+                this.rebind(reg, new, from_head);
+            }
+        });
         Ok(())
     }
 
     // --- resolution --------------------------------------------------------
 
     /// Resolve branch `b` to the head it should use, copying-and-rebinding when
-    /// a `Write` reaches a shared head. Returns the head id and a handle. The
-    /// registry lock is released before the handle is used.
+    /// a `Write` reaches a shared head. Returns the head id and a handle.
     pub fn resolve(&self, b: &BranchId, intent: Intent) -> LoroResult<(HeadId, LoroDoc)> {
-        let mut reg = self.reg.lock();
-        let target = self.policy.target(self, b)?;
+        self.with_reg(|this, reg| {
+            let target = this.inner.policy.target(this, b)?;
 
-        let mut id = match reg.bound.get(b).copied() {
-            Some(h) if reg.heads[&h].tip == target => h,
-            cur => match reg.by_tip.get(&target).copied() {
-                // Another branch already rests at `target`: SHARE it, O(1).
-                Some(h2) => {
-                    self.rebind(&mut reg, b, h2);
-                    h2
-                }
-                None => match cur {
-                    Some(h) if reg.heads[&h].refs == 1 => {
-                        self.advance_in_place(&mut reg, h, &target)?;
-                        h
+            let mut id = match reg.bound.get(b).copied() {
+                Some(h) if reg.heads[&h].tip == target => h,
+                cur => match reg.by_tip.get(&target).copied() {
+                    Some(h2) => {
+                        this.rebind(reg, b, h2);
+                        h2
                     }
-                    Some(h) => {
-                        let c = self.copy_head(&mut reg, h);
-                        self.advance_in_place(&mut reg, c, &target)?;
-                        self.rebind(&mut reg, b, c);
-                        c
-                    }
-                    // SECONDARY: nearest source + diff.
-                    None => {
-                        let m = self.materialize(&mut reg, &target)?;
-                        self.rebind(&mut reg, b, m);
-                        m
-                    }
+                    None => match cur {
+                        Some(h) if reg.heads[&h].refs == 1 => {
+                            this.advance_in_place(reg, h, &target)?;
+                            h
+                        }
+                        Some(h) => {
+                            let c = this.copy_head(reg, h);
+                            this.advance_in_place(reg, c, &target)?;
+                            this.rebind(reg, b, c);
+                            c
+                        }
+                        None => {
+                            let m = this.materialize(reg, &target)?;
+                            this.rebind(reg, b, m);
+                            m
+                        }
+                    },
                 },
-            },
-        };
+            };
 
-        if intent == Intent::Write && reg.heads[&id].refs > 1 {
-            debug_assert!(
-                P::COPY == CopyMode::OnDivergence,
-                "an Eager head is born refs == 1 and never reaches the Write copy arm"
-            );
-            let c = self.copy_head(&mut reg, id);
-            self.rebind(&mut reg, b, c);
-            id = c;
-        }
+            if intent == Intent::Write && reg.heads[&id].refs > 1 {
+                debug_assert!(
+                    P::COPY == CopyMode::OnDivergence,
+                    "an Eager head is born refs == 1 and never reaches the Write copy arm"
+                );
+                let c = this.copy_head(reg, id);
+                this.rebind(reg, b, c);
+                id = c;
+            }
 
-        let doc = reg.heads[&id].doc.clone();
-        Ok((id, doc))
+            Ok((id, reg.heads[&id].doc.clone()))
+        })
     }
 
     /// Move a UNIQUELY-owned head to `target` by applying `diff(tip, target)`
-    /// (a checkout on the shared history). Precondition: `refs == 1` (the
-    /// caller copies first otherwise).
+    /// (a checkout on the shared history). Precondition: `refs == 1`.
     fn advance_in_place(
         &self,
         reg: &mut Registry,
@@ -435,8 +590,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     }
 
     /// SECONDARY path: build a head at `target` from the nearest existing head
-    /// (or the root), then advance it. Reached only for a frontier no head is
-    /// at. No checkpoint code (deferred).
+    /// (or the root), then advance it. No checkpoint code (deferred).
     fn materialize(&self, reg: &mut Registry, target: &Frontiers) -> LoroResult<HeadId> {
         let src = reg
             .by_tip
@@ -444,7 +598,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             .next()
             .copied()
             .or_else(|| reg.heads.keys().next().copied())
-            .ok_or(LoroError::HeadShared)?; // no heads at all is impossible (root always exists)
+            .expect("the root head always exists");
         let c = self.copy_head(reg, src);
         self.advance_in_place(reg, c, target)?;
         Ok(c)
@@ -453,68 +607,76 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     // --- read / write ------------------------------------------------------
 
     /// Resolve `b` for read (never copies) and run `f` on the resolved head. A
-    /// mutation inside `f` on a shared head errors from the sink; it does not
-    /// corrupt a co-owner.
+    /// mutation inside `f` on a shared head errors from the sink.
     pub fn read<R>(&self, b: &BranchId, f: impl FnOnce(&LoroDoc) -> R) -> LoroResult<R> {
         let (_, doc) = self.resolve(b, Intent::Read)?;
         Ok(f(&doc))
     }
 
     /// Resolve `b` for write (copies if shared, handing back a `Private` head),
-    /// run `f`, then commit and re-key `by_tip` + notify the policy.
+    /// run `f`, then commit. The commit fires the injected on-commit hook
+    /// (`on_head_committed`), which re-keys `by_tip` and notifies the policy;
+    /// there is no synchronous re-keying here.
     pub fn write<R>(&self, b: &BranchId, f: impl FnOnce(&LoroDoc) -> R) -> LoroResult<R> {
-        let (id, doc) = self.resolve(b, Intent::Write)?;
+        let (_, doc) = self.resolve(b, Intent::Write)?;
         let r = f(&doc);
         doc.commit_then_renew();
-        self.on_commit(b, id);
         Ok(r)
     }
 
-    /// After a head commits: re-key `by_tip` to its new tip and let the policy
-    /// publish it. `last` (the fresh op id) cannot collide in `by_tip`.
-    fn on_commit(&self, b: &BranchId, id: HeadId) {
-        let mut reg = self.reg.lock();
-        let (old_tip, new_tip) = {
-            let doc = reg.heads[&id].doc.clone();
-            let new_tip = doc.state_frontiers();
-            let h = reg.heads.get_mut(&id).expect("head exists");
-            let old = std::mem::replace(&mut h.tip, new_tip.clone());
-            (old, new_tip)
-        };
-        if old_tip != new_tip {
-            if reg.by_tip.get(&old_tip) == Some(&id) {
-                reg.by_tip.remove(&old_tip);
-            }
-            reg.by_tip.insert(new_tip.clone(), id);
+    /// The injected txn on-commit hook target. Runs after the head's locks drop
+    /// (so it may lock the registry), unless the commit was triggered from
+    /// inside a registry op (a `flip_to_shared` flush), in which case that op
+    /// re-keys `by_tip` itself and this defers.
+    fn on_head_committed(&self, id: HeadId) {
+        if in_registry_op() {
+            return;
         }
-        drop(reg);
-        if let Some(last) = new_tip.as_single() {
-            self.policy.after_commit(self, b, last);
+        let (new_tip, branch) = {
+            let _g = RegOpGuard::enter();
+            let mut reg = self.reg.lock();
+            let Some(head) = reg.heads.get(&id) else {
+                return;
+            };
+            let new_tip = head.doc.state_frontiers();
+            let old_tip = std::mem::replace(
+                &mut reg.heads.get_mut(&id).expect("head exists").tip,
+                new_tip.clone(),
+            );
+            if old_tip != new_tip {
+                if reg.by_tip.get(&old_tip) == Some(&id) {
+                    reg.by_tip.remove(&old_tip);
+                }
+                reg.by_tip.insert(new_tip.clone(), id);
+            }
+            // Reverse lookup: only a refs == 1 head commits, so at most one
+            // branch is bound here.
+            let branch = reg
+                .bound
+                .iter()
+                .find(|(_, h)| **h == id)
+                .map(|(b, _)| b.clone());
+            (new_tip, branch)
+        };
+        if let (Some(b), Some(last)) = (branch, new_tip.as_single()) {
+            self.inner.policy.after_commit(self, &b, last);
         }
     }
 
     // --- history barrier / import / export ---------------------------------
 
     /// Run `f` with EVERY head's transaction committed and stopped (the
-    /// all-heads import barrier). Each head's auto-commit txn is renewed
-    /// afterward. Reusable by `import` / `replace_history`.
+    /// all-heads import barrier), then renew each head's auto-commit txn.
+    ///
+    /// Every head's `Txn` lock is the SAME `LockKind` in one shared group, so
+    /// the order checker forbids holding two at once; we therefore commit-stop
+    /// each head sequentially (dropping its guard; the txn stays `None` because
+    /// we do not renew yet), run `f`, then renew.
     pub fn with_all_heads_barrier<R>(&self, f: impl FnOnce() -> R) -> R {
-        let reg = self.reg.lock();
-        let docs: Vec<LoroDoc> = reg.heads.values().map(|h| h.doc.clone()).collect();
-        drop(reg);
-        // Every head's `Txn` lock is the SAME `LockKind` in one shared group, so
-        // the order checker forbids holding two at once. We therefore
-        // commit-and-stop each head sequentially, dropping its txn guard (the
-        // transaction stays `None` because we do not renew here), run `f` with
-        // no head holding an open transaction, then renew each head's
-        // auto-commit transaction afterward.
-        //
-        // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): dropping the
-        // guards means the barrier alone does not block a concurrent thread from
-        // starting a fresh txn on a head during `f`. Under Phase 1 that cannot
-        // happen (single-writer, single-threaded tests); a multi-threaded
-        // history-only import that needs a hard barrier is a later-phase concern
-        // (it also needs `import_to_history`, not present on this branch).
+        let docs: Vec<LoroDoc> = {
+            let reg = self.reg.lock();
+            reg.heads.values().map(|h| h.doc.clone()).collect()
+        };
         let mut renew = Vec::with_capacity(docs.len());
         for d in &docs {
             let (opts, guard) = d.implicit_commit_then_stop();
@@ -528,33 +690,85 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         r
     }
 
-    /// The number of live heads (test / diagnostics).
+    /// History-only import: land ops into the shared `OpLog` WITHOUT moving any
+    /// head's state or binding (all heads barriered). No co-owner of a shared
+    /// head can be corrupted; heads observe the ops only when the registry
+    /// advances them. Emits a history event with the imported bytes.
+    pub fn import(&self, bytes: &[u8]) -> LoroResult<ImportStatus> {
+        let head = {
+            let reg = self.reg.lock();
+            reg.heads
+                .values()
+                .next()
+                .map(|h| h.doc.clone())
+                .expect("the root head always exists")
+        };
+        let status = self.with_all_heads_barrier(|| head.import_to_history(bytes))?;
+        if !self.history_subs.inner().is_empty() {
+            self.history_subs.emit(&(), bytes.to_vec());
+        }
+        Ok(status)
+    }
+
+    /// Export the shared history. `Snapshot` additionally carries the
+    /// `snapshot_head`'s materialized state (default: the root head); all other
+    /// modes are head-independent (the op log is shared).
+    pub fn export(&self, mode: ExportMode) -> Result<Vec<u8>, LoroEncodeError> {
+        let want = self
+            .snapshot_head
+            .load(std::sync::atomic::Ordering::Acquire);
+        let doc = {
+            let reg = self.reg.lock();
+            reg.heads
+                .get(&want)
+                .or_else(|| reg.heads.values().next())
+                .map(|h| h.doc.clone())
+                .expect("the root head always exists")
+        };
+        doc.export(mode)
+    }
+
+    /// One event per new change in the shared history (any head commit or an
+    /// import), carrying that change's update bytes.
+    pub fn subscribe_history(&self, callback: HistoryCallback) -> Subscription {
+        let (sub, enable) = self.history_subs.inner().insert((), callback);
+        enable();
+        sub
+    }
+
+    /// One event per first commit from a peer, aggregated over all heads. Every
+    /// head copy mints a fresh peer, so this fires once per write slot.
+    pub fn subscribe_first_commit_from_peer(
+        &self,
+        callback: FirstCommitFromPeerCallback,
+    ) -> Subscription {
+        let (sub, enable) = self.first_commit_subs.inner().insert((), callback);
+        enable();
+        sub
+    }
+
+    // --- accessors (test / diagnostics) ------------------------------------
+
     pub fn head_count(&self) -> usize {
         self.reg.lock().heads.len()
     }
 
-    /// A clone of a head's `LoroDoc` handle, by id (test / diagnostics; models
-    /// a handle "leaked" out of a `read` closure).
     pub fn head_doc(&self, id: HeadId) -> Option<LoroDoc> {
         self.reg.lock().heads.get(&id).map(|h| h.doc.clone())
     }
 
-    /// The head id a branch is currently bound to.
     pub fn bound_head(&self, b: &BranchId) -> Option<HeadId> {
         self.reg.lock().bound.get(b).copied()
     }
 
-    /// The recorded tip of a head (test / diagnostics).
     pub fn head_tip(&self, id: HeadId) -> Option<Frontiers> {
         self.reg.lock().heads.get(&id).map(|h| h.tip.clone())
     }
 
-    /// Whether `by_tip` maps `tip` to `id` (test: on_commit re-keying).
     pub fn by_tip_maps(&self, tip: &Frontiers, id: HeadId) -> bool {
         self.reg.lock().by_tip.get(tip) == Some(&id)
     }
 
-    /// The refcount of the head a branch is bound to.
     pub fn refs_of(&self, b: &BranchId) -> Option<usize> {
         let reg = self.reg.lock();
         reg.bound
@@ -563,7 +777,6 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             .map(|h| h.refs)
     }
 
-    /// Whether the head a branch is bound to is currently shared (immutable).
     pub fn is_head_shared(&self, b: &BranchId) -> Option<bool> {
         let reg = self.reg.lock();
         reg.bound
@@ -599,6 +812,11 @@ impl Manual {
     pub fn set_target(&self, b: &BranchId, target: Frontiers) {
         self.targets.lock().unwrap().insert(b.clone(), target);
     }
+
+    /// The recorded target for a branch (test: observe `after_commit`).
+    pub fn target_of(&self, b: &BranchId) -> Option<Frontiers> {
+        self.targets.lock().unwrap().get(b).cloned()
+    }
 }
 
 impl HeadPolicy for Manual {
@@ -630,6 +848,7 @@ impl HeadPolicy for Manual {
 mod tests {
     use super::*;
     use crate::lock::{LockKind, LoroLockGroup};
+    use loro_common::LoroError;
     use std::sync::{Arc, Mutex};
 
     fn b(s: &str) -> BranchId {
@@ -920,5 +1139,235 @@ mod tests {
         md.write(&main, |d| d.get_text("t").insert_unicode(1, "B").unwrap())
             .unwrap();
         assert_eq!(tlen(&md, &main), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Injected on-commit hook (migration off the synchronous write() path)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn injected_on_commit_hook_rekeys_and_after_commits() {
+        // Commit DIRECTLY on a head's own handle, bypassing MultiHeadDoc::write
+        // entirely. by_tip re-keying and Manual's after_commit can now come ONLY
+        // from the injected txn on-commit hook (the synchronous write()-driven
+        // path is gone), so their effects prove the hook fired.
+        let md = MultiHeadDoc::new(Manual::new());
+        let main = b("main");
+        md.bind(&main, 0); // refs 1, private, tip empty
+        assert!(md.by_tip_maps(&Frontiers::default(), 0));
+
+        let doc = md.head_doc(0).unwrap();
+        doc.get_text("t").insert_unicode(0, "A").unwrap();
+        doc.commit_then_renew(); // fires the injected on_commit hook
+
+        let t = md.head_tip(0).unwrap();
+        assert!(!t.is_empty(), "tip advanced");
+        assert!(md.by_tip_maps(&t, 0), "hook re-keyed by_tip to the new tip");
+        assert!(
+            !md.by_tip_maps(&Frontiers::default(), 0),
+            "hook vacated the old empty tip"
+        );
+        assert_eq!(
+            md.policy().target_of(&main),
+            Some(t),
+            "hook ran after_commit (Manual recorded the new target)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // History-only import: no head materialization, co-owner safe, visible
+    // to a head that advances; sink guard backstops a shared head.
+    // ------------------------------------------------------------------
+
+    fn external_updates(text: &str) -> Vec<u8> {
+        let ext = LoroDoc::new();
+        ext.start_auto_commit();
+        ext.get_text("t").insert_unicode(0, text).unwrap();
+        ext.commit_then_renew();
+        ext.export(crate::encoding::ExportMode::all_updates())
+            .unwrap()
+    }
+
+    fn external_updates_frontier(text: &str) -> (Vec<u8>, Frontiers) {
+        let ext = LoroDoc::new();
+        ext.start_auto_commit();
+        ext.get_text("t").insert_unicode(0, text).unwrap();
+        ext.commit_then_renew();
+        let f = ext.state_frontiers();
+        let bytes = ext
+            .export(crate::encoding::ExportMode::all_updates())
+            .unwrap();
+        (bytes, f)
+    }
+
+    #[test]
+    fn import_is_history_only_and_coowner_safe() {
+        let md = MultiHeadDoc::new(Manual::new());
+        let (main, review) = (b("main"), b("review"));
+        md.bind(&main, 0);
+        md.bind(&review, 0); // refs 2, head 0 shared
+        assert_eq!(md.is_head_shared(&main), Some(true));
+
+        let updates = external_updates("ABC");
+        md.import(&updates).unwrap();
+
+        // History-only: the shared head's materialized state is UNTOUCHED, so no
+        // co-owner sees the imported ops. (The failure picture: an import that
+        // silently materialized into head 0 would corrupt both main and review.)
+        assert_eq!(
+            tlen(&md, &main),
+            0,
+            "shared co-owner main untouched by import"
+        );
+        assert_eq!(
+            tlen(&md, &review),
+            0,
+            "shared co-owner review untouched by import"
+        );
+
+        // The ops ARE in the shared history: a fresh branch that advances to
+        // include them materializes them.
+        let (updates2, f2) = external_updates_frontier("XYZ");
+        md.import(&updates2).unwrap();
+        let reader = b("reader");
+        md.policy().set_target(&reader, f2);
+        let seen = md.read(&reader, |d| d.get_text("t").to_string()).unwrap();
+        assert_eq!(
+            seen, "XYZ",
+            "imported ops visible to a head advanced to them"
+        );
+        // Co-owners of the shared head still see nothing.
+        assert_eq!(tlen(&md, &main), 0);
+        assert_eq!(tlen(&md, &review), 0);
+    }
+
+    #[test]
+    fn import_path_sink_guard_backstops_shared_head() {
+        // The history-only import never materializes into a head. As a backstop,
+        // even a DIRECT attempt to apply imported ops to the shared head (via
+        // checkout -> apply_diff) is refused by the sink guard rather than
+        // silently corrupting co-owners. This is the guard the history-only rule
+        // makes it unnecessary to rely on, shown load-bearing.
+        let md = MultiHeadDoc::new(Manual::new());
+        let (main, review) = (b("main"), b("review"));
+        md.bind(&main, 0);
+        md.bind(&review, 0); // shared
+
+        let (updates, f) = external_updates_frontier("ABC");
+        md.import(&updates).unwrap();
+        assert_eq!(
+            tlen(&md, &main),
+            0,
+            "history-only import left the shared head empty"
+        );
+
+        // A direct checkout of the shared head to the imported frontier would be
+        // a materialization; the sink guard refuses it.
+        let shared = md.head_doc(0).unwrap();
+        let r = shared.checkout(&f);
+        assert!(
+            matches!(r, Err(LoroError::HeadShared)),
+            "checkout (apply_diff) on a shared head refused, got {r:?}"
+        );
+        assert_eq!(
+            tlen(&md, &main),
+            0,
+            "co-owner still uncorrupted after the refused attempt"
+        );
+    }
+
+    #[test]
+    fn owned_head_refuses_direct_import_and_set_peer_id() {
+        // The owner gates: a registry head is mutated only through the registry.
+        let md = MultiHeadDoc::new(Manual::new());
+        md.bind(&b("main"), 0);
+        let head = md.head_doc(0).unwrap();
+        let updates = external_updates("ABC");
+        assert!(
+            matches!(head.import(&updates), Err(LoroError::OwnedHeadOp("import"))),
+            "direct import on an owned head refused"
+        );
+        assert!(
+            matches!(
+                head.set_peer_id(12345),
+                Err(LoroError::OwnedHeadOp("set_peer_id"))
+            ),
+            "set_peer_id on an owned head refused"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Completed base methods: aggregated subscriptions and snapshot export.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn subscribe_history_fires_on_commit_and_import() {
+        let md = MultiHeadDoc::new(Manual::new());
+        let main = b("main");
+        md.bind(&main, 0);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        let _sub = md.subscribe_history(Box::new(move |_bytes| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }));
+        md.write(&main, |d| d.get_text("t").insert_unicode(0, "A").unwrap())
+            .unwrap();
+        let after_commit = count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_commit >= 1, "history event fired on a head commit");
+        md.import(&external_updates("Z")).unwrap();
+        assert!(
+            count.load(std::sync::atomic::Ordering::SeqCst) > after_commit,
+            "history event fired on import"
+        );
+    }
+
+    #[test]
+    fn subscribe_first_commit_from_peer_aggregates_over_heads() {
+        let md = MultiHeadDoc::new(Manual::new());
+        let (main, review) = (b("main"), b("review"));
+        let peers = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let p2 = peers.clone();
+        let _sub = md.subscribe_first_commit_from_peer(Box::new(move |payload| {
+            p2.lock().unwrap().push(payload.peer);
+            true
+        }));
+        md.bind(&main, 0);
+        md.bind(&review, 0); // shared
+                             // main diverges -> a copy with a fresh peer -> a first-commit from it.
+        md.write(&main, |d| d.get_text("t").insert_unicode(0, "A").unwrap())
+            .unwrap();
+        // review diverges -> another fresh peer.
+        md.write(&review, |d| d.get_text("t").insert_unicode(0, "B").unwrap())
+            .unwrap();
+        let seen = peers.lock().unwrap().clone();
+        assert!(
+            seen.len() >= 2,
+            "one first-commit per write slot (fresh peer per copy), got {seen:?}"
+        );
+        assert_ne!(seen[0], seen[1], "distinct peers per head copy");
+    }
+
+    #[test]
+    fn export_snapshot_roundtrips_a_head_state() {
+        let md = MultiHeadDoc::new(Manual::new());
+        let main = b("main");
+        md.bind(&main, 0);
+        md.write(&main, |d| {
+            d.get_text("t").insert_unicode(0, "hello").unwrap()
+        })
+        .unwrap();
+        // Snapshot carries the root head's state; a fresh doc restores it.
+        let snap = md.export(crate::encoding::ExportMode::Snapshot).unwrap();
+        let restored = LoroDoc::new();
+        restored.import(&snap).unwrap();
+        assert_eq!(restored.get_text("t").to_string(), "hello");
+        // Updates export is head-independent (shared op log).
+        let updates = md
+            .export(crate::encoding::ExportMode::all_updates())
+            .unwrap();
+        let restored2 = LoroDoc::new();
+        restored2.import(&updates).unwrap();
+        assert_eq!(restored2.get_text("t").to_string(), "hello");
     }
 }

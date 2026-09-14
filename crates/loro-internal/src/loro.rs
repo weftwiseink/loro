@@ -166,6 +166,7 @@ impl LoroDoc {
                 pre_commit_subs: SubscriberSetWithQueue::new(),
                 first_commit_from_peer_subs: SubscriberSetWithQueue::new(),
                 head_mode,
+                owner: None,
             }
         });
         LoroDoc { inner }
@@ -188,6 +189,7 @@ impl LoroDoc {
         lock_group: &LoroLockGroup,
         visible_op_count: Arc<AtomicUsize>,
         head_mode: Arc<crate::sync::AtomicU8>,
+        owner: Option<Arc<dyn crate::DocOwner>>,
         make_state: impl FnOnce(
             &std::sync::Weak<LoroDocInner>,
             &Arc<crate::sync::AtomicU8>,
@@ -215,6 +217,7 @@ impl LoroDoc {
                 pre_commit_subs: SubscriberSetWithQueue::new(),
                 first_commit_from_peer_subs: SubscriberSetWithQueue::new(),
                 head_mode,
+                owner,
             }
         });
         let doc = LoroDoc::from_inner(inner);
@@ -279,6 +282,10 @@ impl LoroDoc {
 
     #[inline(always)]
     pub fn set_peer_id(&self, peer: PeerID) -> LoroResult<()> {
+        // A registry-owned head's peer is its E2 write slot, fixed at fork.
+        if self.is_owned() {
+            return Err(LoroError::OwnedHeadOp("set_peer_id"));
+        }
         if peer == PeerID::MAX {
             return Err(LoroError::InvalidPeerID);
         }
@@ -317,6 +324,10 @@ impl LoroDoc {
 
     /// Renews the PeerID for the document.
     pub(crate) fn renew_peer_id(&self) {
+        // Registry-owned heads keep their peer; never renew it internally.
+        if self.is_owned() {
+            return;
+        }
         let mut peer_id = DefaultRandom.next_u64();
         while peer_id == PeerID::MAX {
             peer_id = DefaultRandom.next_u64();
@@ -673,7 +684,38 @@ impl LoroDoc {
         bytes: &[u8],
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
+        // A registry-owned head is never import-merged directly: doing so would
+        // apply a diff to that head's state from the shared oplog's union head
+        // (the E1 hazard). History enters through `import_to_history` under the
+        // registry's all-heads barrier, and heads advance via the registry.
+        if self.is_owned() {
+            return Err(LoroError::OwnedHeadOp("import"));
+        }
         self.with_barrier(|| self._import_with(bytes, origin))
+    }
+
+    /// Record changes into the (possibly shared) history WITHOUT moving this
+    /// handle's state or tip: today's detached-import behaviour, made explicit
+    /// and available on an attached handle.
+    ///
+    /// This is the history-only import path a `MultiHeadDoc` uses: ops enter the
+    /// shared `OpLog` but no head's materialized `DocState` is touched, so no
+    /// co-owner of a shared head can be corrupted. Heads observe the new ops
+    /// only when the registry advances them (a guarded `apply_diff` on a
+    /// `refs == 1` head). Unlike `import`, this is allowed on an owned head.
+    pub fn import_to_history(&self, bytes: &[u8]) -> Result<ImportStatus, LoroError> {
+        self.with_barrier(|| {
+            // Force the insert-only path (see
+            // `update_oplog_and_apply_delta_to_state_if_needed` /
+            // `import_changes_and_apply_delta_to_state_if_needed`, which skip the
+            // state diff-apply when detached), regardless of the handle's own
+            // attached state, then restore it.
+            let was_detached = self.is_detached();
+            self.set_detached(true);
+            let r = self._import_with(bytes, "import_to_history".into());
+            self.set_detached(was_detached);
+            r
+        })
     }
 
     #[tracing::instrument(skip_all)]
@@ -1533,6 +1575,10 @@ impl LoroDoc {
     // PERF: opt
     #[tracing::instrument(skip_all)]
     pub fn import_batch(&self, bytes: &[Vec<u8>]) -> LoroResult<ImportStatus> {
+        // See `import_with`: a registry-owned head is never import-merged directly.
+        if self.is_owned() {
+            return Err(LoroError::OwnedHeadOp("import"));
+        }
         if bytes.is_empty() {
             return Ok(ImportStatus::default());
         }
@@ -1741,7 +1787,9 @@ impl LoroDoc {
             )?;
             // We don't need to shrink frontiers because oplog's frontiers are already shrinked.
             this.emit_events();
-            if this.config.detached_editing() {
+            // Registry-owned heads keep their peer (their E2 write slot) across
+            // a checkout; only standalone detached-editing docs renew it.
+            if this.config.detached_editing() && !this.is_owned() {
                 this.renew_peer_id();
             }
 
@@ -1763,7 +1811,8 @@ impl LoroDoc {
         }
         drop(guard);
         if self.config.detached_editing() {
-            if result.is_ok() {
+            // Registry-owned heads keep their peer across a checkout (see above).
+            if result.is_ok() && !self.is_owned() {
                 self.renew_peer_id();
             }
             self.renew_txn_if_auto_commit(options);

@@ -186,6 +186,31 @@ pub struct LoroDocInner {
     /// without upgrading the `Weak<LoroDocInner>` back-pointer on the hot path.
     /// A plain `LoroDoc` (unbranched) is always `HEAD_MODE_PRIVATE`.
     head_mode: Arc<AtomicU8>,
+    /// Registry back-pointer, present exactly when this doc is a head owned by a
+    /// `MultiHeadDoc`. Set once at construction (`None` for a plain
+    /// `LoroDoc`), never mutated. When present it (1) receives the on-commit
+    /// tip-mirror callback from the txn commit path, (2) suppresses peer renewal
+    /// on `checkout` so a head keeps its E2 write-slot peer, and (3) gates
+    /// direct `import` / `set_peer_id` (a head is mutated only through its
+    /// registry: history via `import_to_history`, peer fixed at fork). See
+    /// `MultiHeadDoc`.
+    owner: Option<Arc<dyn DocOwner>>,
+}
+
+/// The registry back-pointer a `MultiHeadDoc` installs on each of its heads.
+///
+/// Object-safe so `LoroDocInner` can hold it type-erased (the registry is
+/// generic over a `HeadPolicy`, which must not leak into `loro-internal`'s
+/// core doc type). The txn commit path invokes [`on_head_commit`] after the
+/// head's locks drop; the registry re-keys its tip index and notifies its
+/// policy there.
+///
+/// [`on_head_commit`]: DocOwner::on_head_commit
+pub trait DocOwner: Send + Sync {
+    /// Called once per non-empty commit on this head, with the committed op
+    /// span, after the head's `Txn`/`OpLog`/`DocState` locks have been
+    /// released (so the callback may take the registry lock).
+    fn on_head_commit(&self, id_span: loro_common::IdSpan);
 }
 
 impl LoroDocInner {
@@ -205,6 +230,11 @@ impl LoroDocInner {
 
     pub(crate) fn is_head_shared(&self) -> bool {
         self.head_mode.load(std::sync::atomic::Ordering::Acquire) == HEAD_MODE_SHARED
+    }
+
+    /// Whether this doc is a registry-owned head (see [`DocOwner`]).
+    pub(crate) fn is_owned(&self) -> bool {
+        self.owner.is_some()
     }
 }
 
