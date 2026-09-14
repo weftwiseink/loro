@@ -32,9 +32,10 @@
 
 use std::cell::Cell;
 use std::ops::Deref;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use crate::arena::SharedArena;
 use crate::configure::Configure;
@@ -45,11 +46,15 @@ use crate::pre_commit::{FirstCommitFromPeerCallback, FirstCommitFromPeerPayload}
 use crate::state::DocState;
 use crate::sync::{AtomicU64, AtomicU8, AtomicUsize};
 use crate::utils::subscription::{SubscriberSetWithQueue, Subscription};
-use crate::version::Frontiers;
+use crate::version::{shrink_frontiers, Frontiers};
 use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
-use loro_common::{IdSpan, InternalString, LoroEncodeError, LoroResult, ID};
+use loro_common::{
+    ContainerID, Counter, IdSpan, InternalString, LoroEncodeError, LoroError, LoroResult, PeerID,
+    ID,
+};
 
 pub type BranchId = InternalString;
+pub type DocId = InternalString;
 pub type HeadId = u64;
 
 /// The pinned root head's id. Created at `refs == 0` and NEVER dropped: it is
@@ -521,18 +526,19 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     }
 
     /// Create branch `new` bound to wherever `from` currently resolves: the
-    /// free, O(1) branch-from-a-live-head path (share `from`'s head), or an
-    /// eager copy for an `Eager` policy.
+    /// free, O(1) branch-from-a-live-head path (share `from`'s head).
+    ///
+    /// This is the `OnDivergence` (content-doc) path only. An `Eager` policy
+    /// (the index) provides its OWN creation that additionally seeds lineage,
+    /// so the eager copy never leaks into this generic / `Delegated` path (see
+    /// `MultiHeadDoc<SelfRooted>::create_index_branch`).
     pub fn create_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
+        debug_assert!(
+            P::COPY == CopyMode::OnDivergence,
+            "eager policies must use their own branch creation (e.g. create_index_branch)"
+        );
         let (from_head, _) = self.resolve(from, Intent::Read)?;
-        self.with_reg(|this, reg| {
-            if P::COPY == CopyMode::Eager {
-                let copy = this.copy_head(reg, from_head);
-                this.rebind(reg, new, copy);
-            } else {
-                this.rebind(reg, new, from_head);
-            }
-        });
+        self.with_reg(|this, reg| this.rebind(reg, new, from_head));
         Ok(())
     }
 
@@ -723,6 +729,16 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 .expect("the root head always exists")
         };
         let status = self.with_all_heads_barrier(|| head.import_to_history(bytes))?;
+        // Drive policy-directed rebinding of the branches whose recorded history
+        // just landed (the ingest). For `SelfRooted` this discovers remote
+        // branches from the lineage scan and advances affected index heads; for
+        // policies that track no remote binding (e.g. `Manual`) it is empty.
+        // A branch whose ids are not yet fully held is skipped and picked up on
+        // the next import (resolve errors are non-fatal here).
+        let touched = self.inner.policy.after_import(self, &status);
+        for b in touched {
+            let _ = self.resolve(&b, Intent::Read);
+        }
         if !self.history_subs.inner().is_empty() {
             self.history_subs.emit(&(), bytes.to_vec());
         }
@@ -802,6 +818,222 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             .get(b)
             .and_then(|id| reg.heads.get(id))
             .map(|h| h.doc.is_head_shared())
+    }
+}
+
+// ======================================================================
+// The index variant: MultiHeadDoc<SelfRooted>.
+// ======================================================================
+
+/// Root-container name prefix for a branch's lineage list (`lineage:<b>`).
+const LINEAGE_PREFIX: &str = "lineage:";
+
+fn lineage_name(b: &BranchId) -> String {
+    format!("{LINEAGE_PREFIX}{b}")
+}
+
+/// If `idx` names a `lineage:<b>` root container, return `b`. Pure op-log
+/// discovery: the branch is encoded in the (name-addressable) container id, so
+/// `after_import` never needs a materialized state to identify it.
+fn lineage_branch_of(ol: &OpLog, idx: crate::container::idx::ContainerIdx) -> Option<BranchId> {
+    match ol.arena.idx_to_id(idx)? {
+        ContainerID::Root { name, .. } => name
+            .as_str()
+            .strip_prefix(LINEAGE_PREFIX)
+            .map(InternalString::from),
+        _ => None,
+    }
+}
+
+/// The index's resolution policy: its OWN per-branch lineage IS the root of
+/// truth for where each branch is, so it consults no other index -- this breaks
+/// the `BranchingDoc`-depends-on-index circularity. Eager copy at branch
+/// creation means every index head is born `refs == 1` (never shared), so the
+/// sink guard never fires on an index head.
+///
+/// `lineage` maps a branch to the peers of its index heads. It is rebuilt from
+/// the index's own op log: each index head writes under exactly one branch with
+/// a unique peer, so "the index ops of branch `b`" is exactly "the ops of the
+/// peers in `lineage:<b>`", and `b`'s index frontier is the join of those peers'
+/// latest ids.
+#[allow(missing_debug_implementations)]
+pub struct SelfRooted {
+    // Created lazily in the doc's lock group (`LockKind::Lineage`, the leaf
+    // acquired only after `OpLog`) on first use, since the group exists only
+    // once `MultiHeadDoc::new` has run.
+    lineage: OnceLock<LoroMutex<FxHashMap<BranchId, SmallVec<[PeerID; 2]>>>>,
+}
+
+impl Default for SelfRooted {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SelfRooted {
+    pub fn new() -> Self {
+        SelfRooted {
+            lineage: OnceLock::new(),
+        }
+    }
+
+    fn lineage(
+        &self,
+        this: &MultiHeadDoc<SelfRooted>,
+    ) -> &LoroMutex<FxHashMap<BranchId, SmallVec<[PeerID; 2]>>> {
+        self.lineage.get_or_init(|| {
+            this.lock_group
+                .new_lock(FxHashMap::default(), LockKind::Lineage)
+        })
+    }
+}
+
+impl HeadPolicy for SelfRooted {
+    const COPY: CopyMode = CopyMode::Eager;
+
+    /// Branch `b`'s index frontier = the join of the latest ids of the peers in
+    /// `lineage:<b>`, shrunk against the op-log DAG. The causal past does the
+    /// rest: a peer's ops depend on the tip its head forked from, so this brings
+    /// the inherited parent record and `b`'s own writes, never a sibling's later
+    /// writes (which no `b` peer depends on).
+    fn target(&self, this: &MultiHeadDoc<Self>, b: &BranchId) -> LoroResult<Frontiers> {
+        let ol = this.oplog.lock(); // OpLog before Lineage
+        let peers: SmallVec<[PeerID; 2]> = self
+            .lineage(this)
+            .lock()
+            .get(b)
+            .cloned()
+            .unwrap_or_default();
+        let ids: Vec<ID> = peers
+            .iter()
+            .filter_map(|p| ol.vv().get_last(*p).map(|c| ID::new(*p, c)))
+            .collect();
+        shrink_frontiers(&Frontiers::from(ids), &ol.dag).map_err(LoroError::FrontiersNotFound)
+    }
+
+    /// The index tip IS the record; nothing extra to publish.
+    fn after_commit(&self, _this: &MultiHeadDoc<Self>, _b: &BranchId, _last: ID) {}
+
+    /// Walk the just-imported spans: an op in a `lineage:<b>` container names a
+    /// (possibly remote) peer of `b`; any op by a known lineage peer marks its
+    /// branch touched. Returns the branches whose index head should be rebound.
+    fn after_import(&self, this: &MultiHeadDoc<Self>, st: &ImportStatus) -> Vec<BranchId> {
+        // Collect under the OpLog lock, then fold into the lineage map (leaf
+        // lock, acquired alone) -- never nesting the two here.
+        let mut lineage_ops: Vec<(BranchId, PeerID)> = Vec::new();
+        let mut change_peers: Vec<PeerID> = Vec::new();
+        {
+            let ol = this.oplog.lock();
+            for (peer, (start, end)) in st.success.iter() {
+                for ch in ol.iter_changes(IdSpan::new(*peer, *start, *end)) {
+                    let cp = ch.peer();
+                    change_peers.push(cp);
+                    for op in ch.ops().iter() {
+                        if let Some(b) = lineage_branch_of(&ol, op.container) {
+                            lineage_ops.push((b, cp));
+                        }
+                    }
+                }
+            }
+        }
+        let mut touched: FxHashSet<BranchId> = FxHashSet::default();
+        let mut lineage = self.lineage(this).lock();
+        for (b, p) in lineage_ops {
+            let entry = lineage.entry(b.clone()).or_default();
+            if !entry.contains(&p) {
+                entry.push(p);
+            }
+            touched.insert(b);
+        }
+        for cp in change_peers {
+            for (b, peers) in lineage.iter() {
+                if peers.contains(&cp) {
+                    touched.insert(b.clone());
+                }
+            }
+        }
+        drop(lineage);
+        touched.into_iter().collect()
+    }
+}
+
+/// The repo's index doc. Its heads hold only frontiers: a root map
+/// `docs: LoroMap<DocId, LoroMap<"heads", LoroMap<PeerID, Counter>>>` plus one
+/// root list per branch, `lineage:<b>`. No weft filesystem metadata (that is a
+/// TS-side content doc). The only types that appear are `ID`/`Frontiers`/
+/// `DocId`/`BranchId`.
+pub type IndexDoc = MultiHeadDoc<SelfRooted>;
+
+impl MultiHeadDoc<SelfRooted> {
+    /// Establish the first (genesis) branch, bound to the pinned root head, and
+    /// seed its lineage with the root's peer. Must be called once before other
+    /// branches are created.
+    pub fn init_genesis(&self, genesis: &BranchId) -> LoroResult<()> {
+        let root = self.head_doc(ROOT_HEAD_ID).expect("root head exists");
+        let peer = root.peer_id();
+        self.with_reg(|this, reg| this.rebind(reg, genesis, ROOT_HEAD_ID));
+        // The genesis lineage op, authored by the root's peer, written directly
+        // on the root head; then recorded, so target(genesis) == root's tip.
+        root.get_list(lineage_name(genesis).as_str())
+            .push(peer as i64)?;
+        root.commit_then_renew();
+        self.policy()
+            .lineage(self)
+            .lock()
+            .entry(genesis.clone())
+            .or_default()
+            .push(peer);
+        Ok(())
+    }
+
+    /// Create `new` from `from` by EAGER copy: fork `from`'s index head (a state
+    /// of a few map entries), then write the copy's first op -- appending the
+    /// copy's fresh peer to `lineage:<new>` -- directly on the copy so its tip is
+    /// `[peer]` and `target(new)` is consistent. Every index head is thus born
+    /// `refs == 1`.
+    pub fn create_index_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
+        let (from_head, _) = self.resolve(from, Intent::Read)?;
+        let copy_doc = self.with_reg(|this, reg| {
+            let c = this.copy_head(reg, from_head);
+            this.rebind(reg, new, c);
+            reg.heads[&c].doc.clone()
+        });
+        let peer = copy_doc.peer_id();
+        copy_doc
+            .get_list(lineage_name(new).as_str())
+            .push(peer as i64)?;
+        copy_doc.commit_then_renew();
+        self.policy()
+            .lineage(self)
+            .lock()
+            .entry(new.clone())
+            .or_default()
+            .push(peer);
+        Ok(())
+    }
+
+    /// Record `docs[doc].heads[peer] = counter` on `b`'s index head: the
+    /// per-writer head record the frontier reduction reads back. One local op.
+    pub fn record_head(
+        &self,
+        b: &BranchId,
+        doc: &DocId,
+        peer: PeerID,
+        counter: Counter,
+    ) -> LoroResult<()> {
+        self.write(b, |d| {
+            // Mergeable (map-key) child containers so two sessions writing the
+            // same doc/heads path converge to one container across import.
+            let docs = d.get_map("docs");
+            let per_doc = docs.ensure_mergeable_map(doc.as_str())?;
+            let heads = per_doc.ensure_mergeable_map("heads")?;
+            heads.insert(&peer.to_string(), counter as i64)
+        })?
+    }
+
+    /// The branches this session knows, from the lineage map.
+    pub fn branches(&self) -> Vec<BranchId> {
+        self.policy().lineage(self).lock().keys().cloned().collect()
     }
 }
 
@@ -1472,5 +1704,95 @@ mod tests {
         md.policy().set_target(&cold, Frontiers::default());
         let seen = md.read(&cold, |d| d.get_text("t").to_string()).unwrap();
         assert_eq!(seen, "", "pinned root still resolvable at its empty tip");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2: IndexDoc = MultiHeadDoc<SelfRooted>
+    // ------------------------------------------------------------------
+
+    fn d(s: &str) -> DocId {
+        s.into()
+    }
+
+    fn doc_has_key(md: &IndexDoc, branch: &BranchId, key: &str) -> bool {
+        md.read(branch, |doc| doc.get_map("docs").get_(key).is_some())
+            .unwrap()
+    }
+
+    #[test]
+    fn index_eager_copy_born_refs_one_never_shared() {
+        let idx = IndexDoc::new(SelfRooted::new());
+        idx.init_genesis(&b("main")).unwrap();
+        idx.create_index_branch(&b("feat"), &b("main")).unwrap();
+        // Eager: feat is on its OWN head (a copy of main's), refs 1, private.
+        assert_ne!(idx.bound_head(&b("feat")), idx.bound_head(&b("main")));
+        assert_eq!(idx.refs_of(&b("feat")), Some(1));
+        assert_eq!(idx.is_head_shared(&b("feat")), Some(false));
+        assert!(idx.branches().contains(&b("main")));
+        assert!(idx.branches().contains(&b("feat")));
+    }
+
+    #[test]
+    fn index_remote_lineage_import_rebinds_branch() {
+        // Session A creates `feat` and records content on it.
+        let a = IndexDoc::new(SelfRooted::new());
+        a.init_genesis(&b("main")).unwrap();
+        a.create_index_branch(&b("feat"), &b("main")).unwrap();
+        a.record_head(&b("feat"), &d("D"), 111, 7).unwrap();
+        let updates = a.export(ExportMode::all_updates()).unwrap();
+
+        // Session B knows only `main`.
+        let bb = IndexDoc::new(SelfRooted::new());
+        bb.init_genesis(&b("main")).unwrap();
+        assert!(
+            !bb.branches().contains(&b("feat")),
+            "feat unknown before import"
+        );
+
+        // Importing A's history discovers `feat` via the lineage scan and
+        // rebinds it (after_import -> resolve).
+        bb.import(&updates).unwrap();
+        assert!(
+            bb.branches().contains(&b("feat")),
+            "remote branch discovered"
+        );
+        assert!(
+            doc_has_key(&bb, &b("feat"), "D"),
+            "feat's index head materialized A's record"
+        );
+        assert!(
+            !doc_has_key(&bb, &b("main"), "D"),
+            "main did not absorb feat's record"
+        );
+    }
+
+    #[test]
+    fn index_target_is_join_of_lineage_peers() {
+        // Session A creates `shared` and records doc "A" on it.
+        let a = IndexDoc::new(SelfRooted::new());
+        a.init_genesis(&b("main")).unwrap();
+        a.create_index_branch(&b("shared"), &b("main")).unwrap();
+        a.record_head(&b("shared"), &d("A"), 1, 1).unwrap();
+        let a_updates = a.export(ExportMode::all_updates()).unwrap();
+
+        // Session B independently creates the SAME branch `shared`, records "B".
+        let bb = IndexDoc::new(SelfRooted::new());
+        bb.init_genesis(&b("main")).unwrap();
+        bb.create_index_branch(&b("shared"), &b("main")).unwrap();
+        bb.record_head(&b("shared"), &d("B"), 2, 2).unwrap();
+        assert!(doc_has_key(&bb, &b("shared"), "B"));
+        assert!(!doc_has_key(&bb, &b("shared"), "A"), "B has not seen A yet");
+
+        // Import A's history: `shared` now has TWO lineage peers on B, and its
+        // frontier is their JOIN -> B's shared head shows BOTH records.
+        bb.import(&a_updates).unwrap();
+        assert!(
+            doc_has_key(&bb, &b("shared"), "A"),
+            "join of lineage peers brought session A's record"
+        );
+        assert!(
+            doc_has_key(&bb, &b("shared"), "B"),
+            "join of lineage peers kept session B's record"
+        );
     }
 }
