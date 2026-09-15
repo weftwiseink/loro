@@ -13,7 +13,7 @@ use crate::state::DocState;
 use crate::subscription::Subscriber;
 use crate::sync::{AtomicU64, AtomicU8, AtomicUsize};
 use crate::utils::subscription::{SubscriberSetWithQueue, Subscription};
-use crate::version::Frontiers;
+use crate::version::{Frontiers, VersionVector};
 use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
 use loro_common::{ContainerID, IdSpan, LoroEncodeError, LoroResult};
 
@@ -38,6 +38,12 @@ pub struct MultiHeadInner<P: HeadPolicy> {
     /// One event per new change in the shared history, aggregated over heads and
     /// imports.
     pub(super) history_subs: SubscriberSetWithQueue<(), HistoryCallback, Vec<u8>>,
+    /// One event per LOCAL new change in the shared history (a head commit on any
+    /// branch), aggregated over heads. UNLIKE `history_subs`, this does NOT fire
+    /// on `import`: it mirrors `LoroDoc::subscribe_local_update` exactly (local
+    /// edits only), so a wire adaptor driven off it never re-broadcasts imported
+    /// (remote) ops back onto the wire.
+    pub(super) local_update_subs: SubscriberSetWithQueue<(), HistoryCallback, Vec<u8>>,
     /// One event per first commit from a peer, aggregated over heads. Every head
     /// copy mints a fresh peer, so this fires once per write slot.
     pub(super) first_commit_subs:
@@ -92,6 +98,10 @@ pub(super) fn install_forwarders<P: HeadPolicy>(
     let s1 = doc.subscribe_local_update(Box::new(move |bytes| {
         if let Some(inner) = w1.upgrade() {
             inner.history_subs.emit(&(), bytes.clone());
+            // Local-only stream: fed from the per-head local-update forwarder and
+            // NEVER from `import` (which emits to `history_subs` alone). This is
+            // what `MultiHeadDoc::subscribe_local_update` exposes.
+            inner.local_update_subs.emit(&(), bytes.clone());
         }
         true
     }));
@@ -183,6 +193,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 policy,
                 snapshot_head: AtomicU64::new(0),
                 history_subs: SubscriberSetWithQueue::new(),
+                local_update_subs: SubscriberSetWithQueue::new(),
                 first_commit_subs: SubscriberSetWithQueue::new(),
             }
         });
@@ -449,6 +460,29 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         let (sub, enable) = self.history_subs.inner().insert((), callback);
         enable();
         sub
+    }
+
+    /// One event per LOCAL new change in the shared history (a head commit on ANY
+    /// branch), carrying that change's update bytes. Mirrors
+    /// `LoroDoc::subscribe_local_update`: it fires ONLY on this peer's local edits,
+    /// NEVER on `import`, so a sync adaptor driven off it does not echo imported
+    /// ops back onto the wire. Aggregated over every head, so an edit on any branch
+    /// (including a copy-on-divergence head for a non-main branch) is delivered.
+    pub fn subscribe_local_update(&self, callback: HistoryCallback) -> Subscription {
+        let (sub, enable) = self.local_update_subs.inner().insert((), callback);
+        enable();
+        sub
+    }
+
+    /// The version vector of the SHARED op log: everything this peer holds across
+    /// all branches. The op log is the sync unit (`export({mode:"update", from})`
+    /// reads it), so this is the version a wire adaptor compares against a peer's
+    /// version and exports the delta from. A `MultiHeadDoc` has no single
+    /// materialized DocState (each head sits at its own frontier), so both the
+    /// "state" and "oplog" version a `LoroDoc` distinguishes collapse to this one
+    /// shared-oplog vv.
+    pub fn oplog_vv(&self) -> VersionVector {
+        self.oplog.lock().vv().clone()
     }
 
     /// One event per first commit from a peer, aggregated over all heads. Every

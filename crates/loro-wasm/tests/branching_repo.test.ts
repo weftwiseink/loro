@@ -297,3 +297,81 @@ describe("Branch subscriptions deliver change events", () => {
     unsubscribe();
   });
 });
+
+// The wire-surface discriminator: `subscribeLocalUpdates` + persistent `version()` /
+// `oplogVersion()` on the branching doc/index, the surface weft's `EnvelopedAdaptor` drives the
+// wire off. Proven on a NON-MAIN branch (the multi-head case), because the ops land on a
+// copy-on-divergence head — a version-tracking loop keyed off only main's state would MISS them.
+//
+// Two independent failures this must catch:
+//   - `subscribeLocalUpdates` firing only for the root/main head (if forwarders were not installed
+//     on the copy-on-divergence head): the feat edit would deliver NO callback.
+//   - `version()` reflecting a single head's DocState VV instead of the shared oplog vv: a feat
+//     edit would NOT advance it, so `after.compare(before)` would be 0, not 1.
+describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta round-trip", () => {
+  const UPDATE = { mode: "update" } as const;
+  const readBranch = (repo: BranchingDocRepo, doc: string, branch: string) =>
+    repo.openDoc(doc).branch(branch).read((h) => h.getText("t").toString());
+
+  it("delta-syncs a NON-MAIN branch edit to a peer via the callback bytes and via export(from)", () => {
+    const a = new BranchingDocRepo();
+    const b = new BranchingDocRepo(); // converges via export({from}) deltas
+    const c = new BranchingDocRepo(); // converges via the subscribeLocalUpdates callback bytes
+
+    // Base on main, fork a NON-MAIN branch, and bring both peers to this shared pre-edit state.
+    a.openDoc("G").branch("main").write((h) => h.getText("t").insert(0, "base"));
+    a.createBranch("feat", "main");
+    for (const peer of [b, c]) {
+      peer.openDoc("G");
+      peer.index().import(a.index().export(UPDATE));
+      peer.openDoc("G").import(a.openDoc("G").export(UPDATE));
+    }
+    expect(b.branches().sort()).toEqual(["feat", "main"]);
+    expect(readBranch(b, "G", "feat")).toBe("base");
+
+    // Capture the shared-oplog versions BEFORE the non-main edit, on BOTH the content doc and the
+    // index, and wire both local-update streams (what an EnvelopedAdaptor per doc would send).
+    const beforeDoc = a.openDoc("G").version();
+    const beforeIdx = a.index().version();
+    const docUpdates: Uint8Array[] = [];
+    const idxUpdates: Uint8Array[] = [];
+    const unsubDoc = a.openDoc("G").subscribeLocalUpdates((bytes) => docUpdates.push(bytes));
+    const unsubIdx = a.index().subscribeLocalUpdates((bytes) => idxUpdates.push(bytes));
+
+    // The edit lands on a NON-MAIN branch (a copy-on-divergence head).
+    a.openDoc("G").branch("feat").write((h) => h.getText("t").insert(4, "-feat"));
+
+    // (1) subscribeLocalUpdates FIRED for the non-main edit — on the content doc (the feat ops)
+    //     and on the index (feat's advanced frontier record, committed by the Delegated policy).
+    expect(docUpdates.length).toBeGreaterThan(0);
+    expect(idxUpdates.length).toBeGreaterThan(0);
+
+    // (2) version()/oplogVersion() ADVANCED on the non-main edit. A head-state VV keyed off main
+    //     would NOT move here — this is the version-tracking-loop-misses-branch-edits discriminator.
+    const afterDoc = a.openDoc("G").version();
+    expect(afterDoc.compare(beforeDoc)).toBe(1);
+    expect(a.openDoc("G").oplogVersion().compare(beforeDoc)).toBe(1);
+    expect(a.index().version().compare(beforeIdx)).toBe(1);
+
+    // (3) export({mode:"update", from: before}) yields exactly the delta for that edit: a peer
+    //     already at `before` converges by importing ONLY the delta (no full re-export).
+    const docDelta = a.openDoc("G").export({ mode: "update", from: beforeDoc });
+    const idxDelta = a.index().export({ mode: "update", from: beforeIdx });
+    expect(docDelta.length).toBeGreaterThan(0);
+    expect(idxDelta.length).toBeGreaterThan(0);
+
+    b.index().import(idxDelta);
+    b.openDoc("G").import(docDelta);
+    expect(readBranch(b, "G", "feat")).toBe("base-feat"); // converged on the NON-MAIN branch
+    expect(readBranch(b, "G", "main")).toBe("base"); // isolated: main untouched
+
+    // (4) The wire bytes the adaptor would SEND (the callback payloads) are themselves valid
+    //     deltas: a peer at `before` fed only the callback bytes converges identically.
+    unsubDoc();
+    unsubIdx();
+    for (const bytes of idxUpdates) c.index().import(bytes);
+    for (const bytes of docUpdates) c.openDoc("G").import(bytes);
+    expect(readBranch(c, "G", "feat")).toBe("base-feat");
+    expect(readBranch(c, "G", "main")).toBe("base");
+  });
+});

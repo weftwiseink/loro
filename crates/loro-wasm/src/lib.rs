@@ -2700,6 +2700,30 @@ interface BranchingDocHead<T extends Record<string, Container> = Record<string, 
 }
 "#;
 
+/// Hand-written TypeScript for the `skip_typescript` `subscribeLocalUpdates` on the
+/// branching doc/index (a `js_sys::Function` argument cannot generate a good
+/// signature), mirroring `LoroDoc.subscribeLocalUpdates`. `version()` /
+/// `oplogVersion()` are NOT skip_typescript, so wasm-bindgen generates them.
+#[wasm_bindgen(typescript_custom_section)]
+const BRANCHING_LOCAL_UPDATES_TYPES: &str = r#"
+interface BranchingDoc {
+    /**
+     * Subscribe to this content doc's local updates (this peer's commits to the shared op
+     * log, across all branches), mirroring `LoroDoc.subscribeLocalUpdates`. Fires with the
+     * update bytes on a local edit only, never on `import`. Returns an unsubscribe.
+     */
+    subscribeLocalUpdates(f: (bytes: Uint8Array) => void): () => void;
+}
+interface BranchingIndex {
+    /**
+     * Subscribe to this index's local updates (this peer's commits to the shared index op
+     * log), mirroring `LoroDoc.subscribeLocalUpdates`. Fires with the update bytes on a
+     * local edit only, never on `import`. Returns an unsubscribe.
+     */
+    subscribeLocalUpdates(f: (bytes: Uint8Array) => void): () => void;
+}
+"#;
+
 // ======================================================================
 // BranchingDocRepo wasm surface.
 //
@@ -2833,6 +2857,41 @@ impl BranchingIndex {
         let status = self.0.import(bytes)?;
         Ok(import_status_to_js_value(status)?.into())
     }
+
+    /// Subscribe to this index's LOCAL updates (this peer's commits to the shared
+    /// index op log, across all branches), mirroring `LoroDoc::subscribeLocalUpdates`.
+    /// Fires with the local update bytes on a local edit ONLY, NEVER on `import`, so a
+    /// wire adaptor driven off it does not echo imported ops back out. Returns a
+    /// `() => void` unsubscribe.
+    #[wasm_bindgen(js_name = "subscribeLocalUpdates", skip_typescript)]
+    pub fn subscribe_local_updates(&self, f: js_sys::Function) -> JsValue {
+        let observer = observer::Observer::new(f);
+        let sub = self.0.subscribe_local_update(Box::new(move |e| {
+            let arr = js_sys::Uint8Array::new_with_length(e.len() as u32);
+            arr.copy_from(e);
+            let js_value: JsValue = arr.into();
+            put_js_value_in_pending_queue(observer.clone(), js_value);
+            true
+        }));
+        subscription_to_js_function_callback(sub)
+    }
+
+    /// The version vector of the shared index op log (everything this peer holds
+    /// across all branches). Mirrors `LoroDoc::version`. The op log is the sync unit
+    /// (`export({ mode: "update", from })` reads it), so this is the version a wire
+    /// adaptor compares against a peer's and exports the delta from.
+    pub fn version(&self) -> VersionVector {
+        VersionVector(self.0.oplog_vv())
+    }
+
+    /// The version vector of the shared index op log. For a branching doc this is
+    /// identical to [`version`](Self::version): a `MultiHeadDoc` has no single
+    /// materialized state, so both collapse to the shared-oplog vv. Mirrors
+    /// `LoroDoc::oplogVersion`.
+    #[wasm_bindgen(js_name = "oplogVersion")]
+    pub fn oplog_version(&self) -> VersionVector {
+        VersionVector(self.0.oplog_vv())
+    }
 }
 
 /// One content document: branch resolution delegates to the repo's index, with
@@ -2900,6 +2959,41 @@ impl BranchingDoc {
     pub fn import(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
         let status = self.0.import(bytes)?;
         Ok(import_status_to_js_value(status)?.into())
+    }
+
+    /// Subscribe to this content doc's LOCAL updates (this peer's commits to the
+    /// shared op log, across ALL branches -- forwarders are installed on every head,
+    /// including a non-main branch's copy-on-divergence head), mirroring
+    /// `LoroDoc::subscribeLocalUpdates`. Fires with the local update bytes on a local
+    /// edit ONLY, NEVER on `import`, so a wire adaptor driven off it does not echo
+    /// imported ops back out. Returns a `() => void` unsubscribe.
+    #[wasm_bindgen(js_name = "subscribeLocalUpdates", skip_typescript)]
+    pub fn subscribe_local_updates(&self, f: js_sys::Function) -> JsValue {
+        let observer = observer::Observer::new(f);
+        let sub = self.0.subscribe_local_update(Box::new(move |e| {
+            let arr = js_sys::Uint8Array::new_with_length(e.len() as u32);
+            arr.copy_from(e);
+            let js_value: JsValue = arr.into();
+            put_js_value_in_pending_queue(observer.clone(), js_value);
+            true
+        }));
+        subscription_to_js_function_callback(sub)
+    }
+
+    /// The version vector of the shared op log (everything this peer holds across all
+    /// branches). Mirrors `LoroDoc::version`. The op log is the sync unit
+    /// (`export({ mode: "update", from })` reads it), so this is the version a wire
+    /// adaptor compares against a peer's and exports the delta from.
+    pub fn version(&self) -> VersionVector {
+        VersionVector(self.0.oplog_vv())
+    }
+
+    /// The version vector of the shared op log. For a branching doc this is identical
+    /// to [`version`](Self::version): a `MultiHeadDoc` has no single materialized
+    /// state, so both collapse to the shared-oplog vv. Mirrors `LoroDoc::oplogVersion`.
+    #[wasm_bindgen(js_name = "oplogVersion")]
+    pub fn oplog_version(&self) -> VersionVector {
+        VersionVector(self.0.oplog_vv())
     }
 }
 
