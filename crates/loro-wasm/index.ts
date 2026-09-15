@@ -5,6 +5,7 @@ import {
   Branch,
   BranchingDoc,
   BranchingDocHead,
+  BranchingDocRepo,
   EphemeralStoreWasm,
   PeerID,
   Container,
@@ -560,6 +561,20 @@ decorateMethods(Branch.prototype, ["write"]);
 // fixable in JS decoration (there is nothing enqueued to flush) — see the Phase-5 reactivity-gap
 // risk in the devlog; the fix is emit-on-rebind (Rust) or an explicit re-project consumer contract.
 decorateMethods(BranchingDoc.prototype, ["import", "merge", "advance"]);
+
+// `BranchingDocRepo.createBranch` commits a lineage op onto the shared INDEX op log (the repo's
+// `create_index_branch` pushes the new branch's `lineage:<name>` entry and `commit_then_renew`s).
+// That commit synchronously enqueues a `BranchingIndex.subscribeLocalUpdates` local-update
+// callback into the global pending-event queue, but the queue only flushes when a decorated
+// method runs `callPendingEvents()`. Without this decoration the enqueued frame is never
+// delivered (0 fires) and the scheduled microtask check logs `[LORO_INTERNAL_ERROR] Event not
+// called`, so a wire adaptor driven off the index stream never learns of a locally-created
+// branch. Auto-flushing here makes `createBranch(...)` deliver the index lineage frame with NO
+// manual `callPendingEvents()`, mirroring the decorated content-mutating methods above.
+// `deleteBranch` is CURRENTLY local-only registry cleanup (`delete_index_branch` commits no op —
+// durable cross-peer deletion is a Phase-5 wrapper-lifecycle follow-up), so its decoration flushes
+// an empty queue today; it is included to future-proof the method for when a durable delete op lands.
+decorateMethods(BranchingDocRepo.prototype, ["createBranch", "deleteBranch"]);
 
 // ---------------------------------------------------------------------------
 // Head-safety drift guard (compile-time).

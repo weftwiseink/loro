@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BranchingDocRepo, type LoroEventBatch } from "../bundler/index";
 
 // The discriminator: proves branch data crosses the wasm boundary correctly — a write is
@@ -424,5 +424,114 @@ describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta
 
     unsubDoc();
     unsubIdx();
+  });
+});
+
+// Repo-level branch-lifecycle streaming: `BranchingDocRepo.createBranch` commits a lineage op
+// onto the shared INDEX op log, which must reach the `BranchingIndex.subscribeLocalUpdates` wire
+// stream so a peer learns of a locally-created branch INCREMENTALLY (not only via a full
+// re-export). The op is enqueued onto the global pending-event queue at commit time, but the
+// queue flushes only when a DECORATED method runs `callPendingEvents()`; `createBranch`/
+// `deleteBranch` are decorated in `index.ts` for exactly this reason.
+//
+// The regression this guards (observed before the decoration): `createBranch` streamed ZERO
+// frames AND logged `[LORO_INTERNAL_ERROR] Event not called` (the microtask check finding the
+// enqueued frame never flushed), even though a full `export({mode:"update"})` afterward DID carry
+// the branch. That is the "branch never reaches the live wire" bug: peer B never learns peer A's
+// freshly-created branch incrementally.
+describe("BranchingDocRepo branch-lifecycle local-update streaming", () => {
+  const UPDATE = { mode: "update" } as const;
+
+  // Capture `console.error` so the microtask-scheduled `[LORO_INTERNAL_ERROR] Event not called`
+  // (logged when an enqueued pending event was never flushed) is assertable.
+  const consoleErrors: string[] = [];
+  // Only `mockRestore` is used; a structural type sidesteps vitest's version-specific
+  // `MockInstance` generic without an `any`.
+  let errSpy: { mockRestore: () => void };
+  beforeEach(() => {
+    consoleErrors.length = 0;
+    errSpy = vi.spyOn(console, "error").mockImplementation((...args) => {
+      consoleErrors.push(args.map((a) => String(a)).join(" "));
+    });
+  });
+  afterEach(() => {
+    errSpy.mockRestore();
+  });
+  const noInternalError = () =>
+    consoleErrors.some((e) => e.includes("[LORO_INTERNAL_ERROR]"));
+
+  // Drain the microtask/macrotask turn so `schedule_pending_event_check`'s promise callback runs.
+  // That callback is where `[LORO_INTERNAL_ERROR] Event not called` would be logged on a missed flush.
+  const drain = () => new Promise((r) => setTimeout(r, 0));
+
+  it("createBranch streams its lineage op on the index stream with NO manual flush (no LORO_INTERNAL_ERROR)", async () => {
+    const repo = new BranchingDocRepo();
+    const doc = repo.openDoc("G");
+    doc.branch("main").write((h) => h.getText("t").insert(0, "base"));
+
+    const idxUpdates: Uint8Array[] = [];
+    const unsub = repo.index().subscribeLocalUpdates((b) => idxUpdates.push(b));
+
+    repo.createBranch("draft", "main");
+
+    // Delivered synchronously (decorated auto-flush) — before any awaited turn.
+    expect(idxUpdates.length).toBeGreaterThanOrEqual(1);
+    expect(repo.branches().sort()).toEqual(["draft", "main"]);
+
+    // The pending-event queue was flushed, so the scheduled microtask check finds no orphan.
+    await drain();
+    expect(noInternalError()).toBe(false);
+
+    unsub();
+  });
+
+  it("a peer at the shared prefix learns the branch from the streamed createBranch delta alone", async () => {
+    const a = new BranchingDocRepo();
+    a.openDoc("G").branch("main").write((h) => h.getText("t").insert(0, "base"));
+
+    // B is synced to A's pre-createBranch state (the causal prefix) — an incremental delta only
+    // applies onto the prefix it descends from, exactly as the wire-surface delta test above.
+    const b = new BranchingDocRepo();
+    b.openDoc("G");
+    b.index().import(a.index().export(UPDATE));
+    b.openDoc("G").import(a.openDoc("G").export(UPDATE));
+    expect(b.branches().sort()).toEqual(["main"]);
+
+    // Capture ONLY the incremental createBranch index frame off the wire stream.
+    const idxUpdates: Uint8Array[] = [];
+    const unsub = a.index().subscribeLocalUpdates((by) => idxUpdates.push(by));
+    a.createBranch("draft", "main");
+    await drain();
+    unsub();
+    expect(idxUpdates.length).toBeGreaterThanOrEqual(1);
+    expect(noInternalError()).toBe(false);
+
+    // B converges on the new branch from the streamed delta — no full re-export needed.
+    for (const bytes of idxUpdates) b.index().import(bytes);
+    expect(b.branches().sort()).toEqual(["draft", "main"]);
+  });
+
+  // `deleteBranch` is CURRENTLY local-only registry cleanup: it drops the branch's lineage entry
+  // WITHOUT committing a durable "discard" op (durable cross-peer deletion is a wrapper
+  // lifecycle-log follow-up). So it emits NO local-update frame and — because nothing is enqueued
+  // — trips no `[LORO_INTERNAL_ERROR]`. Its `index.ts` decoration is therefore harmless (a flush
+  // of an empty queue) and future-proofs the method for when a durable delete op is added. This
+  // test pins that contract so a later durable-delete change is a deliberate, visible break here.
+  it("deleteBranch removes the branch locally, streams no frame, and trips no LORO_INTERNAL_ERROR", async () => {
+    const repo = new BranchingDocRepo();
+    repo.openDoc("G").branch("main").write((h) => h.getText("t").insert(0, "x"));
+    repo.createBranch("draft", "main");
+
+    const idxUpdates: Uint8Array[] = [];
+    const unsub = repo.index().subscribeLocalUpdates((b) => idxUpdates.push(b));
+
+    repo.deleteBranch("draft");
+    await drain();
+
+    expect(repo.branches().sort()).toEqual(["main"]);
+    expect(idxUpdates.length).toBe(0); // local-only: no durable delete op on the shared log
+    expect(noInternalError()).toBe(false);
+
+    unsub();
   });
 });
