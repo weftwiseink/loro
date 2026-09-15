@@ -33,6 +33,11 @@ use loro_internal::{
     LoroValue, MovableListHandler, SubscriberSetWithQueue, Subscription, TreeNodeWithChildren,
     TreeParentId, UndoManager as InnerUndoManager, VersionVector as InternalVersionVector,
 };
+use loro_internal::multi_head::{
+    BranchId, BranchSubscription, BranchingDoc as BranchingDocContent, BranchingDocRepo as RepoInner,
+    IndexDoc, MergeOutcome,
+};
+use loro_internal::subscription::Subscriber;
 use parking_lot::lock_api::ReentrantMutex;
 use rle::HasLength;
 use serde::{Deserialize, Serialize};
@@ -2503,8 +2508,8 @@ impl LoroDoc {
 pub struct BranchingDocHead(LoroDoc);
 
 impl BranchingDocHead {
-    /// Wrap a materialized head. Internal plumbing; a future slice wires this to the repo.
-    #[allow(dead_code)]
+    /// Wrap a materialized head. Internal plumbing: `Branch::{read,write}` build one per
+    /// closure invocation over the head `LoroDoc` the repo resolves, and hand it to JS.
     pub(crate) fn from_loro_doc(doc: LoroDoc) -> Self {
         Self(doc)
     }
@@ -2692,6 +2697,252 @@ interface BranchingDocHead<T extends Record<string, Container> = Record<string, 
     getList<Key extends keyof T | ContainerID>(name: Key): T[Key] extends LoroList ? T[Key] : LoroList;
     getMovableList<Key extends keyof T | ContainerID>(name: Key): T[Key] extends LoroMovableList ? T[Key] : LoroMovableList;
     getTree<Key extends keyof T | ContainerID>(name: Key): T[Key] extends LoroTree ? T[Key] : LoroTree;
+}
+"#;
+
+// ======================================================================
+// BranchingDocRepo wasm surface.
+//
+// Exposes `loro_internal::multi_head::{BranchingDocRepo, BranchingDoc, Branch}` to JS. The
+// load-bearing invariant: `Branch::{read,write}` hand JS a head-safe `BranchingDocHead`
+// (drift-guarded in `index.ts`), NEVER a raw `LoroDoc`. The crossing wraps the head `LoroDoc`
+// the repo resolves in a wasm `LoroDoc` and immediately in a `BranchingDocHead`, mirroring the
+// Rust `Branch::read`'s `BranchingDocHead::from_head(d.clone())`; only the `BranchingDocHead`
+// escapes to JS.
+// ======================================================================
+
+fn merge_outcome_to_str(outcome: MergeOutcome) -> &'static str {
+    match outcome {
+        MergeOutcome::AlreadyContained => "already-contained",
+        MergeOutcome::FastForward => "fast-forward",
+        MergeOutcome::Merged => "merged",
+    }
+}
+
+/// Wrap a resolved head `LoroDoc` as a head-safe wasm `BranchingDocHead` for a `read`/`write`
+/// closure. The wasm `LoroDoc` aliases the same underlying head (a cheap `Arc` clone), so edits
+/// through the head's containers land on the head the repo committed on closure exit.
+fn head_for_js(head: &LoroDocInner) -> JsValue {
+    let doc = LoroDoc {
+        doc: head.clone(),
+        root_event_sub: Arc::new(Mutex::new(None)),
+    };
+    JsValue::from(BranchingDocHead::from_loro_doc(doc))
+}
+
+/// Turn a registry-owned `BranchSubscription` into a JS `() => void` unsubscribe closure.
+/// Dropping the subscription removes it from the registry (following the branch across rebinds).
+fn branch_subscription_to_js(sub: BranchSubscription) -> JsValue {
+    let mut holder = Some(sub);
+    let closure = Closure::wrap(Box::new(move || {
+        if let Some(s) = holder.take() {
+            s.unsubscribe();
+        }
+    }) as Box<dyn FnMut()>);
+    closure.into_js_value()
+}
+
+/// A branching repo: one loro index doc plus its content docs. Branch existence and "where each
+/// branch is for each doc" live in the index; content docs delegate.
+#[wasm_bindgen]
+pub struct BranchingDocRepo(RepoInner);
+
+#[wasm_bindgen]
+impl BranchingDocRepo {
+    /// Open a fresh repo with the genesis branch (`"main"`).
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> JsResult<BranchingDocRepo> {
+        Ok(BranchingDocRepo(RepoInner::open()?))
+    }
+
+    /// Open (or get) a content doc. Idempotent per id.
+    #[wasm_bindgen(js_name = "openDoc")]
+    pub fn open_doc(&self, id: &str) -> BranchingDoc {
+        BranchingDoc(self.0.open_doc(id.into()))
+    }
+
+    /// Drop the in-memory content doc (its recorded frontiers stay in the index; reopening
+    /// re-materializes lazily).
+    #[wasm_bindgen(js_name = "closeDoc")]
+    pub fn close_doc(&self, id: &str) {
+        self.0.close_doc(&id.into());
+    }
+
+    /// Repo-wide branch creation: `new_branch` starts wherever `from` currently resolves.
+    #[wasm_bindgen(js_name = "createBranch")]
+    pub fn create_branch(&self, new_branch: &str, from: &str) -> JsResult<()> {
+        self.0.create_branch(&new_branch.into(), &from.into())?;
+        Ok(())
+    }
+
+    /// Repo-wide branch deletion: local registry cleanup across the index and every open
+    /// content doc. Committed ops stay in history (unreferenced).
+    #[wasm_bindgen(js_name = "deleteBranch")]
+    pub fn delete_branch(&self, name: &str) -> JsResult<()> {
+        self.0.delete_branch(&name.into())?;
+        Ok(())
+    }
+
+    /// The branches the repo knows (from the index lineage).
+    pub fn branches(&self) -> Vec<String> {
+        self.0.branches().iter().map(|b| b.to_string()).collect()
+    }
+
+    /// The repo's index doc (pure ids / frontiers). See [`BranchingIndex`].
+    pub fn index(&self) -> BranchingIndex {
+        BranchingIndex(self.0.index().clone())
+    }
+}
+
+/// A read-only view of the repo's index doc (frontiers only). The minimal safe surface: the
+/// index heads carry frontier records, so no head is handed out here.
+///
+/// NOTE(claude-opus-4-8/branchingdocrepo-wasm): the fuller index surface (per-branch recorded
+/// frontiers, index import/export sync) is a follow-up; only the branch list is exposed now.
+#[wasm_bindgen]
+pub struct BranchingIndex(IndexDoc);
+
+#[wasm_bindgen]
+impl BranchingIndex {
+    /// The branches this session knows, from the index lineage.
+    pub fn branches(&self) -> Vec<String> {
+        self.0.branches().iter().map(|b| b.to_string()).collect()
+    }
+}
+
+/// One content document: branch resolution delegates to the repo's index, with
+/// copy-on-divergence. Per-branch work goes through [`Branch`].
+#[wasm_bindgen]
+pub struct BranchingDoc(Arc<BranchingDocContent>);
+
+#[wasm_bindgen]
+impl BranchingDoc {
+    /// A handle to branch `name` on this doc. Every op re-resolves the branch's head.
+    pub fn branch(&self, name: &str) -> Branch {
+        Branch {
+            doc: self.0.clone(),
+            name: name.into(),
+        }
+    }
+
+    /// Merge `from` into `into` as frontier advancement (no op created or dropped). Returns the
+    /// outcome: `"already-contained" | "fast-forward" | "merged"`.
+    pub fn merge(&self, into: &str, from: &str) -> JsResult<String> {
+        let outcome = self.0.merge(&into.into(), &from.into())?;
+        Ok(merge_outcome_to_str(outcome).to_string())
+    }
+
+    /// Move branch `b` forward to frontier `to` (additive: keeps every peer's recorded op).
+    pub fn advance(&self, b: &str, to: Vec<JsID>) -> JsResult<()> {
+        self.0.advance(&b.into(), &ids_to_frontiers(to)?)?;
+        Ok(())
+    }
+
+    /// Create branch `name` as a WRITABLE fork of THIS doc at a chosen historical frontier `at`.
+    /// Errors if `name` already exists.
+    #[wasm_bindgen(js_name = "createBranchAt")]
+    pub fn create_branch_at(&self, name: &str, at: Vec<JsID>) -> JsResult<()> {
+        self.0.create_branch_at(&name.into(), &ids_to_frontiers(at)?)?;
+        Ok(())
+    }
+
+    /// Whether branch `target` contains branch `source` (both of this doc).
+    pub fn contains(&self, target: &str, source: &str) -> JsResult<bool> {
+        Ok(self.0.contains(&target.into(), &source.into())?)
+    }
+
+    /// This doc's content frontier for branch `b` (the reduced index record).
+    #[wasm_bindgen(js_name = "frontierOf")]
+    pub fn frontier_of(&self, b: &str) -> JsResult<JsIDs> {
+        frontiers_to_ids(&self.0.frontier_of(&b.into())?)
+    }
+}
+
+/// A branch handle: a NAME plus its content doc. Every operation re-resolves the branch's head
+/// at call time (the head a branch uses can change underneath the handle: a copy, a rebind).
+#[wasm_bindgen]
+pub struct Branch {
+    doc: Arc<BranchingDocContent>,
+    name: BranchId,
+}
+
+#[wasm_bindgen]
+impl Branch {
+    /// Resolve the branch's head for READ and run `f` on its `BranchingDocHead`. A mutation
+    /// inside `f` on a Private head is committed on exit; on a shared head it errors at the sink.
+    #[wasm_bindgen(skip_typescript)]
+    pub fn read(&self, f: js_sys::Function) -> JsResult<JsValue> {
+        self.doc
+            .read(&self.name, |head| f.call1(&JsValue::NULL, &head_for_js(head)))?
+    }
+
+    /// Resolve the branch's head for WRITE (copy-on-divergence if shared), run `f`, then commit.
+    #[wasm_bindgen(skip_typescript)]
+    pub fn write(&self, f: js_sys::Function) -> JsResult<JsValue> {
+        self.doc
+            .write(&self.name, |head| f.call1(&JsValue::NULL, &head_for_js(head)))?
+    }
+
+    /// Branch-scoped container subscription. Follows the branch across rebinds
+    /// (copy-on-divergence / merge). Returns a `() => void` unsubscribe.
+    #[wasm_bindgen(skip_typescript)]
+    pub fn subscribe(&self, container_id: &JsIntoContainerID, f: js_sys::Function) -> JsResult<JsValue> {
+        let cid = js_value_to_container_id(container_id, ContainerType::Map)?;
+        let subscriber = js_function_to_subscriber(f);
+        let sub = self.doc.subscribe_branch(&self.name, Some(cid), subscriber)?;
+        Ok(branch_subscription_to_js(sub))
+    }
+
+    /// Branch-scoped root subscription (see [`subscribe`](Self::subscribe)).
+    #[wasm_bindgen(js_name = "subscribeRoot", skip_typescript)]
+    pub fn subscribe_root(&self, f: js_sys::Function) -> JsResult<JsValue> {
+        let subscriber = js_function_to_subscriber(f);
+        let sub = self.doc.subscribe_branch(&self.name, None, subscriber)?;
+        Ok(branch_subscription_to_js(sub))
+    }
+
+    /// The gated escape hatch: EJECT a standalone `LoroDoc` (independent op log, full surface)
+    /// snapshotted at this head's own frontier. The only `Branch` method that hands out a
+    /// `LoroDoc`.
+    pub fn fork(&self) -> JsResult<LoroDoc> {
+        let forked = self.doc.branch(self.name.clone()).fork()?;
+        Ok(LoroDoc {
+            doc: forked,
+            root_event_sub: Arc::new(Mutex::new(None)),
+        })
+    }
+}
+
+/// Bridge a JS callback to a `Subscriber`, routing events through the pending-event queue (the
+/// same discipline as `LoroDoc::subscribe`).
+fn js_function_to_subscriber(f: js_sys::Function) -> Subscriber {
+    let observer = observer::Observer::new(f);
+    Arc::new(move |e: DiffEvent| {
+        put_event_in_pending_queue(observer.clone(), e);
+    })
+}
+
+/// Hand-written TypeScript for the `skip_typescript` methods on `Branch`: typed callbacks so the
+/// head-safe `BranchingDocHead` surface is visible to consumers and the round-trip stays typed.
+#[wasm_bindgen(typescript_custom_section)]
+const BRANCHING_REPO_TYPES: &str = r#"
+interface Branch {
+    /**
+     * Resolve the branch's head for read and run `f` on its head-safe `BranchingDocHead`.
+     */
+    read<R>(f: (head: BranchingDocHead) => R): R;
+    /**
+     * Resolve the branch's head for write (copy-on-divergence if shared), run `f`, then commit.
+     */
+    write<R>(f: (head: BranchingDocHead) => R): R;
+    /**
+     * Branch-scoped container subscription. Returns a `() => void` unsubscribe.
+     */
+    subscribe(containerId: ContainerID, f: (event: { by: string, origin: string, target: ContainerID, diff: Diff }) => void): () => void;
+    /**
+     * Branch-scoped root subscription. Returns a `() => void` unsubscribe.
+     */
+    subscribeRoot(f: (event: { by: string, origin: string, target: ContainerID, diff: Diff }) => void): () => void;
 }
 "#;
 
