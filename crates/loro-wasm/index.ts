@@ -544,15 +544,22 @@ decorateMethods(BranchingDocHead.prototype, [
 // `Branch.write` commits its resolved content head internally, enqueuing branch-subscriber
 // events. Auto-flush them (mirroring `LoroDoc`/`BranchingDocHead.commit`) so a consumer doing
 // `subscribeRoot(cb); write(...)` observes the change with NO manual `callPendingEvents()`.
-// Only `write` mutates+commits+emits: `read`/`subscribe`/`subscribeRoot`/`fork` do not commit,
-// and `merge`/`advance`/`createBranchAt` (on `BranchingDoc`) re-resolve the head by REBIND, which
-// delivers no `DiffEvent` (verified empirically) — decorating them would be a no-op.
+// Only `write` mutates+commits+emits; `read`/`subscribe`/`subscribeRoot`/`fork` do not commit.
 decorateMethods(Branch.prototype, ["write"]);
 
-// `BranchingDoc.import` lands remote ops then EAGERLY re-resolves every known branch (the
-// `Delegated` policy's `after_import`), delivering the synced change to branch subscribers — the
-// cross-peer sync path. Same auto-flush precedent as the decorated `LoroDoc.import`.
-decorateMethods(BranchingDoc.prototype, ["import"]);
+// `BranchingDoc` mutating methods that enqueue branch-subscriber events, auto-flushed here:
+//   - `import`: lands remote ops then EAGERLY re-resolves every known branch (the `Delegated`
+//     policy's `after_import`); same precedent as the decorated `LoroDoc.import`.
+//   - `merge` / `advance`: a TRUE 3-way merge (and any advance that catches a head up by copy)
+//     takes the `advance_in_place` -> `head.checkout` arm, which enqueues a `by:"checkout"`
+//     event on the target branch's subscriber. Without this flush a subscriber goes STALE on a
+//     real merge.
+// WARN(claude-opus-4-8/loro-wasm-branchingdocrepo): a FAST-FORWARD advance/merge takes the REBIND
+// arm instead (re-points the subscription to an existing head at the target) and emits NO
+// `DiffEvent` at the Rust level, so on a fast-forward the subscriber is NOT notified. This is NOT
+// fixable in JS decoration (there is nothing enqueued to flush) — see the Phase-5 reactivity-gap
+// risk in the devlog; the fix is emit-on-rebind (Rust) or an explicit re-project consumer contract.
+decorateMethods(BranchingDoc.prototype, ["import", "merge", "advance"]);
 
 // ---------------------------------------------------------------------------
 // Head-safety drift guard (compile-time).

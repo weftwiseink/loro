@@ -263,4 +263,37 @@ describe("Branch subscriptions deliver change events", () => {
     branch.write((h) => h.getText("t").insert(2, "z"));
     expect(events.length).toBe(1);
   });
+
+  it("a TRUE 3-way merge delivers a catch-up event to the target subscriber", () => {
+    // The discriminator the fast-forward case misses: two DIVERGENT edits at the same position
+    // force a real merge (outcome "merged"), which catches the target head up via
+    // `advance_in_place` -> `head.checkout`, enqueuing a `by:"checkout"` event. `merge` is
+    // decorated to auto-flush it, so the `main` subscriber must observe it with NO manual flush.
+    const repo = new BranchingDocRepo();
+    const doc = repo.openDoc("G");
+    doc.branch("main").write((h) => h.getText("t").insert(0, "base"));
+    repo.createBranch("feature", "main");
+    doc.branch("main").write((h) => h.getText("t").insert(4, "M"));
+    doc.branch("feature").write((h) => h.getText("t").insert(4, "F"));
+    // Precondition: this is a genuine divergence, not a fast-forward.
+    expect(doc.contains("main", "feature")).toBe(false);
+
+    const events: LoroEventBatch[] = [];
+    const unsubscribe = doc.branch("main").subscribeRoot((e) => events.push(e));
+
+    expect(doc.merge("main", "feature")).toBe("merged"); // TRUE 3-way merge, not "fast-forward"
+
+    // The catch-up event is delivered with no manual `callPendingEvents()`.
+    expect(events.length).toBe(1);
+    expect(events[0].by).toBe("checkout"); // the copy/catch-up arm, not a local edit
+    expect(events[0].events.some((ev) => ev.target === "cid:root-t:Text")).toBe(
+      true,
+    );
+    // main now carries BOTH divergent edits (6 chars) — the subscriber's view is not stale.
+    expect(
+      doc.branch("main").read((h) => [...h.getText("t").toString()].length),
+    ).toBe(6);
+
+    unsubscribe();
+  });
 });
