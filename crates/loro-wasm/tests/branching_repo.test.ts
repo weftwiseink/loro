@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BranchingDocRepo } from "../bundler/index";
+import { BranchingDocRepo, callPendingEvents } from "../bundler/index";
 
 // The discriminator: proves branch data crosses the wasm boundary correctly — a write is
 // readable back on its branch, a divergent branch stays ISOLATED (copy-on-divergence), and
@@ -202,5 +202,88 @@ describe("BranchingDocRepo cross-peer sync", () => {
     expect(a.openDoc("G").contains("main", "feat")).toBe(true);
     expect(readBranch(a, "G", "main")).toBe(readBranch(b, "G", "main"));
     expect(readBranch(a, "G", "main")).toBe("base-feat");
+  });
+});
+
+// Branch-scoped subscriptions: proves the `subscribe`/`subscribeRoot` bindings actually DELIVER a
+// change event to a JS callback after a mutation lands on the branch (not merely that the call
+// does not throw), that the container-scoped variant carries the right target, and that the
+// unsubscribe closure stops delivery.
+//
+// > NOTE(claude-opus-4-8/loro-wasm-branchingdocrepo): event delivery is LAZY on this surface.
+// > `Branch.write` commits internally but is NOT in the JS `callPendingEvents` auto-flush
+// > decoration list (only `LoroDoc`/`BranchingDocHead.commit` etc. are), so queued branch events
+// > are not delivered to callbacks until the pending queue is flushed. Every assertion here flushes
+// > with `callPendingEvents()` after the mutating `write`; without it the callbacks never fire.
+// The RUNTIME payload delivered to a branch subscriber is a `LoroEventBatch`-shaped object
+// (`diff_event_to_js_value`: `{ by, origin, events: [{ target, path, diff }], from, to }`). The
+// binding's hand-written TS declares the callback arg as `{ by, origin, target, diff }`, which
+// does NOT match the runtime shape, so the callback arg is cast to this accurate type here.
+// WARN(claude-opus-4-8/loro-wasm-branchingdocrepo): the declared `subscribe`/`subscribeRoot`
+// callback type in `lib.rs`'s `BRANCHING_REPO_TYPES` is inaccurate; a follow-up should align it
+// with the batch shape below.
+type BranchDiffEvent = {
+  by: string;
+  origin: string;
+  events: Array<{ target: string; path: unknown; diff: unknown }>;
+};
+
+describe("Branch subscriptions deliver change events", () => {
+  it("subscribeRoot fires on a branch write and stops after unsubscribe", () => {
+    const repo = new BranchingDocRepo();
+    const doc = repo.openDoc("G");
+    const branch = doc.branch("main");
+
+    const events: BranchDiffEvent[] = [];
+    const unsubscribe = branch.subscribeRoot((e) =>
+      events.push(e as unknown as BranchDiffEvent),
+    );
+
+    // A mutation on the branch's content doc must reach the root subscriber.
+    branch.write((h) => h.getText("t").insert(0, "hi"));
+    callPendingEvents(); // lazy delivery: flush the pending queue (see NOTE above)
+
+    expect(events.length).toBe(1);
+    // The delivered payload is a real change batch: a LOCAL edit carrying the text container's diff.
+    expect(events[0].by).toBe("local");
+    expect(events[0].events.length).toBeGreaterThan(0);
+    expect(events[0].events.some((ev) => ev.target === "cid:root-t:Text")).toBe(
+      true,
+    );
+
+    // After unsubscribe, a further write delivers NOTHING (the callback is detached).
+    unsubscribe();
+    branch.write((h) => h.getText("t").insert(2, "!"));
+    callPendingEvents();
+    expect(events.length).toBe(1);
+  });
+
+  it("subscribe(containerId) fires for the scoped container on a write", () => {
+    const repo = new BranchingDocRepo();
+    const doc = repo.openDoc("G");
+    const branch = doc.branch("main");
+
+    // Materialize the container first, then subscribe to it by id.
+    branch.write((h) => h.getText("t").insert(0, "x"));
+    callPendingEvents();
+    const cid = branch.read((h) => h.getText("t").id);
+
+    const events: BranchDiffEvent[] = [];
+    const unsubscribe = branch.subscribe(cid, (e) =>
+      events.push(e as unknown as BranchDiffEvent),
+    );
+
+    branch.write((h) => h.getText("t").insert(1, "y"));
+    callPendingEvents();
+
+    expect(events.length).toBe(1);
+    expect(events[0].by).toBe("local");
+    // The container-scoped subscription's event targets exactly the subscribed container.
+    expect(events[0].events[0].target).toBe("cid:root-t:Text");
+
+    unsubscribe();
+    branch.write((h) => h.getText("t").insert(2, "z"));
+    callPendingEvents();
+    expect(events.length).toBe(1);
   });
 });
