@@ -2794,11 +2794,16 @@ impl BranchingDocRepo {
     }
 }
 
-/// A read-only view of the repo's index doc (frontiers only). The minimal safe surface: the
-/// index heads carry frontier records, so no head is handed out here.
+/// A byte-sync + read view of the repo's index doc (frontiers only). Branch existence and
+/// per-doc frontier records travel between peers through the DOC-LEVEL `import`/`export`
+/// here, NOT through any head handle: the index heads carry frontier records, so no head is
+/// ever handed out from this type. `import`/`export` operate on the shared op log through the
+/// engine's root head (never materializing a live head), exactly as `MultiHeadDoc::import`/
+/// `export` do; that is why they are head-safe.
 ///
-/// NOTE(claude-opus-4-8/branchingdocrepo-wasm): the fuller index surface (per-branch recorded
-/// frontiers, index import/export sync) is a follow-up; only the branch list is exposed now.
+/// NOTE(claude-opus-4-8/branchingdocrepo-wasm-sync): the per-branch recorded-frontier
+/// READ surface (individual `docs[doc].heads` records) stays deferred; only the branch list
+/// and whole-index byte sync are exposed. Byte sync needs no per-record accessor.
 #[wasm_bindgen]
 pub struct BranchingIndex(IndexDoc);
 
@@ -2807,6 +2812,26 @@ impl BranchingIndex {
     /// The branches this session knows, from the index lineage.
     pub fn branches(&self) -> Vec<String> {
         self.0.branches().iter().map(|b| b.to_string()).collect()
+    }
+
+    /// Export the index's shared history for cross-peer sync (byte-level). Mirrors
+    /// `LoroDoc::export`: `{ mode: "update" }` yields the update bytes a peer imports to
+    /// learn which branches exist and where each is recorded. History/ops export is
+    /// head-independent (the op log is shared).
+    pub fn export(&self, mode: JsExportMode) -> JsResult<Vec<u8>> {
+        let export_mode = js_to_export_mode(mode)
+            .map_err(|e| JsValue::from_str(&format!("Invalid export mode. Error: {:?}", e)))?;
+        Ok(self.0.export(export_mode)?)
+    }
+
+    /// Import index history from a peer (byte-level). History-only + all-heads-barriered:
+    /// ops land in the shared op log without moving any head's state, then the `SelfRooted`
+    /// policy's `after_import` discovers remote branches from the lineage scan and advances
+    /// the affected index heads. This is how a peer LEARNS a remote branch and where it sits;
+    /// the content ops themselves arrive via [`BranchingDoc::import`].
+    pub fn import(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
+        let status = self.0.import(bytes)?;
+        Ok(import_status_to_js_value(status)?.into())
     }
 }
 
@@ -2855,6 +2880,26 @@ impl BranchingDoc {
     #[wasm_bindgen(js_name = "frontierOf")]
     pub fn frontier_of(&self, b: &str) -> JsResult<JsIDs> {
         frontiers_to_ids(&self.0.frontier_of(&b.into())?)
+    }
+
+    /// Export this content doc's shared history for cross-peer sync (byte-level). Mirrors
+    /// `LoroDoc::export`. Pair with an index export ([`BranchingIndex::export`]): a peer
+    /// imports the index first (to learn the branches) and then this doc's content bytes.
+    pub fn export(&self, mode: JsExportMode) -> JsResult<Vec<u8>> {
+        let export_mode = js_to_export_mode(mode)
+            .map_err(|e| JsValue::from_str(&format!("Invalid export mode. Error: {:?}", e)))?;
+        Ok(self.0.export(export_mode)?)
+    }
+
+    /// Import content history from a peer (byte-level). History-only + all-heads-barriered:
+    /// ops land in the shared op log without corrupting any shared head, then the `Delegated`
+    /// policy's `after_import` EAGERLY re-resolves every branch the index knows -- a branch
+    /// whose recorded ids for this doc just became held advances to them (the ingest); ids
+    /// still unheld are dropped by `target` and picked up on the next import. Import the
+    /// paired index bytes ([`BranchingIndex::import`]) FIRST so the branch is already known.
+    pub fn import(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
+        let status = self.0.import(bytes)?;
+        Ok(import_status_to_js_value(status)?.into())
     }
 }
 
