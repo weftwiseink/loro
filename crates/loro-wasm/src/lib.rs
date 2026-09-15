@@ -2983,11 +2983,11 @@ interface Branch {
     /**
      * Branch-scoped container subscription. Returns a `() => void` unsubscribe.
      */
-    subscribe(containerId: ContainerID, f: (event: { by: string, origin: string, target: ContainerID, diff: Diff }) => void): () => void;
+    subscribe(containerId: ContainerID, f: (event: LoroEventBatch) => void): () => void;
     /**
      * Branch-scoped root subscription. Returns a `() => void` unsubscribe.
      */
-    subscribeRoot(f: (event: { by: string, origin: string, target: ContainerID, diff: Diff }) => void): () => void;
+    subscribeRoot(f: (event: LoroEventBatch) => void): () => void;
 }
 "#;
 

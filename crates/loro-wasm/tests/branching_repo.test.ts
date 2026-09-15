@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BranchingDocRepo, callPendingEvents } from "../bundler/index";
+import { BranchingDocRepo, type LoroEventBatch } from "../bundler/index";
 
 // The discriminator: proves branch data crosses the wasm boundary correctly — a write is
 // readable back on its branch, a divergent branch stays ISOLATED (copy-on-divergence), and
@@ -210,38 +210,21 @@ describe("BranchingDocRepo cross-peer sync", () => {
 // does not throw), that the container-scoped variant carries the right target, and that the
 // unsubscribe closure stops delivery.
 //
-// > NOTE(claude-opus-4-8/loro-wasm-branchingdocrepo): event delivery is LAZY on this surface.
-// > `Branch.write` commits internally but is NOT in the JS `callPendingEvents` auto-flush
-// > decoration list (only `LoroDoc`/`BranchingDocHead.commit` etc. are), so queued branch events
-// > are not delivered to callbacks until the pending queue is flushed. Every assertion here flushes
-// > with `callPendingEvents()` after the mutating `write`; without it the callbacks never fire.
-// The RUNTIME payload delivered to a branch subscriber is a `LoroEventBatch`-shaped object
-// (`diff_event_to_js_value`: `{ by, origin, events: [{ target, path, diff }], from, to }`). The
-// binding's hand-written TS declares the callback arg as `{ by, origin, target, diff }`, which
-// does NOT match the runtime shape, so the callback arg is cast to this accurate type here.
-// WARN(claude-opus-4-8/loro-wasm-branchingdocrepo): the declared `subscribe`/`subscribeRoot`
-// callback type in `lib.rs`'s `BRANCHING_REPO_TYPES` is inaccurate; a follow-up should align it
-// with the batch shape below.
-type BranchDiffEvent = {
-  by: string;
-  origin: string;
-  events: Array<{ target: string; path: unknown; diff: unknown }>;
-};
-
+// Delivery needs NO manual flush: `Branch.write` is decorated in `index.ts` to auto-flush
+// `callPendingEvents()` after it commits (mirroring `LoroDoc`/`BranchingDocHead.commit`), so a
+// consumer doing `subscribeRoot(cb); write(...)` observes the change directly. The callback arg is
+// the exported `LoroEventBatch` type — `{ by, origin, events: [{ target, path, diff }], from, to }`.
 describe("Branch subscriptions deliver change events", () => {
   it("subscribeRoot fires on a branch write and stops after unsubscribe", () => {
     const repo = new BranchingDocRepo();
     const doc = repo.openDoc("G");
     const branch = doc.branch("main");
 
-    const events: BranchDiffEvent[] = [];
-    const unsubscribe = branch.subscribeRoot((e) =>
-      events.push(e as unknown as BranchDiffEvent),
-    );
+    const events: LoroEventBatch[] = [];
+    const unsubscribe = branch.subscribeRoot((e) => events.push(e));
 
-    // A mutation on the branch's content doc must reach the root subscriber.
+    // A mutation on the branch's content doc reaches the root subscriber with no manual flush.
     branch.write((h) => h.getText("t").insert(0, "hi"));
-    callPendingEvents(); // lazy delivery: flush the pending queue (see NOTE above)
 
     expect(events.length).toBe(1);
     // The delivered payload is a real change batch: a LOCAL edit carrying the text container's diff.
@@ -254,7 +237,6 @@ describe("Branch subscriptions deliver change events", () => {
     // After unsubscribe, a further write delivers NOTHING (the callback is detached).
     unsubscribe();
     branch.write((h) => h.getText("t").insert(2, "!"));
-    callPendingEvents();
     expect(events.length).toBe(1);
   });
 
@@ -265,16 +247,12 @@ describe("Branch subscriptions deliver change events", () => {
 
     // Materialize the container first, then subscribe to it by id.
     branch.write((h) => h.getText("t").insert(0, "x"));
-    callPendingEvents();
     const cid = branch.read((h) => h.getText("t").id);
 
-    const events: BranchDiffEvent[] = [];
-    const unsubscribe = branch.subscribe(cid, (e) =>
-      events.push(e as unknown as BranchDiffEvent),
-    );
+    const events: LoroEventBatch[] = [];
+    const unsubscribe = branch.subscribe(cid, (e) => events.push(e));
 
     branch.write((h) => h.getText("t").insert(1, "y"));
-    callPendingEvents();
 
     expect(events.length).toBe(1);
     expect(events[0].by).toBe("local");
@@ -283,7 +261,6 @@ describe("Branch subscriptions deliver change events", () => {
 
     unsubscribe();
     branch.write((h) => h.getText("t").insert(2, "z"));
-    callPendingEvents();
     expect(events.length).toBe(1);
   });
 });

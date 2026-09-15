@@ -2,6 +2,8 @@ export * from "loro-wasm";
 export type * from "loro-wasm";
 import {
   AwarenessWasm,
+  Branch,
+  BranchingDoc,
   BranchingDocHead,
   EphemeralStoreWasm,
   PeerID,
@@ -538,6 +540,19 @@ decorateMethods(BranchingDocHead.prototype, [
   "revertTo",
   "applyDiff",
 ]);
+
+// `Branch.write` commits its resolved content head internally, enqueuing branch-subscriber
+// events. Auto-flush them (mirroring `LoroDoc`/`BranchingDocHead.commit`) so a consumer doing
+// `subscribeRoot(cb); write(...)` observes the change with NO manual `callPendingEvents()`.
+// Only `write` mutates+commits+emits: `read`/`subscribe`/`subscribeRoot`/`fork` do not commit,
+// and `merge`/`advance`/`createBranchAt` (on `BranchingDoc`) re-resolve the head by REBIND, which
+// delivers no `DiffEvent` (verified empirically) — decorating them would be a no-op.
+decorateMethods(Branch.prototype, ["write"]);
+
+// `BranchingDoc.import` lands remote ops then EAGERLY re-resolves every known branch (the
+// `Delegated` policy's `after_import`), delivering the synced change to branch subscribers — the
+// cross-peer sync path. Same auto-flush precedent as the decorated `LoroDoc.import`.
+decorateMethods(BranchingDoc.prototype, ["import"]);
 
 // ---------------------------------------------------------------------------
 // Head-safety drift guard (compile-time).
