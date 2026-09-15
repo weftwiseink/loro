@@ -374,4 +374,55 @@ describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta
     expect(readBranch(c, "G", "feat")).toBe("base-feat");
     expect(readBranch(c, "G", "main")).toBe("base");
   });
+
+  // The NON-ECHO invariant, permanently guarded: `subscribeLocalUpdates` fires on LOCAL edits ONLY,
+  // NEVER on `import`. A regression that let an import echo onto the local-update stream would be a
+  // PRODUCTION SYNC LOOP (a peer re-broadcasts every op it receives). Covers BOTH the content
+  // `BranchingDoc` and the `BranchingIndex` — including the index's `after_import` policy-resolve
+  // path (SelfRooted discovers the remote branch and advances index heads), the sharpest residual
+  // echo risk. Proven live too: B's OWN edits DO fire, so a passing "0 on import" is not a dead callback.
+  it("import does NOT echo onto subscribeLocalUpdates (content doc + index); a local edit DOES", () => {
+    const a = new BranchingDocRepo();
+    const b = new BranchingDocRepo();
+
+    // A builds a NON-MAIN branch with an edit (the multi-head case).
+    a.openDoc("G").branch("main").write((h) => h.getText("t").insert(0, "base"));
+    a.createBranch("feat", "main");
+    a.openDoc("G").branch("feat").write((h) => h.getText("t").insert(4, "-feat"));
+
+    b.openDoc("G"); // B has a content doc to import into
+
+    // Wire B's local-update streams BEFORE importing, so ANY echo from `import` (incl. the index
+    // after_import resolve path and the content after_import re-resolve) is caught.
+    const bDocUpdates: Uint8Array[] = [];
+    const bIdxUpdates: Uint8Array[] = [];
+    const unsubDoc = b.openDoc("G").subscribeLocalUpdates((bytes) => bDocUpdates.push(bytes));
+    const unsubIdx = b.index().subscribeLocalUpdates((bytes) => bIdxUpdates.push(bytes));
+
+    // Import A's REMOTE updates: index first (learn feat + frontier -> SelfRooted after_import
+    // advances index heads), then content (feat ops -> Delegated after_import re-resolves).
+    b.index().import(a.index().export(UPDATE));
+    b.openDoc("G").import(a.openDoc("G").export(UPDATE));
+
+    // NON-ECHO: importing remote ops fires the LOCAL-update stream ZERO times on BOTH surfaces.
+    expect(bDocUpdates.length).toBe(0);
+    expect(bIdxUpdates.length).toBe(0);
+
+    // Not vacuous: the import genuinely landed and B converged (so the streams had a real chance to fire).
+    expect(b.branches().sort()).toEqual(["feat", "main"]);
+    expect(readBranch(b, "G", "feat")).toBe("base-feat");
+
+    // ALIVE (content): B's OWN local edit DOES fire the content stream.
+    b.openDoc("G").branch("feat").write((h) => h.getText("t").insert(0, "x"));
+    expect(bDocUpdates.length).toBeGreaterThan(0);
+
+    // ALIVE (index): a LOCAL frontier advance (merge feat -> main, a fast-forward) records a new
+    // frontier into B's index -> a local index commit -> fires the index stream. `BranchingDoc.merge`
+    // is auto-flushed (decorated in index.ts), so delivery is synchronous and deterministic here.
+    expect(b.openDoc("G").merge("main", "feat")).toBe("fast-forward");
+    expect(bIdxUpdates.length).toBeGreaterThan(0);
+
+    unsubDoc();
+    unsubIdx();
+  });
 });
