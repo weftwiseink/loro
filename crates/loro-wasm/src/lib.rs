@@ -35,7 +35,7 @@ use loro_internal::{
 };
 use loro_internal::multi_head::{
     BranchId, BranchSubscription, BranchingDoc as BranchingDocContent, BranchingDocRepo as RepoInner,
-    IndexDoc, MergeOutcome, QuarantineReason,
+    IndexDoc, MergeOutcome,
 };
 use loro_internal::subscription::Subscriber;
 use parking_lot::lock_api::ReentrantMutex;
@@ -331,10 +331,6 @@ extern "C" {
     pub type JsIDs;
     #[wasm_bindgen(typescript_type = "Record<string, { peer: PeerID, counter: number }[]>")]
     pub type JsBranchTips;
-    #[wasm_bindgen(
-        typescript_type = "{ id: { peer: PeerID, counter: number }, reason: string, detail: string }[]"
-    )]
-    pub type JsQuarantineReport;
     #[wasm_bindgen(typescript_type = "{ start: number, end: number }")]
     pub type JsRange;
     #[wasm_bindgen(typescript_type = "number|bool|string|null")]
@@ -2749,25 +2745,6 @@ fn merge_outcome_to_str(outcome: MergeOutcome) -> &'static str {
     }
 }
 
-/// A quarantine reason as a `(tag, detail)` pair for the JS diagnostics view.
-/// `detail` is a human string (a dep id, or the comma-joined disagreeing
-/// branches); empty when the tag alone says it.
-fn quarantine_reason_parts(reason: &QuarantineReason) -> (&'static str, String) {
-    match reason {
-        QuarantineReason::NoDeps => ("no-deps", String::new()),
-        QuarantineReason::UnknownDep(dep) => ("unknown-dep", dep.to_string()),
-        QuarantineReason::DepsDisagree(branches) => (
-            "deps-disagree",
-            branches
-                .iter()
-                .map(|b| b.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-        ),
-        QuarantineReason::NotInDag(dep) => ("not-in-dag", dep.to_string()),
-    }
-}
-
 /// Wrap a resolved head `LoroDoc` as a head-safe wasm `BranchingDocHead` for a `read`/`write`
 /// closure. The wasm `LoroDoc` aliases the same underlying head (a cheap `Arc` clone), so edits
 /// through the head's containers land on the head the repo committed on closure exit.
@@ -2932,25 +2909,6 @@ impl BranchingIndex {
         Ok(JsValue::from(obj).into())
     }
 
-    /// The imported spans the causal fold refused to attribute: `{ id, reason,
-    /// detail }[]`. Empty on a well-formed history; a non-empty report is the
-    /// loud, local signal of a model violation whose ops stayed in the op log
-    /// without moving any branch's frontier. `reason` is one of `"no-deps"`,
-    /// `"unknown-dep"`, `"deps-disagree"`, `"not-in-dag"`.
-    #[wasm_bindgen(js_name = "quarantineReport")]
-    pub fn quarantine_report(&self) -> JsResult<JsQuarantineReport> {
-        let arr = Array::new();
-        for (id, reason) in self.0.quarantine_report() {
-            let obj = Object::new();
-            Reflect::set(&obj, &"id".into(), &id_to_js(&id)?)?;
-            let (tag, detail) = quarantine_reason_parts(&reason);
-            Reflect::set(&obj, &"reason".into(), &JsValue::from_str(tag))?;
-            Reflect::set(&obj, &"detail".into(), &JsValue::from_str(&detail))?;
-            arr.push(&obj);
-        }
-        Ok(JsValue::from(arr).into())
-    }
-
     /// The index frontier branch `b` was forked from: the deps of `b`'s creation
     /// marker (the cross-doc fork point, which lives only in the index). Empty
     /// for the genesis branch and for an unknown branch.
@@ -2959,13 +2917,15 @@ impl BranchingIndex {
         frontiers_to_ids(&self.0.fork_point(&b.into()))
     }
 
-    /// The document ids branch `b` has frontier records for (those inherited from
-    /// its fork parent included). Empty for an unknown branch.
-    #[wasm_bindgen(js_name = "touchedDocs")]
-    pub fn touched_docs(&self, b: &str) -> JsResult<Vec<String>> {
+    /// The document ids branch `b` ITSELF modified since it forked (a fork-point
+    /// diff: docs whose recorded frontier at `tips[b]` differs from their state
+    /// at `fork_point(b)`). Docs inherited unchanged from the fork parent are
+    /// excluded. Empty for an unknown branch.
+    #[wasm_bindgen(js_name = "docsModifiedOnBranch")]
+    pub fn docs_modified_on_branch(&self, b: &str) -> JsResult<Vec<String>> {
         Ok(self
             .0
-            .touched_docs(&b.into())?
+            .docs_modified_on_branch(&b.into())?
             .iter()
             .map(|d| d.to_string())
             .collect())

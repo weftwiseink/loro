@@ -431,7 +431,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         // policies that track no remote binding (e.g. `Manual`) it is empty.
         // A branch whose ids are not yet fully held is skipped and picked up on
         // the next import (resolve errors are non-fatal here).
-        let touched = self.inner.policy.after_import(self, &status);
+        let touched = self.inner.policy.after_import(self, &status)?;
         for b in touched {
             let _ = self.resolve(&b, Intent::Read);
         }

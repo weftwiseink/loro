@@ -3,9 +3,9 @@ use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 
 use crate::version::{shrink_frontiers, Frontiers};
-use loro_common::{Counter, InternalString, Lamport, LoroError, LoroResult, PeerID, ID};
+use loro_common::{Counter, InternalString, Lamport, LoroError, LoroResult, LoroValue, PeerID, ID};
 
-use super::policy::{BRANCH_MERGE_KEY, BRANCH_NAME_KEY, BRANCH_ROOT, QuarantineReason};
+use super::policy::{BRANCH_MERGE_KEY, BRANCH_NAME_KEY, BRANCH_ROOT};
 use super::ROOT_HEAD_ID;
 use super::*;
 
@@ -233,14 +233,6 @@ impl MultiHeadDoc<SelfRooted> {
         self.policy().attribution(self).lock().tips.clone()
     }
 
-    /// The imported spans the causal fold refused to attribute (see
-    /// `QuarantineReason`), keyed by first op id. Empty on a well-formed
-    /// history; a non-empty report is the loud, local signal of a model
-    /// violation whose ops stayed in the op log without moving any `tips`.
-    pub fn quarantine_report(&self) -> Vec<(ID, QuarantineReason)> {
-        self.policy().attribution(self).lock().quarantined.clone()
-    }
-
     /// The index frontier branch `b` was forked from: the DEPENDENCIES of `b`'s
     /// creation marker (the causally-earliest op attributed to `b`).
     ///
@@ -274,25 +266,102 @@ impl MultiHeadDoc<SelfRooted> {
             .unwrap_or_default()
     }
 
-    /// The document ids branch `b` has frontier records for: the keys of its
-    /// `docs` map at `tips[b]`. Empty for an unknown branch.
-    ///
-    /// NOTE(claude-opus-4-8/index-causal-attribution): this returns the docs
-    /// RECORDED on `b` (a superset that INCLUDES docs inherited from `b`'s fork
-    /// parent), which is the useful "which docs does branch `b` know about" read.
-    /// The proposal's finer "docs `b`'s OWN changes touched since `fork_point`"
-    /// delta needs a per-doc state diff between `fork_point(b)` and `tips[b]`;
-    /// it is DEFERRED because no consumer requires it yet (see the Round 5
-    /// TS-reader enumeration: no weftwise caller reads the branching index).
-    pub fn touched_docs(&self, b: &BranchId) -> LoroResult<Vec<DocId>> {
-        self.read(b, |d| {
+    /// The `docs` map (each `DocId` -> its `heads` value) as it stood at frontier
+    /// `f`, materialized on a throwaway scratch head. The comparison substrate
+    /// for the fork-point diffs below.
+    fn docs_map_at(&self, f: &Frontiers) -> LoroResult<FxHashMap<DocId, LoroValue>> {
+        self.read_at(f, |d| {
             d.get_deep_value()
                 .as_map()
                 .and_then(|root| root.get("docs").cloned())
                 .and_then(|v| v.into_map().ok())
-                .map(|docs| docs.keys().map(|k| DocId::from(k.as_str())).collect())
+                .map(|docs| {
+                    docs.iter()
+                        .map(|(k, v)| (DocId::from(k.as_str()), v.clone()))
+                        .collect()
+                })
                 .unwrap_or_default()
         })
+    }
+
+    /// The docs branch `b` ITSELF modified: those whose recorded frontier at
+    /// `tips[b]` DIFFERS from their state at `fork_point(b)` (a fork-point diff).
+    /// Docs inherited unchanged from `b`'s parent are excluded (their value is
+    /// identical at both frontiers), unlike the raw `docs` key set at `tips[b]`
+    /// (which is nearly every doc, since a fork eager-copies the parent's record).
+    ///
+    /// This is computed ON DEMAND, not from an incremental per-branch stack: the
+    /// incremental "copy the parent's set at fork" step is not correct under a
+    /// concurrent fork (a parent op concurrent with the fork, folded first by
+    /// lamport order, would leak into the child's inherited set), so it
+    /// degenerates to this same fork-point recompute. The recompute is also
+    /// exactly what a MERGE needs (a merged branch's own set is recomputed from
+    /// its branchpoint), so one fork-point diff is uniformly correct for forks,
+    /// merges, and concurrent forks. Empty for an unknown branch.
+    pub fn docs_modified_on_branch(&self, b: &BranchId) -> LoroResult<Vec<DocId>> {
+        let tip = self.policy().target(self, b)?;
+        let fork = self.fork_point(b);
+        let at_tip = self.docs_map_at(&tip)?;
+        let at_fork = self.docs_map_at(&fork)?;
+        let mut out: Vec<DocId> = at_tip
+            .into_iter()
+            .filter(|(dc, v)| at_fork.get(dc) != Some(v))
+            .map(|(dc, _)| dc)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// The docs modified anywhere on `b`'s lineage since it diverged from the
+    /// genesis branch (the union of the per-branch stack "changed since main").
+    /// Rust-only accessor for future logic; no wasm surface yet. Empty for the
+    /// genesis branch.
+    ///
+    /// Computed as a fork-point diff from the frontier where `b`'s lineage left
+    /// genesis (found by walking parent fork-points up to genesis) to `tips[b]`.
+    pub fn docs_changed_since_main(&self, b: &BranchId) -> LoroResult<Vec<DocId>> {
+        let departure = self.departure_from_main(b);
+        if departure == Frontiers::default() {
+            // `b` is the genesis branch (never diverged from main): the baseline
+            // has nothing "changed since main".
+            return Ok(Vec::new());
+        }
+        let tip = self.policy().target(self, b)?;
+        let at_tip = self.docs_map_at(&tip)?;
+        let at_dep = self.docs_map_at(&departure)?;
+        let mut out: Vec<DocId> = at_tip
+            .into_iter()
+            .filter(|(dc, v)| at_dep.get(dc) != Some(v))
+            .map(|(dc, _)| dc)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// The frontier at which `b`'s lineage left the genesis branch: walk parent
+    /// fork-points (`fork_point` -> the branch it attributes to -> its
+    /// `fork_point`) until the parent is genesis (an empty fork point). The
+    /// returned frontier is the fork point of the topmost non-genesis ancestor.
+    /// Empty for the genesis branch itself.
+    fn departure_from_main(&self, b: &BranchId) -> Frontiers {
+        let mut fork = self.fork_point(b);
+        loop {
+            if fork == Frontiers::default() {
+                return Frontiers::default(); // `b` (or the current ancestor) is genesis
+            }
+            let parent = {
+                let attr = self.policy().attribution(self).lock();
+                fork.iter().next().and_then(|id| attr.branch_at(id).cloned())
+            };
+            let Some(parent) = parent else {
+                return fork;
+            };
+            let parent_fork = self.fork_point(&parent);
+            if parent_fork == Frontiers::default() {
+                return fork; // parent is genesis; `b`'s lineage left main here
+            }
+            fork = parent_fork;
+        }
     }
 
     /// Remove a branch from the index: unbind its index head (retiring it) and

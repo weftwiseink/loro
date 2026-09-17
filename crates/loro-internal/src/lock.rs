@@ -98,8 +98,8 @@ pub enum LockKind {
     OpLog = 3,
     DocState = 4,
     DiffCalculator = 5,
-    /// The self-rooted index's causal attribution projection (`tips` / `runs`
-    /// / `quarantined`). A leaf acquired alone or while the `OpLog` lock is
+    /// The self-rooted index's causal attribution projection (`tips` / `runs`).
+    /// A leaf acquired alone or while the `OpLog` lock is
     /// already held (`OpLog -> Attribution`), never with a registry or
     /// `DocState` lock. Ordered after `DiffCalculator` so the debug order
     /// checker covers it. (Consumed by `MultiHeadDoc<SelfRooted>`.)

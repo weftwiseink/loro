@@ -536,16 +536,17 @@ describe("BranchingDocRepo branch-lifecycle local-update streaming", () => {
   });
 });
 
-// The derived read-only projections exposed on the index (Phase 4): tips,
-// quarantineReport, forkPoint, touchedDocs. Diagnostics + branch-graph reads for
-// a future consumer; no current weftwise caller (fork engine ahead of wiring).
-describe("BranchingIndex derived reads (Phase 4)", () => {
-  it("tips / forkPoint / touchedDocs / quarantineReport cross the wasm boundary", () => {
+// The derived read-only projections exposed on the index: tips, forkPoint,
+// docsModifiedOnBranch. Branch-graph reads for a future consumer; no current
+// weftwise caller (fork engine ahead of wiring).
+describe("BranchingIndex derived reads", () => {
+  it("tips / forkPoint / docsModifiedOnBranch cross the wasm boundary", () => {
     const repo = new BranchingDocRepo();
-    const doc = repo.openDoc("G");
-    doc.branch("main").write((h) => h.getText("t").insert(0, "base")); // records G on main
+    const g = repo.openDoc("G");
+    const h = repo.openDoc("H");
+    g.branch("main").write((doc) => doc.getText("t").insert(0, "base")); // main touches G
     repo.createBranch("feat", "main");
-    doc.branch("feat").write((h) => h.getText("t").insert(4, "-f")); // records G on feat
+    h.branch("feat").write((doc) => doc.getText("t").insert(0, "hi")); // feat touches H (NOT G)
 
     const idx = repo.index();
 
@@ -559,17 +560,15 @@ describe("BranchingIndex derived reads (Phase 4)", () => {
       expect(typeof tips[b][0].counter).toBe("number");
     }
 
-    // touchedDocs: G is recorded on both branches; an unknown branch is empty.
-    expect(idx.touchedDocs("main")).toEqual(["G"]);
-    expect(idx.touchedDocs("feat")).toEqual(["G"]);
-    expect(idx.touchedDocs("nope")).toEqual([]);
+    // docsModifiedOnBranch = docs the branch ITSELF changed since forking. feat
+    // inherited G unchanged (EXCLUDED) and touched only H; main changed only G.
+    expect(idx.docsModifiedOnBranch("main")).toEqual(["G"]);
+    expect(idx.docsModifiedOnBranch("feat")).toEqual(["H"]);
+    expect(idx.docsModifiedOnBranch("nope")).toEqual([]);
 
     // forkPoint: genesis has none; feat forked from main (non-empty frontier).
     expect(idx.forkPoint("main")).toEqual([]);
     expect(idx.forkPoint("feat").length).toBeGreaterThanOrEqual(1);
     expect(typeof idx.forkPoint("feat")[0].peer).toBe("string");
-
-    // quarantineReport: empty on a well-formed history.
-    expect(idx.quarantineReport()).toEqual([]);
   });
 });

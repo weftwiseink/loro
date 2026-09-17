@@ -1434,7 +1434,6 @@ fn index_create_existing_branch_errors_and_no_peer_serves_two_branches() {
         multi.is_empty(),
         "via the normal API every index peer has exactly one attribution run: {multi:?}"
     );
-    assert!(attr.quarantined.is_empty());
     assert_eq!(attr.tips.len(), 4, "main, b1, b2, b1a");
 }
 
@@ -1477,10 +1476,7 @@ fn index_crafted_shared_peer_across_two_markers_attributes_causally() {
         "beta's frontier is the unrelated op, whose nearest marker names beta"
     );
     assert_ne!(target_alpha, target_beta, "the two branches are kept apart");
-    assert!(
-        idx.quarantine_report().is_empty(),
-        "a well-formed (if odd) history quarantines nothing"
-    );
+    // The import succeeded (a well-formed, if odd, history attributes cleanly).
 }
 
 #[test]
@@ -1821,7 +1817,7 @@ fn index_remote_discovered_branch_local_record_survives() {
 // ------------------------------------------------------------------
 // S4: the single-pass lamport-ordered fold attributes EVERY change of a
 // multi-peer, multi-branch history (diamond + repeated merge + two-session
-// same-branch) on a cold import, with zero quarantines and tips equal to the
+// same-branch) on a cold import, attributing every op (no rejection) with tips equal to the
 // source's.
 // ------------------------------------------------------------------
 
@@ -1910,20 +1906,15 @@ fn s4_history() -> BranchingDocRepo {
 fn index_cold_import_of_diamond_repeated_merge_two_session_history_attributes_all() {
     let repo = s4_history();
     let src = repo.index();
-    assert!(
-        src.quarantine_report().is_empty(),
-        "source quarantined: {:?}",
-        src.quarantine_report()
-    );
     let src_tips = src.tips();
     assert_eq!(src_tips.len(), 6, "main, B, C, D, feature, shared");
 
     let bytes = src.export(ExportMode::all_updates()).unwrap();
     let cold = IndexDoc::new(SelfRooted::new());
+    // A clean cold import (no unattributable op) of the full multi-peer,
+    // multi-branch history: `unwrap` asserts the fold rejected nothing.
     cold.import(&bytes).unwrap();
 
-    let q = cold.quarantine_report();
-    assert!(q.is_empty(), "cold import quarantined {} span(s): {q:?}", q.len());
     assert_eq!(cold.tips(), src_tips, "tips equal on the cold import");
     let mut sb = src.branches();
     sb.sort();
@@ -1937,13 +1928,14 @@ fn index_cold_import_of_diamond_repeated_merge_two_session_history_attributes_al
 }
 
 // ------------------------------------------------------------------
-// S7: quarantine is loud and local. A crafted NON-marker change whose deps
-// span two branches' frontiers is reported, its ops stay in the op log, and
-// neither branch's tips moves.
+// S7: an unattributable op is a LOUD invalid-import error, not a silent
+// attribute-to-main. A crafted NON-marker change whose deps span two branches'
+// frontiers cannot occur in well-formed operation; importing it errors, no
+// branch's tips moves, and the op stays in the op log (harmless, unreferenced).
 // ------------------------------------------------------------------
 
 #[test]
-fn index_change_spanning_two_branches_is_quarantined_without_moving_tips() {
+fn index_change_spanning_two_branches_is_rejected_without_moving_tips() {
     let idx = IndexDoc::new(SelfRooted::new());
     idx.init_genesis(&b("main")).unwrap();
     idx.create_index_branch(&b("alpha"), &b("main")).unwrap();
@@ -1969,20 +1961,19 @@ fn index_change_spanning_two_branches_is_quarantined_without_moving_tips() {
     let poison = ext.state_frontiers().as_single().unwrap();
     let ext_bytes = ext.export(ExportMode::updates(&idx.oplog_vv())).unwrap();
 
-    idx.import(&ext_bytes).unwrap();
-
-    let q = idx.quarantine_report();
-    assert_eq!(q.len(), 1, "exactly the crafted change is quarantined: {q:?}");
-    assert_eq!(q[0].0, poison);
+    // The import is REJECTED loud (the fold cannot attribute the spanning op),
+    // instead of silently attributing it to some default branch.
+    let result = idx.import(&ext_bytes);
     assert!(
-        matches!(&q[0].1, QuarantineReason::DepsDisagree(bs) if bs.len() == 2),
-        "reason names the disagreeing branches: {:?}",
-        q[0].1
+        result.is_err(),
+        "an op spanning two branches must reject the import, not attribute silently"
     );
+
+    // No branch's tips moved, and the op is still in the op log (unreferenced).
     assert_eq!(idx.tips(), tips_before, "no branch's tips moved");
     assert!(
         idx.oplog_vv().get_last(poison.peer) == Some(poison.counter),
-        "the quarantined ops stay in the op log"
+        "the rejected op stays in the op log"
     );
     // Both branches still read their own records only.
     assert_eq!(
@@ -2024,7 +2015,6 @@ fn index_arbitrary_branch_names_round_trip() {
     let restored = IndexDoc::new(SelfRooted::new());
     restored.import(&snap).unwrap();
 
-    assert!(restored.quarantine_report().is_empty());
     for (i, n) in names.iter().enumerate() {
         assert!(
             restored.branches().contains(&b(n)),
@@ -2131,7 +2121,7 @@ fn index_merge_one_marker_unions_docs_per_key() {
     );
 
     // tips read correctly: into moved to a single marker, from unchanged, both
-    // branches still known, nothing quarantined.
+    // branches still known.
     assert!(
         idx.tips()[&b("into")].as_single().is_some(),
         "into's tip is the single merge marker"
@@ -2139,7 +2129,6 @@ fn index_merge_one_marker_unions_docs_per_key() {
     let mut branches = idx.branches();
     branches.sort();
     assert_eq!(branches, vec![b("from"), b("into"), b("main")]);
-    assert!(idx.quarantine_report().is_empty());
 
     // The merge marker is a new KEY on the `branch` map, not a new container:
     // the P2 root-container count (branch + docs) is unchanged.
@@ -2153,15 +2142,10 @@ fn index_merge_one_marker_unions_docs_per_key() {
 
     // The merge marker (deps = the cross-branch join) folds cleanly on a COLD
     // import: it is a marker, so the fold attributes it to `into` with no dep
-    // agreement needed and no quarantine.
+    // agreement needed, so a clean cold import (unwrap asserts no rejection).
     let bytes = idx.export(ExportMode::all_updates()).unwrap();
     let cold = IndexDoc::new(SelfRooted::new());
     cold.import(&bytes).unwrap();
-    assert!(
-        cold.quarantine_report().is_empty(),
-        "cold import of a merge marker quarantines nothing: {:?}",
-        cold.quarantine_report()
-    );
     assert_eq!(cold.tips(), idx.tips(), "tips equal on the cold import");
     let mut cold_d = cold.recorded_ids(&b("into"), &d("D")).unwrap();
     cold_d.sort();
@@ -2286,7 +2270,6 @@ fn index_merge_into_lww_winner_still_emits_and_propagates() {
     let cold = IndexDoc::new(SelfRooted::new());
     cold.import(&idx.export(ExportMode::all_updates()).unwrap())
         .unwrap();
-    assert!(cold.quarantine_report().is_empty());
     assert_eq!(cold.tips(), idx.tips(), "merge propagates: cold tips equal");
     assert_eq!(
         cold.recorded_ids(&b("feat"), &d("D")).unwrap(),
@@ -2379,12 +2362,13 @@ fn index_repeated_merge_into_same_target_each_emits() {
 }
 
 // ------------------------------------------------------------------
-// Phase 4: derived reads (fork_point, touched_docs) + the tips-replace-vs-join
-// serialization resolution.
+// Derived reads: fork_point, docs_modified_on_branch (fork-point diff, excludes
+// inherited docs), docs_changed_since_main (stack union), and the
+// tips-replace-vs-join serialization resolution.
 // ------------------------------------------------------------------
 
 #[test]
-fn index_fork_point_and_touched_docs() {
+fn index_fork_point_and_docs_modified() {
     let idx = IndexDoc::new(SelfRooted::new());
     idx.init_genesis(&b("main")).unwrap();
     // Genesis has no fork point (its creation marker is the root op, no deps).
@@ -2399,15 +2383,106 @@ fn index_fork_point_and_touched_docs() {
     assert_eq!(idx.fork_point(&b("feat")), main_after_d);
 
     idx.record_head(&b("feat"), &d("E"), 222, 7).unwrap();
-    // touched_docs = docs recorded on the branch (D inherited from the fork, E
-    // feat's own).
-    let mut td = idx.touched_docs(&b("feat")).unwrap();
-    td.sort();
-    assert_eq!(td, vec![d("D"), d("E")]);
-    assert_eq!(idx.touched_docs(&b("main")).unwrap(), vec![d("D")]);
+    // docs_modified_on_branch = docs the branch ITSELF changed since forking. D
+    // was inherited from main (unchanged on feat) -> EXCLUDED; only E is feat's.
+    assert_eq!(idx.docs_modified_on_branch(&b("feat")).unwrap(), vec![d("E")]);
+    // main changed D since genesis (its own).
+    assert_eq!(idx.docs_modified_on_branch(&b("main")).unwrap(), vec![d("D")]);
     // Unknown branch -> empty.
-    assert!(idx.touched_docs(&b("nope")).unwrap().is_empty());
+    assert!(idx.docs_modified_on_branch(&b("nope")).unwrap().is_empty());
     assert_eq!(idx.fork_point(&b("nope")), Frontiers::default());
+}
+
+#[test]
+fn index_docs_modified_stack_a_b_c() {
+    // main -> b -> c. Each branch's docs_modified_on_branch is the TOP-of-stack
+    // set (docs IT changed); docs_changed_since_main is the whole-stack UNION.
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.record_head(&b("main"), &d("M"), 1, 1).unwrap(); // main touches M
+
+    idx.create_index_branch(&b("bb"), &b("main")).unwrap();
+    idx.record_head(&b("bb"), &d("B1"), 10, 1).unwrap(); // b touches B1
+
+    idx.create_index_branch(&b("cc"), &b("bb")).unwrap();
+    idx.record_head(&b("cc"), &d("C1"), 20, 1).unwrap(); // c touches C1
+
+    // Top sets: each branch's OWN modifications (inherited excluded).
+    assert_eq!(idx.docs_modified_on_branch(&b("main")).unwrap(), vec![d("M")]);
+    assert_eq!(idx.docs_modified_on_branch(&b("bb")).unwrap(), vec![d("B1")]);
+    assert_eq!(idx.docs_modified_on_branch(&b("cc")).unwrap(), vec![d("C1")]);
+
+    // Union since main: c's lineage changed B1 (on b) and C1 (on c) since it
+    // left main; M (main's own, inherited) is NOT part of "changed since main".
+    assert_eq!(
+        idx.docs_changed_since_main(&b("cc")).unwrap(),
+        vec![d("B1"), d("C1")]
+    );
+    assert_eq!(idx.docs_changed_since_main(&b("bb")).unwrap(), vec![d("B1")]);
+    // main itself: nothing "changed since main".
+    assert!(idx.docs_changed_since_main(&b("main")).unwrap().is_empty());
+}
+
+#[test]
+fn index_docs_modified_recomputes_across_a_merge() {
+    // A merge brings `from`'s doc into `into`; docs_modified_on_branch(into) is a
+    // fork-point recompute (not a broken incremental union), so it picks up the
+    // merged doc.
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("into"), &b("main")).unwrap();
+    idx.create_index_branch(&b("from"), &b("main")).unwrap();
+    idx.record_head(&b("into"), &d("I"), 10, 1).unwrap();
+    idx.record_head(&b("from"), &d("F"), 20, 1).unwrap();
+
+    assert_eq!(idx.docs_modified_on_branch(&b("into")).unwrap(), vec![d("I")]);
+    idx.merge(&b("into"), &b("from")).unwrap();
+    // After the merge, `into` has modified both I (its own) and F (via the merge).
+    assert_eq!(
+        idx.docs_modified_on_branch(&b("into")).unwrap(),
+        vec![d("F"), d("I")]
+    );
+}
+
+#[test]
+fn index_docs_modified_excludes_concurrent_parent_op() {
+    // The concurrency hazard the incremental copy-on-fork would get WRONG: after
+    // `child` forks from `parent`, `parent` records a doc CONCURRENTLY (post-fork
+    // on parent, causally NOT an ancestor of the fork point). A naive incremental
+    // "copy parent's live set at fork" could leak that doc into child if the
+    // parent op folds first by lamport order. The on-demand fork-point diff
+    // cannot: child's fork point predates the parent's concurrent op.
+    let a = IndexDoc::new(SelfRooted::new());
+    a.init_genesis(&b("main")).unwrap();
+    a.create_index_branch(&b("parent"), &b("main")).unwrap();
+    a.record_head(&b("parent"), &d("P0"), 10, 1).unwrap(); // pre-fork parent doc
+    let a_updates = a.export(ExportMode::all_updates()).unwrap();
+
+    // Session B learns `parent`, forks `child` off it, records child's own doc.
+    let bb = IndexDoc::new(SelfRooted::new());
+    bb.init_genesis(&b("main")).unwrap();
+    bb.import(&a_updates).unwrap();
+    bb.create_index_branch(&b("child"), &b("parent")).unwrap();
+    bb.record_head(&b("child"), &d("CH"), 30, 1).unwrap();
+
+    // Meanwhile session A records ANOTHER doc on `parent` (concurrent with the
+    // fork), then the two sync.
+    a.record_head(&b("parent"), &d("PCONC"), 11, 1).unwrap();
+    bb.import(&a.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+
+    // child modified ONLY its own doc; the parent's concurrent post-fork doc is
+    // NOT attributed to child (it is neither inherited-at-fork nor child's own).
+    assert_eq!(
+        bb.docs_modified_on_branch(&b("child")).unwrap(),
+        vec![d("CH")],
+        "child must not absorb the parent's concurrent post-fork doc"
+    );
+    // parent modified both its own docs (pre- and post-fork).
+    assert_eq!(
+        bb.docs_modified_on_branch(&b("parent")).unwrap(),
+        vec![d("P0"), d("PCONC")]
+    );
 }
 
 #[test]

@@ -35,8 +35,13 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
     fn after_commit(&self, this: &MultiHeadDoc<Self>, b: &BranchId, committed: IdSpan);
 
     /// Given the spans that just landed on import, return the branches whose
-    /// binding should be re-resolved.
-    fn after_import(&self, this: &MultiHeadDoc<Self>, status: &ImportStatus) -> Vec<BranchId>;
+    /// binding should be re-resolved. Errs if the import is malformed (an op the
+    /// index policy cannot attribute to any branch); the caller propagates it.
+    fn after_import(
+        &self,
+        this: &MultiHeadDoc<Self>,
+        status: &ImportStatus,
+    ) -> LoroResult<Vec<BranchId>>;
 }
 
 /// Root map that carries every branch's creation MARKER as a plain map value:
@@ -103,20 +108,17 @@ fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
     }
 }
 
-/// Why an imported change (or its pre-marker prefix) was NOT attributed to any
-/// branch. A quarantined span stays in the op log; no branch's `tips` moves
-/// for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QuarantineReason {
-    /// No marker and no dependencies: a root change of unknown branch.
-    NoDeps,
-    /// A dependency lies outside every attribution run.
-    UnknownDep(ID),
-    /// The dependencies attribute to more than one branch (a change that
-    /// literally spans two branches' frontiers, which no engine path produces).
-    DepsDisagree(Vec<BranchId>),
-    /// An attributed id could not be shrunk against the DAG.
-    NotInDag(ID),
+/// Build the loud error for an imported op the fold cannot attribute to a
+/// branch. This is UNREACHABLE in well-formed operation: every index op
+/// descends from genesis, a normal record resolves to exactly one nearest
+/// marker, and a merge is itself a marker. An unattributable op is therefore
+/// malformed input, and the fold refuses it (advancing no branch) and returns
+/// this error, the way Loro rejects an invalid import -- NEVER silently
+/// attributing it to some default branch (that is the S0 silent-data-loss
+/// class).
+fn invalid_attribution(msg: impl std::fmt::Display) -> LoroError {
+    tracing::error!("index attribution: invalid import: {msg}");
+    LoroError::Unknown(format!("index attribution: invalid import: {msg}").into_boxed_str())
 }
 
 /// The index's derived branch projection (the maintainer's `active_branches`),
@@ -131,8 +133,6 @@ pub struct Attribution {
     /// has one run (its creation marker at counter 0); a peer whose head is
     /// later rebound, or a peer that writes a marker mid-history, gains more.
     pub runs: FxHashMap<PeerID, SmallVec<[(Counter, BranchId); 1]>>,
-    /// Spans that violated the model, keyed by their first op id; diagnostics.
-    pub quarantined: Vec<(ID, QuarantineReason)>,
 }
 
 impl Attribution {
@@ -160,22 +160,25 @@ impl Attribution {
         }
     }
 
-    /// The single branch every dependency attributes to.
-    fn branch_of_deps(&self, deps: &Frontiers) -> Result<BranchId, QuarantineReason> {
+    /// The single branch every dependency attributes to, or a loud error if the
+    /// deps are unknown, disagree, or absent (all malformed-input cases).
+    fn branch_of_deps(&self, deps: &Frontiers) -> LoroResult<BranchId> {
         let mut found: Option<BranchId> = None;
         for dep in deps.iter() {
-            let b = self
-                .branch_at(dep)
-                .ok_or(QuarantineReason::UnknownDep(dep))?;
+            let b = self.branch_at(dep).ok_or_else(|| {
+                invalid_attribution(format!("dependency {dep} lies outside every attribution run"))
+            })?;
             match &found {
                 None => found = Some(b.clone()),
                 Some(f) if f == b => {}
                 Some(f) => {
-                    return Err(QuarantineReason::DepsDisagree(vec![f.clone(), b.clone()]))
+                    return Err(invalid_attribution(format!(
+                        "a non-marker change's dependencies span two branches ({f} and {b})"
+                    )))
                 }
             }
         }
-        found.ok_or(QuarantineReason::NoDeps)
+        found.ok_or_else(|| invalid_attribution("a root change carries no marker and no deps"))
     }
 }
 
@@ -187,8 +190,9 @@ impl Attribution {
 ///
 /// Attribution is CAUSAL, not by peer identity: a change belongs to the branch
 /// named by its own marker if it carries one, else to the branch of its
-/// dependencies (which must agree, or the change is quarantined). A head's
-/// state is always at `tips[b]` when it commits (`resolve` guarantees it), so
+/// dependencies (which must agree, or the import is rejected as malformed). A
+/// head's state is always at `tips[b]` when it commits (`resolve` guarantees it),
+/// so
 /// every local change depends on `b`'s tips and inherits `b` with no
 /// declaration -- which is why a head minted by the resolve materialize arm
 /// needs no marker of its own: its first change's deps already attribute it.
@@ -269,8 +273,13 @@ impl HeadPolicy for SelfRooted {
     /// exceeds every dependency's), then attribute each in that order, so every
     /// dependency of a successful change is in `runs` before it is looked up
     /// (Loro holds a change back in `pending` until its deps are present).
-    /// Returns the branches whose `tips` moved.
-    fn after_import(&self, this: &MultiHeadDoc<Self>, st: &ImportStatus) -> Vec<BranchId> {
+    /// Returns the branches whose `tips` moved, or an error if any op cannot be
+    /// attributed (malformed import; no branch advances for it).
+    fn after_import(
+        &self,
+        this: &MultiHeadDoc<Self>,
+        st: &ImportStatus,
+    ) -> LoroResult<Vec<BranchId>> {
         let ol = this.oplog.lock(); // OpLog before Attribution
         let mut batch: Vec<Imported> = Vec::new();
         for (peer, (start, end)) in st.success.iter() {
@@ -303,19 +312,9 @@ impl HeadPolicy for SelfRooted {
             let first_marker = c.markers.first().map(|(k, _)| *k);
             if first_marker != Some(c.start) {
                 let seg_last = first_marker.map_or(c.last, |k| k - 1);
-                match attr.branch_of_deps(&c.deps) {
-                    Ok(b) => segments.push((c.start, seg_last, b)),
-                    Err(reason) => {
-                        tracing::warn!(
-                            "index attribution: quarantined {}..={} of peer {}: {:?}",
-                            c.start,
-                            seg_last,
-                            c.peer,
-                            reason
-                        );
-                        attr.quarantined.push((ID::new(c.peer, c.start), reason));
-                    }
-                }
+                // A non-marker prefix inherits its deps' branch; deps that are
+                // unknown or disagree mean a malformed op -> reject the import.
+                segments.push((c.start, seg_last, attr.branch_of_deps(&c.deps)?));
             }
             for (i, (k, b)) in c.markers.iter().enumerate() {
                 let seg_last = c.markers.get(i + 1).map_or(c.last, |(n, _)| *n - 1);
@@ -325,26 +324,20 @@ impl HeadPolicy for SelfRooted {
                 attr.ensure_run(c.peer, s, &b);
                 let mut f = attr.tips.get(&b).cloned().unwrap_or_default();
                 f.push(ID::new(c.peer, l));
-                match shrink_frontiers(&f, &ol.dag) {
-                    Ok(nf) => {
-                        if attr.tips.get(&b) != Some(&nf) {
-                            attr.tips.insert(b.clone(), nf);
-                            touched.insert(b);
-                        }
-                    }
-                    Err(id) => {
-                        tracing::warn!(
-                            "index attribution: id {id} of branch {b} not in the DAG; quarantined"
-                        );
-                        attr.quarantined
-                            .push((ID::new(c.peer, s), QuarantineReason::NotInDag(id)));
-                    }
+                let nf = shrink_frontiers(&f, &ol.dag).map_err(|id| {
+                    invalid_attribution(format!(
+                        "attributed id {id} of branch {b} is not in the DAG"
+                    ))
+                })?;
+                if attr.tips.get(&b) != Some(&nf) {
+                    attr.tips.insert(b.clone(), nf);
+                    touched.insert(b);
                 }
             }
         }
         drop(attr);
         drop(ol);
-        touched.into_iter().collect()
+        Ok(touched.into_iter().collect())
     }
 }
 
@@ -395,8 +388,12 @@ impl HeadPolicy for Delegated {
     /// After a content import, re-resolve every branch the index knows: a branch
     /// whose recorded ids for this doc just became held advances to them (the
     /// ingest); ids still unheld are dropped by `target` and picked up next time.
-    fn after_import(&self, _this: &MultiHeadDoc<Self>, _status: &ImportStatus) -> Vec<BranchId> {
-        self.index.branches()
+    fn after_import(
+        &self,
+        _this: &MultiHeadDoc<Self>,
+        _status: &ImportStatus,
+    ) -> LoroResult<Vec<BranchId>> {
+        Ok(self.index.branches())
     }
 }
 
@@ -453,7 +450,11 @@ impl HeadPolicy for Manual {
             .insert(b.clone(), Frontiers::from_id(committed.id_last()));
     }
 
-    fn after_import(&self, _this: &MultiHeadDoc<Self>, _status: &ImportStatus) -> Vec<BranchId> {
-        Vec::new()
+    fn after_import(
+        &self,
+        _this: &MultiHeadDoc<Self>,
+        _status: &ImportStatus,
+    ) -> LoroResult<Vec<BranchId>> {
+        Ok(Vec::new())
     }
 }
