@@ -2159,3 +2159,161 @@ fn index_root_container_count_is_two_regardless_of_branch_count() {
         "exactly `branch` and `docs` after 50 branches, not one root per branch: {names:?}"
     );
 }
+
+// ------------------------------------------------------------------
+// Phase 3: repo-wide `IndexDoc::merge` is a SINGLE marker op (checkout + join),
+// not a per-doc `record_frontier` loop. Spike S5's per-key union of
+// `docs[D].heads` is the load-bearing premise; it lands here as a permanent
+// regression.
+// ------------------------------------------------------------------
+
+/// Total ops in the shared index op log (sum of the per-peer VV counters).
+fn total_ops(idx: &IndexDoc) -> i64 {
+    idx.oplog_vv().values().map(|c| *c as i64).sum()
+}
+
+#[test]
+fn index_merge_one_marker_unions_docs_per_key() {
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("into"), &b("main")).unwrap();
+    idx.create_index_branch(&b("from"), &b("main")).unwrap();
+
+    // The same doc D is recorded CONCURRENTLY on both branches (distinct peer
+    // keys), plus a doc E touched only on `from`.
+    idx.record_head(&b("into"), &d("D"), 111, 5).unwrap();
+    idx.record_head(&b("from"), &d("D"), 222, 7).unwrap();
+    idx.record_head(&b("from"), &d("E"), 333, 3).unwrap();
+
+    let ops_before = total_ops(&idx);
+    let outcome = idx.merge(&b("into"), &b("from")).unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged, "into and from diverged");
+
+    // Exactly ONE op was written by the merge (the marker), NOT one-per-doc.
+    assert_eq!(
+        total_ops(&idx) - ops_before,
+        1,
+        "merge writes a single index marker op, not one per merged doc"
+    );
+
+    // Per-key UNION of docs[D].heads survives (S5 property, now permanent): both
+    // concurrent writers' entries are present on `into` after the merge.
+    let mut d_ids = idx.recorded_ids(&b("into"), &d("D")).unwrap();
+    d_ids.sort();
+    assert_eq!(
+        d_ids,
+        vec![ID::new(111, 5), ID::new(222, 7)],
+        "both concurrent same-doc writers survive the merge (per-key VV union)"
+    );
+    // The doc touched only on `from` crossed the merge for free.
+    assert_eq!(
+        idx.recorded_ids(&b("into"), &d("E")).unwrap(),
+        vec![ID::new(333, 3)]
+    );
+    // `from` is untouched: a merge never moves the source.
+    assert_eq!(
+        idx.recorded_ids(&b("from"), &d("D")).unwrap(),
+        vec![ID::new(222, 7)]
+    );
+    assert_eq!(
+        idx.recorded_ids(&b("from"), &d("E")).unwrap(),
+        vec![ID::new(333, 3)]
+    );
+
+    // tips read correctly: into moved to a single marker, from unchanged, both
+    // branches still known, nothing quarantined.
+    assert!(
+        idx.tips()[&b("into")].as_single().is_some(),
+        "into's tip is the single merge marker"
+    );
+    let mut branches = idx.branches();
+    branches.sort();
+    assert_eq!(branches, vec![b("from"), b("into"), b("main")]);
+    assert!(idx.quarantine_report().is_empty());
+
+    // The merge marker (deps = the cross-branch join) folds cleanly on a COLD
+    // import: it is a marker, so the fold attributes it to `into` with no dep
+    // agreement needed and no quarantine.
+    let bytes = idx.export(ExportMode::all_updates()).unwrap();
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&bytes).unwrap();
+    assert!(
+        cold.quarantine_report().is_empty(),
+        "cold import of a merge marker quarantines nothing: {:?}",
+        cold.quarantine_report()
+    );
+    assert_eq!(cold.tips(), idx.tips(), "tips equal on the cold import");
+    let mut cold_d = cold.recorded_ids(&b("into"), &d("D")).unwrap();
+    cold_d.sort();
+    assert_eq!(cold_d, vec![ID::new(111, 5), ID::new(222, 7)]);
+}
+
+#[test]
+fn index_merge_fast_forward_and_already_contained() {
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("feat"), &b("main")).unwrap();
+    // Only feat advances -> main merging feat is a FAST-FORWARD.
+    idx.record_head(&b("feat"), &d("D"), 111, 5).unwrap();
+
+    let ops_before = total_ops(&idx);
+    assert_eq!(
+        idx.merge(&b("main"), &b("feat")).unwrap(),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(total_ops(&idx) - ops_before, 1, "ff still writes one marker");
+    assert_eq!(
+        idx.recorded_ids(&b("main"), &d("D")).unwrap(),
+        vec![ID::new(111, 5)],
+        "main fast-forwarded to feat's record"
+    );
+
+    // A second, redundant merge is AlreadyContained and writes NOTHING.
+    let ops_now = total_ops(&idx);
+    assert_eq!(
+        idx.merge(&b("main"), &b("feat")).unwrap(),
+        MergeOutcome::AlreadyContained
+    );
+    assert_eq!(total_ops(&idx) - ops_now, 0, "already-contained writes no op");
+}
+
+#[test]
+fn repo_merge_branch_content_catches_up() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+
+    // Diverge: feat and main each edit the same doc.
+    g.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(4, "-f").unwrap())
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-m").unwrap())
+        .unwrap();
+
+    let idx_ops_before = total_ops(repo.index());
+    let outcome = repo.merge_branch(&b(GENESIS_BRANCH), &b("feat")).unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+    // Exactly one INDEX op for the whole repo-wide merge (the marker).
+    assert_eq!(
+        total_ops(repo.index()) - idx_ops_before,
+        1,
+        "repo-wide merge is a single index marker, not one record per doc"
+    );
+
+    // main's content head caught up: it now contains BOTH divergent edits.
+    let text = g
+        .branch(GENESIS_BRANCH)
+        .read(|h| h.get_text("t").to_string())
+        .unwrap();
+    assert!(
+        text.contains("base") && text.contains("-f") && text.contains("-m"),
+        "merged main content contains base + both edits: {text:?}"
+    );
+    // feat is untouched by the merge.
+    assert!(repo.branches().contains(&b("feat")));
+}

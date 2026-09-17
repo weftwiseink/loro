@@ -64,6 +64,25 @@ impl BranchingDocRepo {
         self.index.create_index_branch(new, from)
     }
 
+    /// Repo-wide merge of `from` into `into`: ONE index marker op (the union of
+    /// both branches' recorded doc frontiers falls out of the index checkout, no
+    /// per-doc record), then re-resolve every OPEN content doc so its branch
+    /// subscribers receive their catch-up event. A content doc not currently open
+    /// picks up the merged frontier lazily on reopen (the index carries it).
+    ///
+    /// Returns the index-level `MergeOutcome` (`AlreadyContained` when `into`
+    /// already contains `from`).
+    pub fn merge_branch(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
+        let outcome = self.index.merge(into, from)?;
+        // Catch every open content doc up to the merged index frontier. A resolve
+        // that cannot yet advance (ids not held) is non-fatal, exactly as the
+        // import ingest path treats it.
+        for doc in self.docs.lock().unwrap().values() {
+            let _ = doc.resolve(into, Intent::Read);
+        }
+        Ok(outcome)
+    }
+
     /// Repo-wide branch deletion: unbind the branch from every open content doc
     /// AND the index, and drop its index lineage. `branches()` then excludes it
     /// with no dangling `bound`/`by_tip` entry anywhere; the pinned root is never

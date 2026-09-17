@@ -1,6 +1,8 @@
 use rustc_hash::FxHashMap;
 
-use crate::version::Frontiers;
+use std::cmp::Ordering;
+
+use crate::version::{shrink_frontiers, Frontiers};
 use loro_common::{Counter, InternalString, LoroError, LoroResult, PeerID, ID};
 
 use super::policy::{BRANCH_NAME_KEY, BRANCH_ROOT, QuarantineReason};
@@ -60,6 +62,58 @@ impl MultiHeadDoc<SelfRooted> {
             .insert(BRANCH_NAME_KEY, new.as_str())?;
         copy_doc.commit_then_renew();
         Ok(())
+    }
+
+    /// Merge branch `from` into `into` REPO-WIDE with a SINGLE index marker op.
+    ///
+    /// Advance `into`'s index head to `join(tips[into], tips[from])`, whose CRDT
+    /// state IS the per-key union of every doc's `docs[D].heads` map (a mergeable
+    /// per-peer VV, so a concurrent same-branch writer on either side survives --
+    /// Spike S5), then commit ONE `branch.name = "<into>"` marker on it. The
+    /// per-doc `record_frontier` loop the content-level `BranchingDoc::merge`
+    /// walks is not needed here: the union of both branches' recorded frontiers
+    /// falls out of the checkout for free.
+    ///
+    /// The marker's dependencies ARE the join (a frontier spanning both
+    /// branches), so on a remote import the causal fold attributes it to `into`
+    /// (a marker needs no dep agreement) and `tips[into]` becomes `[marker]`.
+    /// `from` is untouched: a merge never moves the source's head or tips, so a
+    /// source merged into two targets is simply two marker ops on two heads.
+    ///
+    /// Returns `AlreadyContained` (nothing written) when `into` already contains
+    /// `from`, else `FastForward` / `Merged` (one marker written either way).
+    pub fn merge(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
+        let ti = self.policy().target(self, into)?;
+        let tf = self.policy().target(self, from)?;
+        let (outcome, join) = {
+            let ol = self.oplog.lock();
+            let outcome = match ol.dag.cmp_frontiers(&ti, &tf).map_err(LoroError::from)? {
+                Some(Ordering::Equal) | Some(Ordering::Greater) => {
+                    return Ok(MergeOutcome::AlreadyContained)
+                }
+                Some(Ordering::Less) => MergeOutcome::FastForward,
+                None => MergeOutcome::Merged,
+            };
+            // The join: shrink(union of both tips' ids). Every id of `from` is in
+            // the union, so no op is dropped.
+            let mut u = ti.clone();
+            for id in tf.iter() {
+                u.push(id);
+            }
+            (
+                outcome,
+                shrink_frontiers(&u, &ol.dag).map_err(LoroError::FrontiersNotFound)?,
+            )
+        };
+        // Bind `into` (at tips[into], refs == 1 eager), advance its head to the
+        // join, and commit the single marker. The commit hook's `after_commit`
+        // sets `tips[into]` to the marker.
+        self.resolve(into, Intent::Read)?;
+        let doc = self.advance_bound_writable(into, &join)?;
+        doc.get_map(BRANCH_ROOT)
+            .insert(BRANCH_NAME_KEY, into.as_str())?;
+        doc.commit_then_renew();
+        Ok(outcome)
     }
 
     /// Record `docs[doc].heads[peer] = counter` on `b`'s index head: the

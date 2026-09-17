@@ -8,7 +8,7 @@ use crate::sync::AtomicU8;
 use crate::utils::subscription::Subscription;
 use crate::version::Frontiers;
 use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
-use loro_common::{ContainerID, LoroResult};
+use loro_common::{ContainerID, LoroError, LoroResult};
 
 use super::base::{install_forwarders, HeadOwner};
 use super::ROOT_HEAD_ID;
@@ -426,5 +426,40 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         let c = self.copy_head(reg, ROOT_HEAD_ID);
         self.advance_in_place(reg, c, target)?;
         Ok(c)
+    }
+
+    /// Advance branch `b`'s BOUND, uniquely-owned (`refs == 1`) head to `target`
+    /// in place and leave it WRITABLE (detached cleared, auto-commit txn
+    /// renewed), returning its `LoroDoc` so the caller can commit ops on it. This
+    /// is exactly the move the resolve catch-up arm makes, exposed for a caller
+    /// that computed `target` OUTSIDE the normal policy path -- specifically a
+    /// repo-wide index merge, whose target is `join(tips[into], tips[from])` and
+    /// whose next act is to commit one merge marker on the advanced head.
+    ///
+    /// Errors if `b` is unbound; the caller resolves `b` first (an eager index
+    /// head is bound at `refs == 1` once resolved). Runs under the registry lock,
+    /// so it must NOT be called from inside another registry op.
+    pub(super) fn advance_bound_writable(
+        &self,
+        b: &BranchId,
+        target: &Frontiers,
+    ) -> LoroResult<LoroDoc> {
+        self.with_reg(|this, reg| {
+            let id = *reg.bound.get(b).ok_or_else(|| {
+                LoroError::ArgErr(format!("cannot advance: branch '{b}' is not bound").into_boxed_str())
+            })?;
+            debug_assert_eq!(
+                reg.heads[&id].refs, 1,
+                "advance_bound_writable requires a uniquely-owned (refs == 1) head"
+            );
+            this.advance_in_place(reg, id, target)?;
+            let doc = &reg.heads[&id].doc;
+            // Same reasoning as the resolve catch-up arm: the head is now the
+            // branch's live writable head at the merge join, so a following local
+            // commit (the merge marker) must not fail `AutoCommitNotStarted`.
+            doc.set_detached(false);
+            doc.renew_txn_if_auto_commit(None);
+            Ok(doc.clone())
+        })
     }
 }
