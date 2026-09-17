@@ -51,6 +51,23 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
 pub(super) const BRANCH_ROOT: &str = "branch";
 pub(super) const BRANCH_NAME_KEY: &str = "name";
 
+/// Key on the `branch` root map for a MERGE marker: `branch.merge = "<seq>:<b>"`
+/// where `<seq>` is a monotonic integer.
+///
+/// A repo-wide merge advances `into`'s index head to the join and needs ONE op
+/// naming `into`. It cannot reuse the `name` key: at the join `branch.name` may
+/// ALREADY equal `into` (the winner of the concurrent creation-marker LWW, or
+/// `into`'s own set causally dominating the source's), and a same-value map set
+/// emits NO op -- so `after_commit` never fires and the whole merge is silently
+/// dropped, on this peer AND on every peer that would fold the op stream. The
+/// `<seq>` prefix (read-then-increment of the current merge value) guarantees the
+/// value DIFFERS from whatever the last merge into `into` wrote, so the op always
+/// emits. The branch name is everything after the FIRST `:`, so a name that
+/// itself contains `:` is recovered intact (the seq is a decimal integer, no
+/// `:`). It stays a KEY on the existing `branch` map, so the root-container count
+/// is unchanged (still 2).
+pub(super) const BRANCH_MERGE_KEY: &str = "merge";
+
 /// Legacy root-container name prefix of a branch's creation marker
 /// (`lineage:<b>`), the pre-Phase-2 encoding. Still READ (dual-read transition)
 /// so a history or snapshot encoded before Phase 2 folds identically under the
@@ -78,17 +95,28 @@ fn lineage_branch_of(ol: &OpLog, idx: crate::container::idx::ContainerIdx) -> Op
 fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
     if let InnerContent::Map(MapSet {
         key,
-        value: Some(LoroValue::String(name)),
+        value: Some(LoroValue::String(v)),
     }) = &op.content
     {
-        if key.as_str() == BRANCH_NAME_KEY {
-            if let Some(ContainerID::Root {
-                name: root,
-                container_type: ContainerType::Map,
-            }) = ol.arena.idx_to_id(op.container)
-            {
-                if root.as_str() == BRANCH_ROOT {
-                    return Some(InternalString::from(name.as_ref()));
+        if let Some(ContainerID::Root {
+            name: root,
+            container_type: ContainerType::Map,
+        }) = ol.arena.idx_to_id(op.container)
+        {
+            if root.as_str() == BRANCH_ROOT {
+                match key.as_str() {
+                    // Creation marker: the value IS the branch name.
+                    BRANCH_NAME_KEY => return Some(InternalString::from(v.as_ref())),
+                    // Merge marker: value is "<seq>:<into>"; the name is
+                    // everything after the FIRST ':' (robust for names that
+                    // contain ':', since <seq> is a decimal integer).
+                    BRANCH_MERGE_KEY => {
+                        return v
+                            .as_ref()
+                            .split_once(':')
+                            .map(|(_, name)| InternalString::from(name))
+                    }
+                    _ => {}
                 }
             }
         }

@@ -2231,6 +2231,16 @@ fn index_merge_one_marker_unions_docs_per_key() {
     assert_eq!(branches, vec![b("from"), b("into"), b("main")]);
     assert!(idx.quarantine_report().is_empty());
 
+    // The merge marker is a new KEY on the `branch` map, not a new container:
+    // the P2 root-container count (branch + docs) is unchanged.
+    assert_eq!(
+        idx.arena
+            .top_level_root_containers(crate::arena::LoadAllFlag)
+            .len(),
+        2,
+        "a merge marker adds no root container"
+    );
+
     // The merge marker (deps = the cross-branch join) folds cleanly on a COLD
     // import: it is a marker, so the fold attributes it to `into` with no dep
     // agreement needed and no quarantine.
@@ -2316,4 +2326,144 @@ fn repo_merge_branch_content_catches_up() {
     );
     // feat is untouched by the merge.
     assert!(repo.branches().contains(&b("feat")));
+}
+
+// ------------------------------------------------------------------
+// Phase 3 FIX (Round 4): the merge marker must ALWAYS emit an op, even when
+// `into` already won the branch.name LWW at the join. A same-value map set is a
+// no-op -> after_commit never fires -> the whole merge (docs union + from-only
+// docs) is silently lost, locally AND on cold import (no op propagates). These
+// three tests reproduce that loss on the pre-fix tree.
+// ------------------------------------------------------------------
+
+#[test]
+fn index_merge_into_lww_winner_still_emits_and_propagates() {
+    // merge(feat, main) with into = feat: feat's branch.name set is CAUSALLY
+    // AFTER main's (eager copy), so branch.name == "feat" at the join
+    // deterministically (no peer luck). Re-setting branch.name = "feat" would be
+    // a no-op. The merge marker must still emit so main's record reaches feat and
+    // propagates to a cold peer.
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("feat"), &b("main")).unwrap();
+    idx.record_head(&b("main"), &d("D"), 111, 5).unwrap();
+    idx.record_head(&b("feat"), &d("E"), 222, 7).unwrap();
+
+    let ops_before = total_ops(&idx);
+    assert_eq!(
+        idx.merge(&b("feat"), &b("main")).unwrap(),
+        MergeOutcome::Merged
+    );
+    assert_eq!(
+        total_ops(&idx) - ops_before,
+        1,
+        "the merge emits exactly one marker op even when `into` wins the name LWW"
+    );
+
+    // main's record crossed into feat (the docs union); feat kept its own.
+    assert_eq!(
+        idx.recorded_ids(&b("feat"), &d("D")).unwrap(),
+        vec![ID::new(111, 5)],
+        "main's record must reach feat"
+    );
+    assert_eq!(
+        idx.recorded_ids(&b("feat"), &d("E")).unwrap(),
+        vec![ID::new(222, 7)]
+    );
+
+    // Propagation: a remote peer sees only the op stream; with no marker op it
+    // would never learn the merge happened.
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&idx.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    assert!(cold.quarantine_report().is_empty());
+    assert_eq!(cold.tips(), idx.tips(), "merge propagates: cold tips equal");
+    assert_eq!(
+        cold.recorded_ids(&b("feat"), &d("D")).unwrap(),
+        vec![ID::new(111, 5)],
+        "the merge reaches a cold-importing peer"
+    );
+}
+
+#[test]
+fn index_merge_preserves_docs_in_both_sibling_creation_orders() {
+    // Two siblings off main; merge `from` into `into`. Their branch.name sets are
+    // CONCURRENT, so the LWW tie-break by (lamport, peer) decides the join value:
+    // the later-created sibling wins. Whichever order makes `into` win is the
+    // bug's trigger; BOTH orders must preserve the merge after the fix.
+    for (first, second) in [("into", "from"), ("from", "into")] {
+        let idx = IndexDoc::new(SelfRooted::new());
+        idx.init_genesis(&b("main")).unwrap();
+        idx.create_index_branch(&b(first), &b("main")).unwrap();
+        idx.create_index_branch(&b(second), &b("main")).unwrap();
+        idx.record_head(&b("into"), &d("D"), 111, 5).unwrap();
+        idx.record_head(&b("from"), &d("E"), 222, 7).unwrap();
+
+        assert_eq!(
+            idx.merge(&b("into"), &b("from")).unwrap(),
+            MergeOutcome::Merged,
+            "order {first}->{second}"
+        );
+        assert_eq!(
+            idx.recorded_ids(&b("into"), &d("E")).unwrap(),
+            vec![ID::new(222, 7)],
+            "from's record E lost in order {first}->{second}"
+        );
+        assert_eq!(
+            idx.recorded_ids(&b("into"), &d("D")).unwrap(),
+            vec![ID::new(111, 5)],
+            "into's own record D in order {first}->{second}"
+        );
+
+        let cold = IndexDoc::new(SelfRooted::new());
+        cold.import(&idx.export(ExportMode::all_updates()).unwrap())
+            .unwrap();
+        assert_eq!(
+            cold.tips(),
+            idx.tips(),
+            "cold tips equal in order {first}->{second}"
+        );
+        assert_eq!(
+            cold.recorded_ids(&b("into"), &d("E")).unwrap(),
+            vec![ID::new(222, 7)],
+            "from's record E lost on cold import, order {first}->{second}"
+        );
+    }
+}
+
+#[test]
+fn index_repeated_merge_into_same_target_each_emits() {
+    // Two merges into the SAME target, with `from` advancing between them. The
+    // second merge writes the same branch NAME as the first, so a name-keyed
+    // marker would no-op (dropping the second merge). The seq'd merge marker must
+    // emit on BOTH.
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("into"), &b("main")).unwrap();
+    idx.create_index_branch(&b("from"), &b("main")).unwrap();
+
+    idx.record_head(&b("from"), &d("D"), 111, 1).unwrap();
+    idx.record_head(&b("into"), &d("Z"), 999, 1).unwrap(); // into diverges so 1st merge is real
+    assert_eq!(idx.merge(&b("into"), &b("from")).unwrap(), MergeOutcome::Merged);
+    assert_eq!(idx.recorded_ids(&b("into"), &d("D")).unwrap(), vec![ID::new(111, 1)]);
+
+    // `from` advances, then a SECOND merge into the same target.
+    idx.record_head(&b("from"), &d("E"), 222, 2).unwrap();
+    let ops_before = total_ops(&idx);
+    assert_eq!(idx.merge(&b("into"), &b("from")).unwrap(), MergeOutcome::Merged);
+    assert_eq!(
+        total_ops(&idx) - ops_before,
+        1,
+        "the second merge into the same target still emits one op"
+    );
+    assert_eq!(
+        idx.recorded_ids(&b("into"), &d("E")).unwrap(),
+        vec![ID::new(222, 2)],
+        "the second merge's new doc reaches into"
+    );
+
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&idx.export(ExportMode::all_updates()).unwrap()).unwrap();
+    assert_eq!(cold.tips(), idx.tips());
+    assert_eq!(cold.recorded_ids(&b("into"), &d("E")).unwrap(), vec![ID::new(222, 2)]);
 }

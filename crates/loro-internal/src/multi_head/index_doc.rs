@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use crate::version::{shrink_frontiers, Frontiers};
 use loro_common::{Counter, InternalString, LoroError, LoroResult, PeerID, ID};
 
-use super::policy::{BRANCH_NAME_KEY, BRANCH_ROOT, QuarantineReason};
+use super::policy::{BRANCH_MERGE_KEY, BRANCH_NAME_KEY, BRANCH_ROOT, QuarantineReason};
 use super::ROOT_HEAD_ID;
 use super::*;
 
@@ -106,12 +106,24 @@ impl MultiHeadDoc<SelfRooted> {
             )
         };
         // Bind `into` (at tips[into], refs == 1 eager), advance its head to the
-        // join, and commit the single marker. The commit hook's `after_commit`
-        // sets `tips[into]` to the marker.
+        // join, and commit the single merge marker. The commit hook's
+        // `after_commit` sets `tips[into]` to the marker.
+        //
+        // The marker goes on the `branch.merge` key as "<seq>:<into>", NOT on
+        // `branch.name`: at the join `branch.name` may already equal `into`, and
+        // a same-value map set emits NO op -- which would leave the merge with no
+        // op to carry it (dropping it locally and on every peer). The `<seq>`
+        // prefix, read-then-incremented from the current merge value, guarantees
+        // the set writes a fresh value and always emits. See `BRANCH_MERGE_KEY`.
         self.resolve(into, Intent::Read)?;
         let doc = self.advance_bound_writable(into, &join)?;
-        doc.get_map(BRANCH_ROOT)
-            .insert(BRANCH_NAME_KEY, into.as_str())?;
+        let branch_map = doc.get_map(BRANCH_ROOT);
+        let next_seq = branch_map
+            .get(BRANCH_MERGE_KEY)
+            .and_then(|v| v.into_string().ok())
+            .and_then(|s| s.split_once(':').and_then(|(seq, _)| seq.parse::<i64>().ok()))
+            .map_or(0, |n| n + 1);
+        branch_map.insert(BRANCH_MERGE_KEY, format!("{next_seq}:{into}"))?;
         doc.commit_then_renew();
         Ok(outcome)
     }
