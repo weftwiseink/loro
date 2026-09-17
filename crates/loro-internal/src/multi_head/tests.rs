@@ -4,7 +4,7 @@ use crate::handler::HandlerTrait;
 use crate::lock::{LockKind, LoroLockGroup};
 use crate::version::Frontiers;
 use crate::LoroDoc;
-use loro_common::{LoroError, LoroResult};
+use loro_common::{LoroError, LoroResult, PeerID, ID};
 use std::sync::{Arc, Mutex};
 
 fn b(s: &str) -> BranchId {
@@ -1375,6 +1375,286 @@ fn create_branch_at_multi_peer_parent_excludes_other_peers() {
     );
 }
 
+// ------------------------------------------------------------------
+// Behavior spike: can the same index-doc peer land in >1 branch's
+// `lineage`, and if so does `target()` compute a wrong frontier?
+// ------------------------------------------------------------------
+
+#[test]
+fn spike_scenario1_normal_api_never_reuses_a_peer_across_branch_lineages() {
+    // Single session, many branches (some forked from each other, some
+    // re-forked repeatedly), plus content writes that call record_head
+    // (which uses the CONTENT doc's peer, not the index's). If any code
+    // path caused the index's write-path to reuse a peer across branches,
+    // the lineage map's peer sets would overlap.
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+
+    repo.create_branch(&b("b1"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("b2"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("b1a"), &b("b1")).unwrap();
+    // Re-fork "b1a" again from a DIFFERENT source with no existence guard
+    // on create_index_branch (unlike create_branch_at) -- this rebinds b1a
+    // to a fresh head/peer, orphaning (retiring) the first one.
+    repo.create_branch(&b("b1a"), &b("b2")).unwrap();
+
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "main").unwrap())
+        .unwrap();
+    g.branch("b1")
+        .write(|h| h.get_text("t").insert_unicode(0, "one").unwrap())
+        .unwrap();
+    g.branch("b2")
+        .write(|h| h.get_text("t").insert_unicode(0, "two").unwrap())
+        .unwrap();
+    g.branch("b1a")
+        .write(|h| h.get_text("t").insert_unicode(0, "onea").unwrap())
+        .unwrap();
+
+    let idx = repo.index();
+    let lineage = idx.policy().lineage(idx).lock();
+    let mut seen: std::collections::HashMap<PeerID, BranchId> = std::collections::HashMap::new();
+    let mut collisions = Vec::new();
+    for (branch, peers) in lineage.iter() {
+        for p in peers {
+            if let Some(prev) = seen.insert(*p, branch.clone()) {
+                collisions.push((*p, prev, branch.clone()));
+            }
+        }
+    }
+    assert!(
+        collisions.is_empty(),
+        "peer reused across branch lineages via normal API: {collisions:?}"
+    );
+    // NOTE(claude-sonnet-5/branchingdocrepo-multiheaddoc-behavior-spike):
+    // create_index_branch has NO existence guard (unlike create_branch_at),
+    // so re-forking an EXISTING branch name APPENDS a second, distinct peer
+    // to the SAME lineage:<name> list rather than replacing it -- the first
+    // (now-orphaned) peer's stale single-op tip stays in b1a's lineage set
+    // forever. Both peers are still confined to b1a alone (no cross-branch
+    // collision, per the assertion above), but b1a's target() is now the
+    // JOIN of two CONCURRENT (neither dominates the other) frontiers: the
+    // first fork's lone lineage-push op, and the second fork's real content.
+    // This is a real, distinct correctness quirk from the one the spike was
+    // sent to look for, worth flagging to the maintainer separately.
+    assert_eq!(
+        lineage.get(&b("b1a")).map(|v| v.len()),
+        Some(2),
+        "b1a's lineage accumulates BOTH creation peers (no existence guard), got {:?}",
+        lineage.get(&b("b1a"))
+    );
+}
+
+#[test]
+fn spike_scenario1_crafted_shared_peer_across_two_lineages_corrupts_target() {
+    // What IF a peer's ops end up recorded under two branches' lineage lists
+    // (not reachable via the real create_index_branch/init_genesis API, which
+    // always mints a fresh random peer per branch -- but reachable via a
+    // hand-crafted/foreign import, e.g. a buggy or malicious peer). Build such
+    // a payload directly (bypassing the IndexDoc API) and import it, to see
+    // whether `target()` then leaks one branch's unrelated op into another's
+    // frontier.
+    const SHARED_PEER: PeerID = 999;
+    let ext = LoroDoc::new();
+    ext.start_auto_commit();
+    ext.set_peer_id(SHARED_PEER).unwrap();
+    // SHARED_PEER claims membership in BOTH lineage:alpha and lineage:beta.
+    ext.get_list("lineage:alpha").push(SHARED_PEER as i64).unwrap();
+    ext.get_list("lineage:beta").push(SHARED_PEER as i64).unwrap();
+    ext.commit_then_renew();
+    // SHARED_PEER's actual LATEST op: an unrelated write, causally after the
+    // two lineage pushes, that has nothing to do with either branch's "own"
+    // work (models e.g. that peer being reused as a write slot elsewhere).
+    ext.get_map("docs")
+        .insert("unrelated", "poison")
+        .unwrap();
+    ext.commit_then_renew();
+    let unrelated_tip = ext.state_frontiers();
+    let payload = ext.export(ExportMode::all_updates()).unwrap();
+
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.import(&payload).unwrap();
+
+    assert!(idx.branches().contains(&b("alpha")));
+    assert!(idx.branches().contains(&b("beta")));
+    let target_alpha = idx.policy().target(&idx, &b("alpha")).unwrap();
+    let target_beta = idx.policy().target(&idx, &b("beta")).unwrap();
+    // BUG CONFIRMED (given a violated lineage invariant): both branches'
+    // frontiers resolve to SHARED_PEER's single latest op -- the "unrelated"
+    // write -- because target() takes get_last(peer) unconditionally, with no
+    // notion of "is this op actually causally part of branch b's own history".
+    assert_eq!(
+        target_alpha, unrelated_tip,
+        "alpha's frontier picked up SHARED_PEER's unrelated latest op: {target_alpha:?}"
+    );
+    assert_eq!(
+        target_beta, unrelated_tip,
+        "beta's frontier picked up SHARED_PEER's unrelated latest op: {target_beta:?}"
+    );
+    assert_eq!(
+        target_alpha, target_beta,
+        "two DIFFERENT branches converge on the SAME (wrong) frontier once a peer is shared \
+         between their lineages -- target() cannot tell them apart"
+    );
+}
+
+#[test]
+fn spike_scenario2_diamond_topology_forks_merges_are_stable() {
+    // A (genesis) -> fork B, fork C. Write on B, write on C. Merge B into A,
+    // merge C into A. Fork D from A's now-merged state. Verify D inherits
+    // both contributions (nothing dropped, nothing duplicated) and that
+    // target(B)/target(C) remain stable (still just their own lineage) after
+    // A absorbed them.
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    let a_after_base = g.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+
+    repo.create_branch(&b("B"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("C"), &b(GENESIS_BRANCH)).unwrap();
+
+    g.branch("B")
+        .write(|h| h.get_text("t").insert_unicode(4, "-b").unwrap())
+        .unwrap();
+    g.branch("C")
+        .write(|h| h.get_text("t").insert_unicode(4, "-c").unwrap())
+        .unwrap();
+    let b_frontier_before = g.frontier_of(&b("B")).unwrap();
+    let c_frontier_before = g.frontier_of(&b("C")).unwrap();
+
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("B")).unwrap(),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("C")).unwrap(),
+        MergeOutcome::Merged
+    );
+
+    let a_text = g
+        .branch(GENESIS_BRANCH)
+        .read(|h| h.get_text("t").to_string())
+        .unwrap();
+    assert!(
+        a_text.contains("-b") && a_text.contains("-c") && a_text.starts_with("base"),
+        "A absorbed both B's and C's contributions, got {a_text:?}"
+    );
+    assert_eq!(
+        a_text.chars().count(),
+        8,
+        "base(4) + -b(2) + -c(2), nothing dropped/duplicated, got {a_text:?}"
+    );
+
+    // Fork D from A's now-merged state.
+    repo.create_branch(&b("D"), &b(GENESIS_BRANCH)).unwrap();
+    let d_text = g
+        .branch("D")
+        .read(|h| h.get_text("t").to_string())
+        .unwrap();
+    assert_eq!(
+        d_text, a_text,
+        "D inherits exactly A's merged state, both contributions present once"
+    );
+
+    // B and C themselves are STABLE: still just their own (unmerged) content,
+    // unaffected by A's absorption of them.
+    assert_eq!(
+        g.frontier_of(&b("B")).unwrap(),
+        b_frontier_before,
+        "B's own frontier unaffected by being merged into A"
+    );
+    assert_eq!(
+        g.frontier_of(&b("C")).unwrap(),
+        c_frontier_before,
+        "C's own frontier unaffected by being merged into A"
+    );
+    assert_eq!(
+        g.branch("B").read(|h| h.get_text("t").to_string()).unwrap(),
+        "base-b",
+        "B still reads only its own lineage's content"
+    );
+    assert_eq!(
+        g.branch("C").read(|h| h.get_text("t").to_string()).unwrap(),
+        "base-c",
+        "C still reads only its own lineage's content"
+    );
+    // Sanity: A's post-base frontier is properly an ancestor (both merges
+    // strictly advanced it).
+    assert_ne!(a_after_base, g.frontier_of(&b(GENESIS_BRANCH)).unwrap());
+}
+
+#[test]
+fn spike_scenario3_repeated_merge_into_same_target_no_drop_no_dup() {
+    // Fork b from main, write, merge b into main. Continue writing on b.
+    // Merge b into main AGAIN. Confirm main reflects both merges (nothing
+    // dropped, nothing double-counted), i.e. merge does not assume "b is
+    // merged only once".
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feature"), &b(GENESIS_BRANCH))
+        .unwrap();
+
+    g.branch("feature")
+        .write(|h| h.get_text("t").insert_unicode(4, "-1").unwrap())
+        .unwrap();
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(
+        g.branch(GENESIS_BRANCH)
+            .read(|h| h.get_text("t").to_string())
+            .unwrap(),
+        "base-1"
+    );
+
+    // Continue writing on feature past the point already merged.
+    g.branch("feature")
+        .write(|h| h.get_text("t").insert_unicode(6, "-2").unwrap())
+        .unwrap();
+    // main also advances independently, concurrently with feature's second
+    // edit, so the second merge is a real join (not another fast-forward).
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(6, "-m").unwrap())
+        .unwrap();
+
+    let outcome2 = g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap();
+    assert_eq!(outcome2, MergeOutcome::Merged, "second merge is a real join");
+
+    let final_text = g
+        .branch(GENESIS_BRANCH)
+        .read(|h| h.get_text("t").to_string())
+        .unwrap();
+    assert!(
+        final_text.contains("-1") && final_text.contains("-2") && final_text.contains("-m"),
+        "both merges' content present, got {final_text:?}"
+    );
+    assert_eq!(
+        final_text.chars().count(),
+        10,
+        "base(4) + -1(2) + -2(2) + -m(2) = 10, no drop/dup across repeated merges, \
+         got {final_text:?}"
+    );
+    // A third merge (already contained) must be a true no-op.
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+        MergeOutcome::AlreadyContained
+    );
+    assert_eq!(
+        g.branch(GENESIS_BRANCH)
+            .read(|h| h.get_text("t").to_string())
+            .unwrap(),
+        final_text,
+        "a no-op AlreadyContained merge changes nothing"
+    );
+}
+
 #[test]
 fn create_branch_at_existing_name_errors() {
     let repo = BranchingDocRepo::open().unwrap();
@@ -1390,5 +1670,174 @@ fn create_branch_at_existing_name_errors() {
     assert!(
         doc.create_branch_at(&b("hist"), &f).is_err(),
         "re-create of an existing branch errors"
+    );
+}
+
+#[test]
+fn index_snapshot_restore_preserves_lineage_for_every_branch() {
+    // Behavior spike: does `SelfRooted`'s runtime `lineage` cache (rebuilt by
+    // replaying `after_import` over `ImportStatus::success`) survive a
+    // Snapshot export/import into a COMPLETELY FRESH `IndexDoc`? Build a
+    // non-trivial multi-branch history (3 forks, one nested, one genuine
+    // divergent merge, and one branch with a MULTI-PEER lineage from two
+    // independent sessions), snapshot it, import the snapshot into a doc
+    // that has NEVER seen an incremental update, and compare `branches()` /
+    // `target(b)` before vs after exactly.
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+
+    // main (genesis) gets a base write.
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+
+    // Two forks off genesis, plus a NESTED fork off one of them.
+    repo.create_branch(&b("feat1"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("feat2"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("feat1-nested"), &b("feat1")).unwrap();
+
+    g.branch("feat1")
+        .write(|h| h.get_text("t").insert_unicode(4, "-f1").unwrap())
+        .unwrap();
+    g.branch("feat2")
+        .write(|h| h.get_text("t").insert_unicode(4, "-f2").unwrap())
+        .unwrap();
+    g.branch("feat1-nested")
+        .write(|h| h.get_text("t").insert_unicode(4, "-n").unwrap())
+        .unwrap();
+
+    // A genuine divergent merge (not a fast-forward): main advances
+    // independently of feat2 before the merge, forcing a real join.
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-m").unwrap())
+        .unwrap();
+    let outcome = g.merge(&b(GENESIS_BRANCH), &b("feat2")).unwrap();
+    assert_eq!(
+        outcome,
+        MergeOutcome::Merged,
+        "the merge must be a real divergent join, not a fast-forward"
+    );
+
+    // A branch with a MULTI-PEER lineage: a second, fully independent
+    // session creates the SAME branch name off its own genesis, then syncs
+    // with the first via a plain index-history import (mirrors
+    // `index_target_is_join_of_lineage_peers`). This exercises the exact
+    // "peer roster per branch" attribution the spike is questioning.
+    let session_b = IndexDoc::new(SelfRooted::new());
+    session_b.init_genesis(&b(GENESIS_BRANCH)).unwrap();
+    session_b
+        .create_index_branch(&b("shared"), &b(GENESIS_BRANCH))
+        .unwrap();
+    session_b
+        .record_head(&b("shared"), &d("OTHER"), 999, 3)
+        .unwrap();
+    let b_updates = session_b.export(ExportMode::all_updates()).unwrap();
+    repo.create_branch(&b("shared"), &b(GENESIS_BRANCH)).unwrap();
+    repo.index().import(&b_updates).unwrap();
+    assert_eq!(
+        repo.index()
+            .policy()
+            .lineage(repo.index())
+            .lock()
+            .get(&b("shared"))
+            .map(|p| p.len())
+            .unwrap_or(0),
+        2,
+        "sanity: 'shared' must have a genuine multi-peer lineage before the snapshot"
+    );
+
+    // --- BEFORE baseline: branches() + target(b) for every branch --------
+    let idx = repo.index();
+    let mut before_branches = idx.branches();
+    before_branches.sort();
+    let before_targets: Vec<(BranchId, LoroResult<Frontiers>)> = before_branches
+        .iter()
+        .map(|br| (br.clone(), idx.policy().target(idx, br)))
+        .collect();
+    for (br, t) in &before_targets {
+        assert!(t.is_ok(), "pre-snapshot target({br}) must resolve");
+    }
+
+    // --- Export a SNAPSHOT (not just updates) and import into a doc that --
+    // --- has NEVER seen ANY incremental update (only the snapshot bytes). -
+    let snap = idx.export(ExportMode::Snapshot).unwrap();
+    let restored = IndexDoc::new(SelfRooted::new());
+    let status = restored.import(&snap).unwrap();
+    // The concern under test: does a snapshot import's `ImportStatus::success`
+    // cover the FULL history (so `after_import`'s attribution walk sees every
+    // `lineage:<b>` op), or does it come back empty/partial?
+    assert!(
+        !status.success.is_empty(),
+        "snapshot import's ImportStatus::success must be non-empty for after_import \
+         to rebuild lineage at all"
+    );
+
+    let mut after_branches = restored.branches();
+    after_branches.sort();
+    assert_eq!(
+        before_branches, after_branches,
+        "branches() must match exactly after a fresh snapshot restore"
+    );
+
+    for (br, before) in &before_targets {
+        let after = restored.policy().target(&restored, br);
+        match (before, after) {
+            (Ok(bf), Ok(af)) => assert_eq!(
+                bf, &af,
+                "target({br}) frontier must match exactly before vs after snapshot restore"
+            ),
+            other => panic!("target({br}) resolution mismatch before/after: {other:?}"),
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// S0: a local record on a REMOTELY-DISCOVERED branch must survive the next
+// resolve and reach the peer. Control: `index_import_then_record_converges`
+// (identical, except session B CREATES `feat` locally before importing).
+// ------------------------------------------------------------------
+
+#[test]
+#[ignore = "S0 data loss on the peer-roster encoding; closed by Phase 1 causal attribution"]
+fn index_remote_discovered_branch_local_record_survives() {
+    // Session A creates `feat` and records doc D on it.
+    let a = IndexDoc::new(SelfRooted::new());
+    a.init_genesis(&b("main")).unwrap();
+    a.create_index_branch(&b("feat"), &b("main")).unwrap();
+    a.record_head(&b("feat"), &d("D"), 111, 7).unwrap();
+    let a_updates = a.export(ExportMode::all_updates()).unwrap();
+
+    // Session B never creates `feat`: it LEARNS it from A's import (the
+    // `loro_repo.ts` `ensureFsBranch` path), so its `feat` index head is minted
+    // by the resolve MATERIALIZE arm, which no `lineage:feat` op names.
+    let bb = IndexDoc::new(SelfRooted::new());
+    bb.init_genesis(&b("main")).unwrap();
+    bb.import(&a_updates).unwrap();
+    let after_import = bb.recorded_ids(&b("feat"), &d("D")).unwrap();
+    assert_eq!(
+        after_import,
+        vec![ID::new(111, 7)],
+        "B discovered feat and materialized A's record"
+    );
+
+    // B records locally on the discovered branch.
+    bb.record_head(&b("feat"), &d("D"), 222, 9).unwrap();
+    let mut after_record = bb.recorded_ids(&b("feat"), &d("D")).unwrap();
+    after_record.sort();
+    assert_eq!(
+        after_record,
+        vec![ID::new(111, 7), ID::new(222, 9)],
+        "B's local record on a remotely-discovered branch is LOST on B: {after_record:?}"
+    );
+
+    // ... and the record reaches A.
+    let b_updates = bb.export(ExportMode::all_updates()).unwrap();
+    a.import(&b_updates).unwrap();
+    let mut on_a = a.recorded_ids(&b("feat"), &d("D")).unwrap();
+    on_a.sort();
+    assert_eq!(
+        on_a,
+        vec![ID::new(111, 7), ID::new(222, 9)],
+        "B's record never reached A: {on_a:?}"
     );
 }
