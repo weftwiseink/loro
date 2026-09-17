@@ -46,7 +46,7 @@ pub use base::{MultiHeadDoc, MultiHeadInner};
 pub use branch::{Branch, BranchSubscription, BranchingDocHead};
 pub use branching_doc::{BranchingDoc, MergeOutcome};
 pub use index_doc::IndexDoc;
-pub use policy::{Delegated, HeadPolicy, Manual, SelfRooted};
+pub use policy::{Attribution, Delegated, HeadPolicy, Manual, QuarantineReason, SelfRooted};
 pub use repo::{BranchingDocRepo, GENESIS_BRANCH};
 
 pub(crate) use head_registry::in_registry_op;

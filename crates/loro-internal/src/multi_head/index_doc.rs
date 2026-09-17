@@ -1,45 +1,52 @@
-use crate::version::Frontiers;
-use loro_common::{Counter, InternalString, LoroResult, PeerID, ID};
+use rustc_hash::FxHashMap;
 
-use super::policy::lineage_name;
+use crate::version::Frontiers;
+use loro_common::{Counter, InternalString, LoroError, LoroResult, PeerID, ID};
+
+use super::policy::{lineage_name, QuarantineReason};
 use super::ROOT_HEAD_ID;
 use super::*;
 
 /// The repo's index doc. Its heads hold only frontiers: a root map
 /// `docs: LoroMap<DocId, LoroMap<"heads", LoroMap<PeerID, Counter>>>` plus one
-/// root list per branch, `lineage:<b>`. No weft filesystem metadata (that is a
-/// TS-side content doc). The only types that appear are `ID`/`Frontiers`/
-/// `DocId`/`BranchId`.
+/// root list per branch, `lineage:<b>`, whose push is the branch's creation
+/// MARKER (see `SelfRooted`). No weft filesystem metadata (that is a TS-side
+/// content doc). The only types that appear are `ID`/`Frontiers`/`DocId`/
+/// `BranchId`.
 pub type IndexDoc = MultiHeadDoc<SelfRooted>;
 
 impl MultiHeadDoc<SelfRooted> {
-    /// Establish the first (genesis) branch, bound to the pinned root head, and
-    /// seed its lineage with the root's peer. Must be called once before other
-    /// branches are created.
+    /// Establish the first (genesis) branch, bound to the pinned root head, by
+    /// writing its creation marker as the root's first op. The commit hook's
+    /// `after_commit` sets `tips[genesis]` to that op. Must be called once
+    /// before other branches are created.
     pub fn init_genesis(&self, genesis: &BranchId) -> LoroResult<()> {
         let root = self.head_doc(ROOT_HEAD_ID).expect("root head exists");
         let peer = root.peer_id();
         self.with_reg(|this, reg| this.rebind(reg, genesis, ROOT_HEAD_ID));
-        // The genesis lineage op, authored by the root's peer, written directly
-        // on the root head; then recorded, so target(genesis) == root's tip.
         root.get_list(lineage_name(genesis).as_str())
             .push(peer as i64)?;
         root.commit_then_renew();
-        self.policy()
-            .lineage(self)
-            .lock()
-            .entry(genesis.clone())
-            .or_default()
-            .push(peer);
         Ok(())
     }
 
     /// Create `new` from `from` by EAGER copy: fork `from`'s index head (a state
-    /// of a few map entries), then write the copy's first op -- appending the
-    /// copy's fresh peer to `lineage:<new>` -- directly on the copy so its tip is
-    /// `[peer]` and `target(new)` is consistent. Every index head is thus born
-    /// `refs == 1`.
+    /// of a few map entries), then write the copy's first op -- the creation
+    /// marker, a push of the copy's fresh peer into `lineage:<new>` -- directly
+    /// on the copy. That op depends on `tips[from]` and names `new`, so the
+    /// commit hook's `after_commit` sets `tips[new]` to it. Every index head is
+    /// thus born `refs == 1`.
+    ///
+    /// Errors if `new` already exists (mirroring `create_branch_at`): re-forking
+    /// a live name would otherwise mint a second creation marker for it, and
+    /// `tips[new]` would become the join of two unrelated lineages.
     pub fn create_index_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
+        if self.branches().contains(new) {
+            return Err(LoroError::ArgErr(
+                format!("cannot create_index_branch: branch '{new}' already exists")
+                    .into_boxed_str(),
+            ));
+        }
         let (from_head, _) = self.resolve(from, Intent::Read)?;
         let copy_doc = self.with_reg(|this, reg| {
             let c = this.copy_head(reg, from_head);
@@ -51,12 +58,6 @@ impl MultiHeadDoc<SelfRooted> {
             .get_list(lineage_name(new).as_str())
             .push(peer as i64)?;
         copy_doc.commit_then_renew();
-        self.policy()
-            .lineage(self)
-            .lock()
-            .entry(new.clone())
-            .or_default()
-            .push(peer);
         Ok(())
     }
 
@@ -148,18 +149,41 @@ impl MultiHeadDoc<SelfRooted> {
         })
     }
 
-    /// The branches this session knows, from the lineage map.
+    /// The branches this session knows: the keys of the derived `tips`.
     pub fn branches(&self) -> Vec<BranchId> {
-        self.policy().lineage(self).lock().keys().cloned().collect()
+        self.policy()
+            .attribution(self)
+            .lock()
+            .tips
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Every branch's index frontier (`{b: target(b)}`), the derived read-only
+    /// `active_branches` projection.
+    pub fn tips(&self) -> FxHashMap<BranchId, Frontiers> {
+        self.policy().attribution(self).lock().tips.clone()
+    }
+
+    /// The imported spans the causal fold refused to attribute (see
+    /// `QuarantineReason`), keyed by first op id. Empty on a well-formed
+    /// history; a non-empty report is the loud, local signal of a model
+    /// violation whose ops stayed in the op log without moving any `tips`.
+    pub fn quarantine_report(&self) -> Vec<(ID, QuarantineReason)> {
+        self.policy().attribution(self).lock().quarantined.clone()
     }
 
     /// Remove a branch from the index: unbind its index head (retiring it) and
-    /// drop its lineage entry, so `branches()` no longer lists it and no
-    /// `bound`/`by_tip` entry dangles. (The durable cross-peer "discard" is the
-    /// wrapper's lifecycle log; this is the local registry cleanup.)
+    /// drop its `tips` entry, so `branches()` no longer lists it and no
+    /// `bound`/`by_tip` entry dangles. Its attribution runs are kept, so a
+    /// later-imported change that depends on its history still attributes (and
+    /// re-lists the branch, exactly as a re-imported marker did before). The
+    /// durable cross-peer "discard" is the wrapper's lifecycle log; this is the
+    /// local registry cleanup.
     pub fn delete_index_branch(&self, name: &BranchId) {
         self.unbind(name);
-        self.policy().lineage(self).lock().remove(name);
+        self.policy().attribution(self).lock().tips.remove(name);
     }
 
     /// The registry HeadId of branch `b`'s (self-rooted) index head, resolving

@@ -98,12 +98,12 @@ pub enum LockKind {
     OpLog = 3,
     DocState = 4,
     DiffCalculator = 5,
-    /// The self-rooted index's per-branch lineage map. A leaf acquired only
-    /// while the `OpLog` lock is already held (`OpLog -> Lineage`), never with a
-    /// registry or `DocState` lock. Ordered after `DiffCalculator` so the debug
-    /// order checker covers it. (Consumed by `MultiHeadDoc<SelfRooted>` in a
-    /// later phase; the variant is defined here with the rest of the ordering.)
-    Lineage = 6,
+    /// The self-rooted index's causal attribution projection (`tips` / `runs`
+    /// / `quarantined`). A leaf acquired alone or while the `OpLog` lock is
+    /// already held (`OpLog -> Attribution`), never with a registry or
+    /// `DocState` lock. Ordered after `DiffCalculator` so the debug order
+    /// checker covers it. (Consumed by `MultiHeadDoc<SelfRooted>`.)
+    Attribution = 6,
 }
 
 impl LoroLockGroup {
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(LockKind::OpLog as u8, 3);
         assert_eq!(LockKind::DocState as u8, 4);
         assert_eq!(LockKind::DiffCalculator as u8, 5);
-        assert_eq!(LockKind::Lineage as u8, 6);
+        assert_eq!(LockKind::Attribution as u8, 6);
     }
 
     #[test]
