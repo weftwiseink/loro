@@ -39,15 +39,15 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
     fn after_import(&self, this: &MultiHeadDoc<Self>, status: &ImportStatus) -> Vec<BranchId>;
 }
 
-/// Root map that carries every branch's creation/attribution MARKER as a plain
-/// map value: `branch.name = "<b>"` (`Root{name: "branch"}`, key `"name"`).
+/// Root map that carries every branch's creation MARKER as a plain map value:
+/// `branch.name = "<b>"` (`Root{name: "branch"}`, key `"name"`).
 ///
-/// Wire encoding: the first op of a fresh index peer sets this key to the branch
-/// it was created for. Because the name travels as a `LoroValue::String` in the
-/// op log (a `MapSet` op, op-log-resident and readable by `after_import` with no
+/// The first op of a fresh index peer sets this key to the branch it was created
+/// for. Because the name travels as a `LoroValue::String` in the op log (a
+/// `MapSet` op, op-log-resident and readable by `after_import` with no
 /// materialized state), the whole index needs ONE marker root container rather
 /// than one per branch, and a branch name is any string (no container-id charset
-/// constraint, so `branch_name_codec.ts` is retired).
+/// constraint).
 pub(super) const BRANCH_ROOT: &str = "branch";
 pub(super) const BRANCH_NAME_KEY: &str = "name";
 
@@ -68,60 +68,39 @@ pub(super) const BRANCH_NAME_KEY: &str = "name";
 /// is unchanged (still 2).
 pub(super) const BRANCH_MERGE_KEY: &str = "merge";
 
-/// Legacy root-container name prefix of a branch's creation marker
-/// (`lineage:<b>`), the pre-Phase-2 encoding. Still READ (dual-read transition)
-/// so a history or snapshot encoded before Phase 2 folds identically under the
-/// current engine; no longer written.
-const LINEAGE_PREFIX: &str = "lineage:";
-
-/// If `idx` names a `lineage:<b>` root container, return `b`. Legacy encoding;
-/// see [`marker_branch_of`] for the dual-read entry point.
-fn lineage_branch_of(ol: &OpLog, idx: crate::container::idx::ContainerIdx) -> Option<BranchId> {
-    match ol.arena.idx_to_id(idx)? {
-        ContainerID::Root { name, .. } => name
-            .as_str()
-            .strip_prefix(LINEAGE_PREFIX)
-            .map(InternalString::from),
-        _ => None,
-    }
-}
-
-/// The branch a marker op names, reading BOTH encodings (the Phase 2 transition
-/// fold): the current `branch.name = "<b>"` map-set, or the legacy `lineage:<b>`
-/// root push. Pure op-log discovery: attribution never needs a materialized
-/// state to identify the branch. A mixed history (peers from before and after
-/// Phase 2) therefore attributes uniformly, and a snapshot encoded before the
-/// change restores identically.
+/// The branch a marker op on the `branch` root map names, or `None` for a
+/// non-marker op. Pure op-log discovery: attribution never needs a materialized
+/// state to identify the branch. Two marker kinds:
+/// - `branch.name = "<b>"` (creation): the value IS the branch name;
+/// - `branch.merge = "<seq>:<b>"` (merge): the name is everything after the
+///   first `:` (the `<seq>` prefix keeps the map set from being a same-value
+///   no-op; see [`BRANCH_MERGE_KEY`]).
 fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
-    if let InnerContent::Map(MapSet {
+    let InnerContent::Map(MapSet {
         key,
         value: Some(LoroValue::String(v)),
     }) = &op.content
-    {
-        if let Some(ContainerID::Root {
-            name: root,
-            container_type: ContainerType::Map,
-        }) = ol.arena.idx_to_id(op.container)
-        {
-            if root.as_str() == BRANCH_ROOT {
-                match key.as_str() {
-                    // Creation marker: the value IS the branch name.
-                    BRANCH_NAME_KEY => return Some(InternalString::from(v.as_ref())),
-                    // Merge marker: value is "<seq>:<into>"; the name is
-                    // everything after the FIRST ':' (robust for names that
-                    // contain ':', since <seq> is a decimal integer).
-                    BRANCH_MERGE_KEY => {
-                        return v
-                            .as_ref()
-                            .split_once(':')
-                            .map(|(_, name)| InternalString::from(name))
-                    }
-                    _ => {}
-                }
-            }
-        }
+    else {
+        return None;
+    };
+    let Some(ContainerID::Root {
+        name: root,
+        container_type: ContainerType::Map,
+    }) = ol.arena.idx_to_id(op.container)
+    else {
+        return None;
+    };
+    if root.as_str() != BRANCH_ROOT {
+        return None;
     }
-    lineage_branch_of(ol, op.container)
+    match key.as_str() {
+        BRANCH_NAME_KEY => Some(InternalString::from(v.as_ref())),
+        BRANCH_MERGE_KEY => v
+            .as_ref()
+            .split_once(':')
+            .map(|(_, name)| InternalString::from(name)),
+        _ => None,
+    }
 }
 
 /// Why an imported change (or its pre-marker prefix) was NOT attributed to any
@@ -129,7 +108,7 @@ fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
 /// for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuarantineReason {
-    /// No marker and no dependencies: a root change of unknown lineage.
+    /// No marker and no dependencies: a root change of unknown branch.
     NoDeps,
     /// A dependency lies outside every attribution run.
     UnknownDep(ID),
@@ -212,7 +191,7 @@ impl Attribution {
 /// state is always at `tips[b]` when it commits (`resolve` guarantees it), so
 /// every local change depends on `b`'s tips and inherits `b` with no
 /// declaration -- which is why a head minted by the resolve materialize arm
-/// needs no roster entry.
+/// needs no marker of its own: its first change's deps already attribute it.
 ///
 /// Consistency of the derived `tips`: every mutation of `(tips, runs)` happens
 /// under the `Attribution` leaf lock as one critical section (a whole fold, or

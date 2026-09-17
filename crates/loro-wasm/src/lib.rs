@@ -2875,7 +2875,7 @@ impl BranchingIndex {
 
     /// Import index history from a peer (byte-level). History-only + all-heads-barriered:
     /// ops land in the shared op log without moving any head's state, then the `SelfRooted`
-    /// policy's `after_import` discovers remote branches from the lineage scan and advances
+    /// policy's `after_import` discovers remote branches from the marker scan and advances
     /// the affected index heads. This is how a peer LEARNS a remote branch and where it sits;
     /// the content ops themselves arrive via [`BranchingDoc::import`].
     pub fn import(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {

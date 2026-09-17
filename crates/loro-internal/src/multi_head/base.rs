@@ -288,9 +288,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     /// free, O(1) branch-from-a-live-head path (share `from`'s head).
     ///
     /// This is the `OnDivergence` (content-doc) path only. An `Eager` policy
-    /// (the index) provides its OWN creation that additionally seeds lineage,
-    /// so the eager copy never leaks into this generic / `Delegated` path (see
-    /// `MultiHeadDoc<SelfRooted>::create_index_branch`).
+    /// (the index) provides its OWN creation that additionally writes the
+    /// branch's creation marker, so the eager copy never leaks into this generic
+    /// / `Delegated` path (see `MultiHeadDoc<SelfRooted>::create_index_branch`).
     pub fn create_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
         debug_assert!(
             P::COPY == CopyMode::OnDivergence,
@@ -427,7 +427,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         let status = self.with_all_heads_barrier(|| head.import_to_history(bytes))?;
         // Drive policy-directed rebinding of the branches whose recorded history
         // just landed (the ingest). For `SelfRooted` this discovers remote
-        // branches from the lineage scan and advances affected index heads; for
+        // branches from the marker scan and advances affected index heads; for
         // policies that track no remote binding (e.g. `Manual`) it is empty.
         // A branch whose ids are not yet fully held is skipped and picked up on
         // the next import (resolve errors are non-fatal here).

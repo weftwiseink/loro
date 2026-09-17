@@ -658,7 +658,7 @@ fn index_remote_lineage_import_rebinds_branch() {
         "feat unknown before import"
     );
 
-    // Importing A's history discovers `feat` via the lineage scan and
+    // Importing A's history discovers `feat` via the marker scan and
     // rebinds it (after_import -> resolve).
     bb.import(&updates).unwrap();
     assert!(
@@ -676,7 +676,7 @@ fn index_remote_lineage_import_rebinds_branch() {
 }
 
 #[test]
-fn index_target_is_join_of_lineage_peers() {
+fn index_target_is_join_of_same_name_branch_markers() {
     // Session A creates `shared` and records doc "A" on it.
     let a = IndexDoc::new(SelfRooted::new());
     a.init_genesis(&b("main")).unwrap();
@@ -692,16 +692,17 @@ fn index_target_is_join_of_lineage_peers() {
     assert!(doc_has_key(&bb, &b("shared"), "B"));
     assert!(!doc_has_key(&bb, &b("shared"), "A"), "B has not seen A yet");
 
-    // Import A's history: `shared` now has TWO lineage peers on B, and its
-    // frontier is their JOIN -> B's shared head shows BOTH records.
+    // Import A's history: `shared` now has TWO creation markers on B (one per
+    // session), and its frontier is their JOIN -> B's shared head shows BOTH
+    // records.
     bb.import(&a_updates).unwrap();
     assert!(
         doc_has_key(&bb, &b("shared"), "A"),
-        "join of lineage peers brought session A's record"
+        "join of both markers brought session A's record"
     );
     assert!(
         doc_has_key(&bb, &b("shared"), "B"),
-        "join of lineage peers kept session B's record"
+        "join of both markers kept session B's record"
     );
 }
 
@@ -1376,8 +1377,9 @@ fn create_branch_at_multi_peer_parent_excludes_other_peers() {
 }
 
 // ------------------------------------------------------------------
-// Behavior spike: can the same index-doc peer land in >1 branch's
-// `lineage`, and if so does `target()` compute a wrong frontier?
+// Causal attribution keeps branches apart by their markers, not by peer
+// identity: one peer writing two branches' markers does not cross-pollute their
+// frontiers, and re-creating an existing branch name errors (the guard).
 // ------------------------------------------------------------------
 
 #[test]
@@ -1440,18 +1442,18 @@ fn index_create_existing_branch_errors_and_no_peer_serves_two_branches() {
 fn index_crafted_shared_peer_across_two_markers_attributes_causally() {
     // S1. A hand-crafted history (bypassing the IndexDoc API) in which ONE
     // peer writes the creation marker of `alpha`, then of `beta`, then an
-    // unrelated op. Under peer-roster attribution both branches' frontiers
-    // collapsed onto the unrelated op (the peer's latest op anywhere). Under
-    // causal attribution each op belongs to the nearest marker in its past:
-    // tips[alpha] = [create(alpha)], tips[beta] = [unrelated].
+    // unrelated op. Attribution keys on the nearest marker in each op's causal
+    // past, NOT on peer identity, so one peer serving two branches does not
+    // collapse their frontiers: tips[alpha] = [create(alpha)], tips[beta] =
+    // [unrelated] (the unrelated op's nearest marker is beta's).
     const SHARED_PEER: PeerID = 999;
     let ext = LoroDoc::new();
     ext.start_auto_commit();
     ext.set_peer_id(SHARED_PEER).unwrap();
-    ext.get_list("lineage:alpha").push(SHARED_PEER as i64).unwrap();
+    ext.get_map("branch").insert("name", "alpha").unwrap();
     ext.commit_then_renew();
     let create_alpha = ext.state_frontiers();
-    ext.get_list("lineage:beta").push(SHARED_PEER as i64).unwrap();
+    ext.get_map("branch").insert("name", "beta").unwrap();
     ext.commit_then_renew();
     ext.get_map("docs").insert("unrelated", "poison").unwrap();
     ext.commit_then_renew();
@@ -1656,15 +1658,14 @@ fn create_branch_at_existing_name_errors() {
 }
 
 #[test]
-fn index_snapshot_restore_preserves_lineage_for_every_branch() {
-    // Behavior spike: does `SelfRooted`'s runtime `lineage` cache (rebuilt by
-    // replaying `after_import` over `ImportStatus::success`) survive a
-    // Snapshot export/import into a COMPLETELY FRESH `IndexDoc`? Build a
-    // non-trivial multi-branch history (3 forks, one nested, one genuine
-    // divergent merge, and one branch with a MULTI-PEER lineage from two
-    // independent sessions), snapshot it, import the snapshot into a doc
-    // that has NEVER seen an incremental update, and compare `branches()` /
-    // `target(b)` before vs after exactly.
+fn index_snapshot_restore_preserves_tips_for_every_branch() {
+    // Does `SelfRooted`'s derived `tips` projection (folded from the marker
+    // history by `after_import` over `ImportStatus::success`) survive a Snapshot
+    // export/import into a COMPLETELY FRESH `IndexDoc`? Build a non-trivial
+    // multi-branch history (3 forks, one nested, one genuine divergent merge,
+    // and one branch created by TWO independent sessions), snapshot it, import
+    // the snapshot into a doc that has NEVER seen an incremental update, and
+    // compare `branches()` / `target(b)` before vs after exactly.
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
 
@@ -1700,11 +1701,11 @@ fn index_snapshot_restore_preserves_lineage_for_every_branch() {
         "the merge must be a real divergent join, not a fast-forward"
     );
 
-    // A branch with a MULTI-PEER lineage: a second, fully independent
-    // session creates the SAME branch name off its own genesis, then syncs
-    // with the first via a plain index-history import (mirrors
-    // `index_target_is_join_of_lineage_peers`). This exercises the exact
-    // "peer roster per branch" attribution the spike is questioning.
+    // A branch created by TWO independent sessions (two creation markers naming
+    // one branch): a second, fully independent session creates the SAME branch
+    // name off its own genesis, then syncs with the first via a plain
+    // index-history import (mirrors `index_target_is_join_of_same_name_branch_markers`),
+    // so `shared`'s frontier is the join of both markers.
     let session_b = IndexDoc::new(SelfRooted::new());
     session_b.init_genesis(&b(GENESIS_BRANCH)).unwrap();
     session_b
@@ -1719,7 +1720,7 @@ fn index_snapshot_restore_preserves_lineage_for_every_branch() {
     assert_eq!(
         repo.index().tips()[&b("shared")].len(),
         2,
-        "sanity: 'shared' must be a genuine two-lineage (two-id) frontier before the snapshot"
+        "sanity: 'shared' must be a genuine two-marker (two-id) frontier before the snapshot"
     );
 
     // --- BEFORE baseline: branches() + target(b) for every branch --------
@@ -1741,11 +1742,11 @@ fn index_snapshot_restore_preserves_lineage_for_every_branch() {
     let status = restored.import(&snap).unwrap();
     // The concern under test: does a snapshot import's `ImportStatus::success`
     // cover the FULL history (so `after_import`'s attribution walk sees every
-    // `lineage:<b>` op), or does it come back empty/partial?
+    // marker op), or does it come back empty/partial?
     assert!(
         !status.success.is_empty(),
         "snapshot import's ImportStatus::success must be non-empty for after_import \
-         to rebuild lineage at all"
+         to rebuild tips at all"
     );
 
     let mut after_branches = restored.branches();
@@ -1784,7 +1785,7 @@ fn index_remote_discovered_branch_local_record_survives() {
 
     // Session B never creates `feat`: it LEARNS it from A's import (the
     // `loro_repo.ts` `ensureFsBranch` path), so its `feat` index head is minted
-    // by the resolve MATERIALIZE arm, which no `lineage:feat` op names.
+    // by the resolve MATERIALIZE arm, which no `branch.name` marker names.
     let bb = IndexDoc::new(SelfRooted::new());
     bb.init_genesis(&b("main")).unwrap();
     bb.import(&a_updates).unwrap();
@@ -1992,115 +1993,24 @@ fn index_change_spanning_two_branches_is_quarantined_without_moving_tips() {
 }
 
 // ------------------------------------------------------------------
-// Phase 2: the `branch.name` root-map marker replaces the per-branch
-// `lineage:<b>` root list. Two root containers total, no branch-name charset
-// constraint, and a DUAL-READ fold so a pre-Phase-2 history still attributes.
+// The `branch.name` root-map marker: two root containers total (`branch` +
+// `docs`), and no branch-name charset constraint (the name is a map VALUE, not
+// a container id).
 // ------------------------------------------------------------------
-
-/// Build a small multi-branch index history as a raw op stream, using either
-/// the legacy `lineage:<b>` marker (`new == false`) or the Phase 2 `branch.name`
-/// marker (`new == true`). The peer/counter layout is IDENTICAL between the two
-/// (only the marker op's shape differs), so the two histories fold to
-/// byte-identical `tips` -- exactly the dual-read guarantee: a pre-Phase-2
-/// history yields the same attribution under the current engine as its Phase 2
-/// equivalent.
-fn dual_read_history(new: bool) -> Vec<Vec<u8>> {
-    fn marker(doc: &LoroDoc, new: bool, name: &str) {
-        if new {
-            doc.get_map("branch").insert("name", name).unwrap();
-        } else {
-            doc.get_list(format!("lineage:{name}").as_str())
-                .push(0i64)
-                .unwrap();
-        }
-        doc.commit_then_renew();
-    }
-
-    // main: peer 100, one creation marker.
-    let m = LoroDoc::new();
-    m.start_auto_commit();
-    m.set_peer_id(100).unwrap();
-    marker(&m, new, "main");
-    let m_bytes = m.export(ExportMode::all_updates()).unwrap();
-
-    // feat: peer 200, forks main (imports its history), then its marker and a
-    // NON-marker op (a plain `docs` write, attributed to feat by its deps).
-    let f = LoroDoc::new();
-    f.start_auto_commit();
-    f.set_peer_id(200).unwrap();
-    f.import(&m_bytes).unwrap();
-    marker(&f, new, "feat");
-    f.get_map("docs").insert("x", 1).unwrap();
-    f.commit_then_renew();
-    let f_bytes = f.export(ExportMode::all_updates()).unwrap();
-
-    // feat2: peer 300, an independent fork off main, marker only.
-    let f2 = LoroDoc::new();
-    f2.start_auto_commit();
-    f2.set_peer_id(300).unwrap();
-    f2.import(&m_bytes).unwrap();
-    marker(&f2, new, "feat2");
-    let f2_bytes = f2.export(ExportMode::all_updates()).unwrap();
-
-    vec![m_bytes, f_bytes, f2_bytes]
-}
-
-#[test]
-fn index_dual_read_old_and_new_marker_fold_identically() {
-    // The transition fold reads BOTH marker encodings. A history built with the
-    // legacy `lineage:<b>` marker and its `branch.name` twin (same peers, same
-    // counters) fold to IDENTICAL tips under the current engine, with no
-    // quarantine on either -- the guarantee that existing pre-Phase-2 dogfood
-    // and snapshot data still attributes correctly.
-    let fold = |hs: Vec<Vec<u8>>| {
-        let idx = IndexDoc::new(SelfRooted::new());
-        for h in &hs {
-            idx.import(h).unwrap();
-        }
-        idx
-    };
-    let old = fold(dual_read_history(false));
-    let new = fold(dual_read_history(true));
-
-    assert!(
-        old.quarantine_report().is_empty(),
-        "old-encoding fold quarantined: {:?}",
-        old.quarantine_report()
-    );
-    assert!(
-        new.quarantine_report().is_empty(),
-        "new-encoding fold quarantined: {:?}",
-        new.quarantine_report()
-    );
-
-    assert_eq!(
-        old.tips(),
-        new.tips(),
-        "legacy lineage:<b> and branch.name markers fold to identical tips"
-    );
-
-    let mut ob = old.branches();
-    ob.sort();
-    let mut nb = new.branches();
-    nb.sort();
-    assert_eq!(ob, nb);
-    assert_eq!(ob, vec![b("feat"), b("feat2"), b("main")]);
-
-    // Concrete frontiers (identical id layout in both encodings): main and feat2
-    // are single-op peers; feat's marker + non-marker op merge into one change,
-    // so its tip is the change's last op.
-    assert_eq!(old.tips()[&b("main")].as_single(), Some(ID::new(100, 0)));
-    assert_eq!(old.tips()[&b("feat")].as_single(), Some(ID::new(200, 1)));
-    assert_eq!(old.tips()[&b("feat2")].as_single(), Some(ID::new(300, 0)));
-}
 
 #[test]
 fn index_arbitrary_branch_names_round_trip() {
-    // Phase 2 retires the branch-name charset constraint (`branch_name_codec`):
-    // the name travels as a map VALUE, not a container id, so a name with
-    // spaces, unicode, ':' or '/' -- all restricted by the legacy `lineage:<b>`
-    // container-name codec -- round-trips through creation, snapshot export,
-    // cold import, and reads.
+    // A branch name is a map VALUE, not a container id, so a name with spaces,
+    // unicode, ':' or '/' round-trips through creation, snapshot export, cold
+    // import, and reads.
+    let names = ["a branch with spaces", "café ☕ 名前", "boc/abc123", "a:b:c"];
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    for (i, n) in names.iter().enumerate() {
+        idx.create_index_branch(&b(n), &b("main")).unwrap();
+        idx.record_head(&b(n), &d("G"), 1000 + i as u64, i as i32 + 1)
+            .unwrap();
+    }
     let names = ["a branch with spaces", "café ☕ 名前", "boc/abc123", "a:b:c"];
     let idx = IndexDoc::new(SelfRooted::new());
     idx.init_genesis(&b("main")).unwrap();
@@ -2139,9 +2049,9 @@ fn index_arbitrary_branch_names_round_trip() {
 
 #[test]
 fn index_root_container_count_is_two_regardless_of_branch_count() {
-    // Phase 2 collapses the wire encoding to TWO root containers total (`branch`
-    // + `docs`), independent of branch count: the legacy `1 + branches_alltime`
-    // (one `lineage:<b>` root list per branch) is gone.
+    // The index has exactly TWO root containers total (`branch` + `docs`),
+    // independent of branch count (the branch NAME is a map value, not a
+    // per-branch container).
     use crate::arena::LoadAllFlag;
     let idx = IndexDoc::new(SelfRooted::new());
     idx.init_genesis(&b("main")).unwrap();
