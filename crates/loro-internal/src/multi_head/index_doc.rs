@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 
 use crate::version::{shrink_frontiers, Frontiers};
-use loro_common::{Counter, InternalString, LoroError, LoroResult, PeerID, ID};
+use loro_common::{Counter, InternalString, Lamport, LoroError, LoroResult, PeerID, ID};
 
 use super::policy::{BRANCH_MERGE_KEY, BRANCH_NAME_KEY, BRANCH_ROOT, QuarantineReason};
 use super::ROOT_HEAD_ID;
@@ -239,6 +239,60 @@ impl MultiHeadDoc<SelfRooted> {
     /// violation whose ops stayed in the op log without moving any `tips`.
     pub fn quarantine_report(&self) -> Vec<(ID, QuarantineReason)> {
         self.policy().attribution(self).lock().quarantined.clone()
+    }
+
+    /// The index frontier branch `b` was forked from: the DEPENDENCIES of `b`'s
+    /// creation marker (the causally-earliest op attributed to `b`).
+    ///
+    /// Empty for the genesis branch (its creation marker is the root op, which
+    /// has no deps) and for an unknown branch. For a branch created from a
+    /// parent, this is the parent's index tips at the moment `b` was forked --
+    /// the cross-doc fork point, which lives ONLY in the index (a content doc's
+    /// own log cannot answer where `b` forked for a doc nobody has touched on `b`
+    /// yet).
+    pub fn fork_point(&self, b: &BranchId) -> Frontiers {
+        let starts: Vec<ID> = {
+            let attr = self.policy().attribution(self).lock();
+            attr.runs
+                .iter()
+                .flat_map(|(peer, runs)| {
+                    runs.iter()
+                        .filter(|(_, br)| br == b)
+                        .map(move |(start, _)| ID::new(*peer, *start))
+                })
+                .collect()
+        };
+        let ol = self.oplog.lock();
+        starts
+            .into_iter()
+            .min_by_key(|id| {
+                ol.get_change_at(*id)
+                    .map(|c| c.lamport())
+                    .unwrap_or(Lamport::MAX)
+            })
+            .and_then(|id| ol.get_deps_of(id))
+            .unwrap_or_default()
+    }
+
+    /// The document ids branch `b` has frontier records for: the keys of its
+    /// `docs` map at `tips[b]`. Empty for an unknown branch.
+    ///
+    /// NOTE(claude-opus-4-8/index-causal-attribution): this returns the docs
+    /// RECORDED on `b` (a superset that INCLUDES docs inherited from `b`'s fork
+    /// parent), which is the useful "which docs does branch `b` know about" read.
+    /// The proposal's finer "docs `b`'s OWN changes touched since `fork_point`"
+    /// delta needs a per-doc state diff between `fork_point(b)` and `tips[b]`;
+    /// it is DEFERRED because no consumer requires it yet (see the Round 5
+    /// TS-reader enumeration: no weftwise caller reads the branching index).
+    pub fn touched_docs(&self, b: &BranchId) -> LoroResult<Vec<DocId>> {
+        self.read(b, |d| {
+            d.get_deep_value()
+                .as_map()
+                .and_then(|root| root.get("docs").cloned())
+                .and_then(|v| v.into_map().ok())
+                .map(|docs| docs.keys().map(|k| DocId::from(k.as_str())).collect())
+                .unwrap_or_default()
+        })
     }
 
     /// Remove a branch from the index: unbind its index head (retiring it) and

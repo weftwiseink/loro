@@ -2467,3 +2467,94 @@ fn index_repeated_merge_into_same_target_each_emits() {
     assert_eq!(cold.tips(), idx.tips());
     assert_eq!(cold.recorded_ids(&b("into"), &d("E")).unwrap(), vec![ID::new(222, 2)]);
 }
+
+// ------------------------------------------------------------------
+// Phase 4: derived reads (fork_point, touched_docs) + the tips-replace-vs-join
+// serialization resolution.
+// ------------------------------------------------------------------
+
+#[test]
+fn index_fork_point_and_touched_docs() {
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    // Genesis has no fork point (its creation marker is the root op, no deps).
+    assert_eq!(idx.fork_point(&b("main")), Frontiers::default());
+
+    idx.record_head(&b("main"), &d("D"), 111, 5).unwrap();
+    let main_after_d = idx.tips()[&b("main")].clone();
+
+    idx.create_index_branch(&b("feat"), &b("main")).unwrap();
+    // feat forked from main AFTER main recorded D: fork_point(feat) is main's
+    // tip at the fork moment (the cross-doc fork point).
+    assert_eq!(idx.fork_point(&b("feat")), main_after_d);
+
+    idx.record_head(&b("feat"), &d("E"), 222, 7).unwrap();
+    // touched_docs = docs recorded on the branch (D inherited from the fork, E
+    // feat's own).
+    let mut td = idx.touched_docs(&b("feat")).unwrap();
+    td.sort();
+    assert_eq!(td, vec![d("D"), d("E")]);
+    assert_eq!(idx.touched_docs(&b("main")).unwrap(), vec![d("D")]);
+    // Unknown branch -> empty.
+    assert!(idx.touched_docs(&b("nope")).unwrap().is_empty());
+    assert_eq!(idx.fork_point(&b("nope")), Frontiers::default());
+}
+
+#[test]
+fn index_local_commit_after_import_preserves_both_lineages() {
+    // The R1 tips-replace-vs-join nit, RESOLVED empirically. `after_commit`
+    // REPLACES tips[b] with the single committed op, while `after_import` JOINs.
+    // This is safe because a local write RESOLVES b to its current (possibly
+    // just-joined) tips BEFORE the edit, so the committed op causally DOMINATES
+    // the join and reading at the new single tip reconstructs the full per-peer
+    // VV. Interleave an import (fold JOINs to two ids) with a local commit
+    // (after_commit REPLACES to one id) on ONE IndexDoc and show no record lost.
+    let a = IndexDoc::new(SelfRooted::new());
+    a.init_genesis(&b("main")).unwrap();
+    a.create_index_branch(&b("shared"), &b("main")).unwrap();
+    a.record_head(&b("shared"), &d("D"), 111, 1).unwrap();
+    let a_updates = a.export(ExportMode::all_updates()).unwrap();
+
+    let bb = IndexDoc::new(SelfRooted::new());
+    bb.init_genesis(&b("main")).unwrap();
+    bb.create_index_branch(&b("shared"), &b("main")).unwrap();
+    bb.record_head(&b("shared"), &d("D"), 222, 2).unwrap();
+
+    // Import A: the fold JOINs both creation lineages -> tips is two ids.
+    bb.import(&a_updates).unwrap();
+    assert_eq!(bb.tips()[&b("shared")].len(), 2, "join of two lineages");
+    let mut both = bb.recorded_ids(&b("shared"), &d("D")).unwrap();
+    both.sort();
+    assert_eq!(both, vec![ID::new(111, 1), ID::new(222, 2)]);
+
+    // Local commit AFTER the import: after_commit REPLACES tips[shared] with the
+    // single new op. The write resolved shared to the joined tips first, so the
+    // new op dominates the join.
+    bb.record_head(&b("shared"), &d("E"), 222, 3).unwrap();
+    assert_eq!(
+        bb.tips()[&b("shared")].len(),
+        1,
+        "after_commit replaced the joined tips with one id"
+    );
+    // ...yet BOTH prior lineages' records still resolve (self-heal via causal
+    // dominance): the per-peer VV was never actually lost.
+    let mut still = bb.recorded_ids(&b("shared"), &d("D")).unwrap();
+    still.sort();
+    assert_eq!(
+        still,
+        vec![ID::new(111, 1), ID::new(222, 2)],
+        "both lineages' D records survive the tips REPLACE"
+    );
+    assert_eq!(
+        bb.recorded_ids(&b("shared"), &d("E")).unwrap(),
+        vec![ID::new(222, 3)]
+    );
+
+    // And it converges on a cold peer: the single-tip op carries the full past.
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&bb.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    let mut cd = cold.recorded_ids(&b("shared"), &d("D")).unwrap();
+    cd.sort();
+    assert_eq!(cd, vec![ID::new(111, 1), ID::new(222, 2)]);
+}
