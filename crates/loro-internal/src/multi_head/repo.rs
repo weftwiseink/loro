@@ -70,9 +70,10 @@ impl BranchingDocRepo {
     /// removed. Its committed ops stay in each doc's history (unreferenced).
     ///
     /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): this is LOCAL-ONLY
-    /// registry cleanup. The branch's `lineage:<name>` ops remain in the shared
-    /// index history, so a later sync that re-imports them re-discovers the
-    /// branch (`SelfRooted::after_import`). Durable cross-peer deletion /
+    /// registry cleanup. The branch's marker op (`branch.name = "<name>"`)
+    /// remains in the shared index history, so a later sync that re-imports it
+    /// re-discovers the branch (`SelfRooted::after_import`). Durable cross-peer
+    /// deletion /
     /// tombstoning is the wrapper's lifecycle-log job and a Phase-5 follow-up;
     /// this method does not attempt it.
     pub fn delete_branch(&self, name: &BranchId) -> LoroResult<()> {

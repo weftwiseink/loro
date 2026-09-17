@@ -3,39 +3,41 @@ use rustc_hash::FxHashMap;
 use crate::version::Frontiers;
 use loro_common::{Counter, InternalString, LoroError, LoroResult, PeerID, ID};
 
-use super::policy::{lineage_name, QuarantineReason};
+use super::policy::{BRANCH_NAME_KEY, BRANCH_ROOT, QuarantineReason};
 use super::ROOT_HEAD_ID;
 use super::*;
 
-/// The repo's index doc. Its heads hold only frontiers: a root map
-/// `docs: LoroMap<DocId, LoroMap<"heads", LoroMap<PeerID, Counter>>>` plus one
-/// root list per branch, `lineage:<b>`, whose push is the branch's creation
-/// MARKER (see `SelfRooted`). No weft filesystem metadata (that is a TS-side
-/// content doc). The only types that appear are `ID`/`Frontiers`/`DocId`/
-/// `BranchId`.
+/// The repo's index doc. Its heads hold only frontiers: TWO root maps total, a
+/// `docs: LoroMap<DocId, LoroMap<"heads", LoroMap<PeerID, Counter>>>` and a
+/// `branch` map whose `name` key set (`branch.name = "<b>"`) is a branch's
+/// creation MARKER (see `SelfRooted`). No weft filesystem metadata (that is a
+/// TS-side content doc). The only types that appear are `ID`/`Frontiers`/
+/// `DocId`/`BranchId`.
 pub type IndexDoc = MultiHeadDoc<SelfRooted>;
 
 impl MultiHeadDoc<SelfRooted> {
     /// Establish the first (genesis) branch, bound to the pinned root head, by
-    /// writing its creation marker as the root's first op. The commit hook's
-    /// `after_commit` sets `tips[genesis]` to that op. Must be called once
-    /// before other branches are created.
+    /// writing its creation marker as the root's first op: `branch.name =
+    /// "<genesis>"`. The commit hook's `after_commit` sets `tips[genesis]` to
+    /// that op. Must be called once before other branches are created.
     pub fn init_genesis(&self, genesis: &BranchId) -> LoroResult<()> {
         let root = self.head_doc(ROOT_HEAD_ID).expect("root head exists");
-        let peer = root.peer_id();
         self.with_reg(|this, reg| this.rebind(reg, genesis, ROOT_HEAD_ID));
-        root.get_list(lineage_name(genesis).as_str())
-            .push(peer as i64)?;
+        root.get_map(BRANCH_ROOT)
+            .insert(BRANCH_NAME_KEY, genesis.as_str())?;
         root.commit_then_renew();
         Ok(())
     }
 
     /// Create `new` from `from` by EAGER copy: fork `from`'s index head (a state
     /// of a few map entries), then write the copy's first op -- the creation
-    /// marker, a push of the copy's fresh peer into `lineage:<new>` -- directly
-    /// on the copy. That op depends on `tips[from]` and names `new`, so the
-    /// commit hook's `after_commit` sets `tips[new]` to it. Every index head is
-    /// thus born `refs == 1`.
+    /// marker, `branch.name = "<new>"` (overwriting the copied parent's name) --
+    /// directly on the copy. That op depends on `tips[from]` and names `new`, so
+    /// the commit hook's `after_commit` sets `tips[new]` to it. Every index head
+    /// is thus born `refs == 1`.
+    ///
+    /// The name travels as a plain map value (a `LoroValue::String` in the op
+    /// log), so `new` may be any string -- no container-id charset constraint.
     ///
     /// Errors if `new` already exists (mirroring `create_branch_at`): re-forking
     /// a live name would otherwise mint a second creation marker for it, and
@@ -53,10 +55,9 @@ impl MultiHeadDoc<SelfRooted> {
             this.rebind(reg, new, c);
             reg.heads[&c].doc.clone()
         });
-        let peer = copy_doc.peer_id();
         copy_doc
-            .get_list(lineage_name(new).as_str())
-            .push(peer as i64)?;
+            .get_map(BRANCH_ROOT)
+            .insert(BRANCH_NAME_KEY, new.as_str())?;
         copy_doc.commit_then_renew();
         Ok(())
     }

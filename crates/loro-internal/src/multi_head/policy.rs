@@ -3,13 +3,15 @@ use std::sync::{Arc, OnceLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use crate::container::map::MapSet;
 use crate::encoding::ImportStatus;
 use crate::lock::{LockKind, LoroMutex};
+use crate::op::InnerContent;
 use crate::oplog::OpLog;
 use crate::version::{shrink_frontiers, Frontiers};
 use loro_common::{
-    ContainerID, Counter, HasIdSpan, IdSpan, InternalString, Lamport, LoroError, LoroResult,
-    PeerID, ID,
+    ContainerID, ContainerType, Counter, HasIdSpan, IdSpan, InternalString, Lamport, LoroError,
+    LoroResult, LoroValue, PeerID, ID,
 };
 
 use super::*;
@@ -37,21 +39,26 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
     fn after_import(&self, this: &MultiHeadDoc<Self>, status: &ImportStatus) -> Vec<BranchId>;
 }
 
-/// Root-container name prefix of a branch's creation MARKER (`lineage:<b>`).
+/// Root map that carries every branch's creation/attribution MARKER as a plain
+/// map value: `branch.name = "<b>"` (`Root{name: "branch"}`, key `"name"`).
 ///
-/// Wire encoding: the first op of a fresh index peer is a push into
-/// `lineage:<b>`, which names the branch that peer was created for. The fold
-/// below reads it as a marker only; the pushed value (the peer id) is not
-/// consulted for attribution.
+/// Wire encoding: the first op of a fresh index peer sets this key to the branch
+/// it was created for. Because the name travels as a `LoroValue::String` in the
+/// op log (a `MapSet` op, op-log-resident and readable by `after_import` with no
+/// materialized state), the whole index needs ONE marker root container rather
+/// than one per branch, and a branch name is any string (no container-id charset
+/// constraint, so `branch_name_codec.ts` is retired).
+pub(super) const BRANCH_ROOT: &str = "branch";
+pub(super) const BRANCH_NAME_KEY: &str = "name";
+
+/// Legacy root-container name prefix of a branch's creation marker
+/// (`lineage:<b>`), the pre-Phase-2 encoding. Still READ (dual-read transition)
+/// so a history or snapshot encoded before Phase 2 folds identically under the
+/// current engine; no longer written.
 const LINEAGE_PREFIX: &str = "lineage:";
 
-pub(super) fn lineage_name(b: &BranchId) -> String {
-    format!("{LINEAGE_PREFIX}{b}")
-}
-
-/// If `idx` names a `lineage:<b>` root container, return `b`. Pure op-log
-/// discovery: the branch is encoded in the (name-addressable) container id, so
-/// `after_import` never needs a materialized state to identify it.
+/// If `idx` names a `lineage:<b>` root container, return `b`. Legacy encoding;
+/// see [`marker_branch_of`] for the dual-read entry point.
 fn lineage_branch_of(ol: &OpLog, idx: crate::container::idx::ContainerIdx) -> Option<BranchId> {
     match ol.arena.idx_to_id(idx)? {
         ContainerID::Root { name, .. } => name
@@ -60,6 +67,33 @@ fn lineage_branch_of(ol: &OpLog, idx: crate::container::idx::ContainerIdx) -> Op
             .map(InternalString::from),
         _ => None,
     }
+}
+
+/// The branch a marker op names, reading BOTH encodings (the Phase 2 transition
+/// fold): the current `branch.name = "<b>"` map-set, or the legacy `lineage:<b>`
+/// root push. Pure op-log discovery: attribution never needs a materialized
+/// state to identify the branch. A mixed history (peers from before and after
+/// Phase 2) therefore attributes uniformly, and a snapshot encoded before the
+/// change restores identically.
+fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
+    if let InnerContent::Map(MapSet {
+        key,
+        value: Some(LoroValue::String(name)),
+    }) = &op.content
+    {
+        if key.as_str() == BRANCH_NAME_KEY {
+            if let Some(ContainerID::Root {
+                name: root,
+                container_type: ContainerType::Map,
+            }) = ol.arena.idx_to_id(op.container)
+            {
+                if root.as_str() == BRANCH_ROOT {
+                    return Some(InternalString::from(name.as_ref()));
+                }
+            }
+        }
+    }
+    lineage_branch_of(ol, op.container)
 }
 
 /// Why an imported change (or its pre-marker prefix) was NOT attributed to any
@@ -236,7 +270,7 @@ impl HeadPolicy for SelfRooted {
             for ch in ol.iter_changes(IdSpan::new(*peer, *start, *end)) {
                 let mut markers = SmallVec::new();
                 for op in ch.ops().iter() {
-                    if let Some(b) = lineage_branch_of(&ol, op.container) {
+                    if let Some(b) = marker_branch_of(&ol, op) {
                         markers.push((op.counter, b));
                     }
                 }

@@ -1990,3 +1990,172 @@ fn index_change_spanning_two_branches_is_quarantined_without_moving_tips() {
     );
     assert!(idx.recorded_ids(&b("alpha"), &d("B")).unwrap().is_empty());
 }
+
+// ------------------------------------------------------------------
+// Phase 2: the `branch.name` root-map marker replaces the per-branch
+// `lineage:<b>` root list. Two root containers total, no branch-name charset
+// constraint, and a DUAL-READ fold so a pre-Phase-2 history still attributes.
+// ------------------------------------------------------------------
+
+/// Build a small multi-branch index history as a raw op stream, using either
+/// the legacy `lineage:<b>` marker (`new == false`) or the Phase 2 `branch.name`
+/// marker (`new == true`). The peer/counter layout is IDENTICAL between the two
+/// (only the marker op's shape differs), so the two histories fold to
+/// byte-identical `tips` -- exactly the dual-read guarantee: a pre-Phase-2
+/// history yields the same attribution under the current engine as its Phase 2
+/// equivalent.
+fn dual_read_history(new: bool) -> Vec<Vec<u8>> {
+    fn marker(doc: &LoroDoc, new: bool, name: &str) {
+        if new {
+            doc.get_map("branch").insert("name", name).unwrap();
+        } else {
+            doc.get_list(format!("lineage:{name}").as_str())
+                .push(0i64)
+                .unwrap();
+        }
+        doc.commit_then_renew();
+    }
+
+    // main: peer 100, one creation marker.
+    let m = LoroDoc::new();
+    m.start_auto_commit();
+    m.set_peer_id(100).unwrap();
+    marker(&m, new, "main");
+    let m_bytes = m.export(ExportMode::all_updates()).unwrap();
+
+    // feat: peer 200, forks main (imports its history), then its marker and a
+    // NON-marker op (a plain `docs` write, attributed to feat by its deps).
+    let f = LoroDoc::new();
+    f.start_auto_commit();
+    f.set_peer_id(200).unwrap();
+    f.import(&m_bytes).unwrap();
+    marker(&f, new, "feat");
+    f.get_map("docs").insert("x", 1).unwrap();
+    f.commit_then_renew();
+    let f_bytes = f.export(ExportMode::all_updates()).unwrap();
+
+    // feat2: peer 300, an independent fork off main, marker only.
+    let f2 = LoroDoc::new();
+    f2.start_auto_commit();
+    f2.set_peer_id(300).unwrap();
+    f2.import(&m_bytes).unwrap();
+    marker(&f2, new, "feat2");
+    let f2_bytes = f2.export(ExportMode::all_updates()).unwrap();
+
+    vec![m_bytes, f_bytes, f2_bytes]
+}
+
+#[test]
+fn index_dual_read_old_and_new_marker_fold_identically() {
+    // The transition fold reads BOTH marker encodings. A history built with the
+    // legacy `lineage:<b>` marker and its `branch.name` twin (same peers, same
+    // counters) fold to IDENTICAL tips under the current engine, with no
+    // quarantine on either -- the guarantee that existing pre-Phase-2 dogfood
+    // and snapshot data still attributes correctly.
+    let fold = |hs: Vec<Vec<u8>>| {
+        let idx = IndexDoc::new(SelfRooted::new());
+        for h in &hs {
+            idx.import(h).unwrap();
+        }
+        idx
+    };
+    let old = fold(dual_read_history(false));
+    let new = fold(dual_read_history(true));
+
+    assert!(
+        old.quarantine_report().is_empty(),
+        "old-encoding fold quarantined: {:?}",
+        old.quarantine_report()
+    );
+    assert!(
+        new.quarantine_report().is_empty(),
+        "new-encoding fold quarantined: {:?}",
+        new.quarantine_report()
+    );
+
+    assert_eq!(
+        old.tips(),
+        new.tips(),
+        "legacy lineage:<b> and branch.name markers fold to identical tips"
+    );
+
+    let mut ob = old.branches();
+    ob.sort();
+    let mut nb = new.branches();
+    nb.sort();
+    assert_eq!(ob, nb);
+    assert_eq!(ob, vec![b("feat"), b("feat2"), b("main")]);
+
+    // Concrete frontiers (identical id layout in both encodings): main and feat2
+    // are single-op peers; feat's marker + non-marker op merge into one change,
+    // so its tip is the change's last op.
+    assert_eq!(old.tips()[&b("main")].as_single(), Some(ID::new(100, 0)));
+    assert_eq!(old.tips()[&b("feat")].as_single(), Some(ID::new(200, 1)));
+    assert_eq!(old.tips()[&b("feat2")].as_single(), Some(ID::new(300, 0)));
+}
+
+#[test]
+fn index_arbitrary_branch_names_round_trip() {
+    // Phase 2 retires the branch-name charset constraint (`branch_name_codec`):
+    // the name travels as a map VALUE, not a container id, so a name with
+    // spaces, unicode, ':' or '/' -- all restricted by the legacy `lineage:<b>`
+    // container-name codec -- round-trips through creation, snapshot export,
+    // cold import, and reads.
+    let names = ["a branch with spaces", "café ☕ 名前", "boc/abc123", "a:b:c"];
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    for (i, n) in names.iter().enumerate() {
+        idx.create_index_branch(&b(n), &b("main")).unwrap();
+        idx.record_head(&b(n), &d("G"), 1000 + i as u64, i as i32 + 1)
+            .unwrap();
+    }
+
+    let snap = idx.export(ExportMode::Snapshot).unwrap();
+    let restored = IndexDoc::new(SelfRooted::new());
+    restored.import(&snap).unwrap();
+
+    assert!(restored.quarantine_report().is_empty());
+    for (i, n) in names.iter().enumerate() {
+        assert!(
+            restored.branches().contains(&b(n)),
+            "branch {n:?} restored from the snapshot"
+        );
+        assert!(
+            restored
+                .policy()
+                .target(&restored, &b(n))
+                .unwrap()
+                .as_single()
+                .is_some(),
+            "target({n:?}) resolves"
+        );
+        assert_eq!(
+            restored.recorded_ids(&b(n), &d("G")).unwrap(),
+            vec![ID::new(1000 + i as u64, i as i32 + 1)],
+            "record for {n:?} round-trips"
+        );
+    }
+}
+
+#[test]
+fn index_root_container_count_is_two_regardless_of_branch_count() {
+    // Phase 2 collapses the wire encoding to TWO root containers total (`branch`
+    // + `docs`), independent of branch count: the legacy `1 + branches_alltime`
+    // (one `lineage:<b>` root list per branch) is gone.
+    use crate::arena::LoadAllFlag;
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    for i in 0..50 {
+        idx.create_index_branch(&b(&format!("feat{i}")), &b("main"))
+            .unwrap();
+    }
+    idx.record_head(&b("main"), &d("G"), 1, 1).unwrap();
+
+    let roots = idx.arena.top_level_root_containers(LoadAllFlag);
+    let names: Vec<_> = roots.iter().filter_map(|c| idx.arena.idx_to_id(*c)).collect();
+    assert_eq!(
+        roots.len(),
+        2,
+        "exactly `branch` and `docs` after 50 branches, not one root per branch: {names:?}"
+    );
+}
