@@ -35,7 +35,7 @@ use loro_internal::{
 };
 use loro_internal::multi_head::{
     BranchId, BranchSubscription, BranchingDoc as BranchingDocContent, BranchingDocRepo as RepoInner,
-    IndexDoc, MergeOutcome,
+    IndexDoc, MergeOutcome, QuarantineReason,
 };
 use loro_internal::subscription::Subscriber;
 use parking_lot::lock_api::ReentrantMutex;
@@ -329,6 +329,12 @@ extern "C" {
     pub type JsID;
     #[wasm_bindgen(typescript_type = "{ peer: PeerID, counter: number }[]")]
     pub type JsIDs;
+    #[wasm_bindgen(typescript_type = "Record<string, { peer: PeerID, counter: number }[]>")]
+    pub type JsBranchTips;
+    #[wasm_bindgen(
+        typescript_type = "{ id: { peer: PeerID, counter: number }, reason: string, detail: string }[]"
+    )]
+    pub type JsQuarantineReport;
     #[wasm_bindgen(typescript_type = "{ start: number, end: number }")]
     pub type JsRange;
     #[wasm_bindgen(typescript_type = "number|bool|string|null")]
@@ -2743,6 +2749,25 @@ fn merge_outcome_to_str(outcome: MergeOutcome) -> &'static str {
     }
 }
 
+/// A quarantine reason as a `(tag, detail)` pair for the JS diagnostics view.
+/// `detail` is a human string (a dep id, or the comma-joined disagreeing
+/// branches); empty when the tag alone says it.
+fn quarantine_reason_parts(reason: &QuarantineReason) -> (&'static str, String) {
+    match reason {
+        QuarantineReason::NoDeps => ("no-deps", String::new()),
+        QuarantineReason::UnknownDep(dep) => ("unknown-dep", dep.to_string()),
+        QuarantineReason::DepsDisagree(branches) => (
+            "deps-disagree",
+            branches
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        QuarantineReason::NotInDag(dep) => ("not-in-dag", dep.to_string()),
+    }
+}
+
 /// Wrap a resolved head `LoroDoc` as a head-safe wasm `BranchingDocHead` for a `read`/`write`
 /// closure. The wasm `LoroDoc` aliases the same underlying head (a cheap `Arc` clone), so edits
 /// through the head's containers land on the head the repo committed on closure exit.
@@ -2850,7 +2875,7 @@ impl BranchingIndex {
 
     /// Import index history from a peer (byte-level). History-only + all-heads-barriered:
     /// ops land in the shared op log without moving any head's state, then the `SelfRooted`
-    /// policy's `after_import` discovers remote branches from the lineage scan and advances
+    /// policy's `after_import` discovers remote branches from the marker scan and advances
     /// the affected index heads. This is how a peer LEARNS a remote branch and where it sits;
     /// the content ops themselves arrive via [`BranchingDoc::import`].
     pub fn import(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
@@ -2891,6 +2916,59 @@ impl BranchingIndex {
     #[wasm_bindgen(js_name = "oplogVersion")]
     pub fn oplog_version(&self) -> VersionVector {
         VersionVector(self.0.oplog_vv())
+    }
+
+    /// Every branch's index frontier as `{ [branch]: OpId[] }` -- the derived,
+    /// read-only `active_branches` projection (each value is `target(branch)`).
+    pub fn tips(&self) -> JsResult<JsBranchTips> {
+        let obj = Object::new();
+        for (branch, frontier) in self.0.tips() {
+            let arr = Array::new();
+            for id in frontier.iter() {
+                arr.push(&id_to_js(&id)?);
+            }
+            Reflect::set(&obj, &JsValue::from_str(&branch), arr.as_ref())?;
+        }
+        Ok(JsValue::from(obj).into())
+    }
+
+    /// The imported spans the causal fold refused to attribute: `{ id, reason,
+    /// detail }[]`. Empty on a well-formed history; a non-empty report is the
+    /// loud, local signal of a model violation whose ops stayed in the op log
+    /// without moving any branch's frontier. `reason` is one of `"no-deps"`,
+    /// `"unknown-dep"`, `"deps-disagree"`, `"not-in-dag"`.
+    #[wasm_bindgen(js_name = "quarantineReport")]
+    pub fn quarantine_report(&self) -> JsResult<JsQuarantineReport> {
+        let arr = Array::new();
+        for (id, reason) in self.0.quarantine_report() {
+            let obj = Object::new();
+            Reflect::set(&obj, &"id".into(), &id_to_js(&id)?)?;
+            let (tag, detail) = quarantine_reason_parts(&reason);
+            Reflect::set(&obj, &"reason".into(), &JsValue::from_str(tag))?;
+            Reflect::set(&obj, &"detail".into(), &JsValue::from_str(&detail))?;
+            arr.push(&obj);
+        }
+        Ok(JsValue::from(arr).into())
+    }
+
+    /// The index frontier branch `b` was forked from: the deps of `b`'s creation
+    /// marker (the cross-doc fork point, which lives only in the index). Empty
+    /// for the genesis branch and for an unknown branch.
+    #[wasm_bindgen(js_name = "forkPoint")]
+    pub fn fork_point(&self, b: &str) -> JsResult<JsIDs> {
+        frontiers_to_ids(&self.0.fork_point(&b.into()))
+    }
+
+    /// The document ids branch `b` has frontier records for (those inherited from
+    /// its fork parent included). Empty for an unknown branch.
+    #[wasm_bindgen(js_name = "touchedDocs")]
+    pub fn touched_docs(&self, b: &str) -> JsResult<Vec<String>> {
+        Ok(self
+            .0
+            .touched_docs(&b.into())?
+            .iter()
+            .map(|d| d.to_string())
+            .collect())
     }
 }
 

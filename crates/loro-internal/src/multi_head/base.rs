@@ -15,7 +15,7 @@ use crate::sync::{AtomicU64, AtomicU8, AtomicUsize};
 use crate::utils::subscription::{SubscriberSetWithQueue, Subscription};
 use crate::version::{Frontiers, VersionVector};
 use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
-use loro_common::{ContainerID, IdSpan, LoroEncodeError, LoroResult};
+use loro_common::{ContainerID, HasIdSpan, IdSpan, LoroEncodeError, LoroResult};
 
 use super::head_registry::{in_registry_op, BranchSub, Head, RegOpGuard, Registry};
 use super::ROOT_HEAD_ID;
@@ -81,9 +81,9 @@ pub(super) struct HeadOwner<P: HeadPolicy> {
 }
 
 impl<P: HeadPolicy> DocOwner for HeadOwner<P> {
-    fn on_head_commit(&self, _id_span: IdSpan) {
+    fn on_head_commit(&self, id_span: IdSpan) {
         if let Some(inner) = self.inner.upgrade() {
-            MultiHeadDoc { inner }.on_head_committed(self.head_id);
+            MultiHeadDoc { inner }.on_head_committed(self.head_id, id_span);
         }
     }
 }
@@ -288,9 +288,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     /// free, O(1) branch-from-a-live-head path (share `from`'s head).
     ///
     /// This is the `OnDivergence` (content-doc) path only. An `Eager` policy
-    /// (the index) provides its OWN creation that additionally seeds lineage,
-    /// so the eager copy never leaks into this generic / `Delegated` path (see
-    /// `MultiHeadDoc<SelfRooted>::create_index_branch`).
+    /// (the index) provides its OWN creation that additionally writes the
+    /// branch's creation marker, so the eager copy never leaks into this generic
+    /// / `Delegated` path (see `MultiHeadDoc<SelfRooted>::create_index_branch`).
     pub fn create_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
         debug_assert!(
             P::COPY == CopyMode::OnDivergence,
@@ -344,7 +344,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     /// (so it may lock the registry), unless the commit was triggered from
     /// inside a registry op (a `flip_to_shared` flush), in which case that op
     /// re-keys `by_tip` itself and this defers.
-    fn on_head_committed(&self, id: HeadId) {
+    fn on_head_committed(&self, id: HeadId, committed: IdSpan) {
         if in_registry_op() {
             return;
         }
@@ -375,7 +375,12 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             (new_tip, branch)
         };
         if let (Some(b), Some(last)) = (branch, new_tip.as_single()) {
-            self.inner.policy.after_commit(self, &b, last);
+            debug_assert_eq!(
+                last,
+                committed.id_last(),
+                "a head's post-commit tip is the committed change's last id"
+            );
+            self.inner.policy.after_commit(self, &b, committed);
         }
     }
 
@@ -422,7 +427,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         let status = self.with_all_heads_barrier(|| head.import_to_history(bytes))?;
         // Drive policy-directed rebinding of the branches whose recorded history
         // just landed (the ingest). For `SelfRooted` this discovers remote
-        // branches from the lineage scan and advances affected index heads; for
+        // branches from the marker scan and advances affected index heads; for
         // policies that track no remote binding (e.g. `Manual`) it is empty.
         // A branch whose ids are not yet fully held is skipped and picked up on
         // the next import (resolve errors are non-fatal here).

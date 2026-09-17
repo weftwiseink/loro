@@ -562,14 +562,14 @@ decorateMethods(Branch.prototype, ["write"]);
 // risk in the devlog; the fix is emit-on-rebind (Rust) or an explicit re-project consumer contract.
 decorateMethods(BranchingDoc.prototype, ["import", "merge", "advance"]);
 
-// `BranchingDocRepo.createBranch` commits a lineage op onto the shared INDEX op log (the repo's
-// `create_index_branch` pushes the new branch's `lineage:<name>` entry and `commit_then_renew`s).
+// `BranchingDocRepo.createBranch` commits a branch-marker op onto the shared INDEX op log (the
+// repo's `create_index_branch` sets the new branch's `branch.name` marker and `commit_then_renew`s).
 // That commit synchronously enqueues a `BranchingIndex.subscribeLocalUpdates` local-update
 // callback into the global pending-event queue, but the queue only flushes when a decorated
 // method runs `callPendingEvents()`. Without this decoration the enqueued frame is never
 // delivered (0 fires) and the scheduled microtask check logs `[LORO_INTERNAL_ERROR] Event not
 // called`, so a wire adaptor driven off the index stream never learns of a locally-created
-// branch. Auto-flushing here makes `createBranch(...)` deliver the index lineage frame with NO
+// branch. Auto-flushing here makes `createBranch(...)` deliver the index marker frame with NO
 // manual `callPendingEvents()`, mirroring the decorated content-mutating methods above.
 // `deleteBranch` is CURRENTLY local-only registry cleanup (`delete_index_branch` commits no op —
 // durable cross-peer deletion is a Phase-5 wrapper-lifecycle follow-up), so its decoration flushes

@@ -3,11 +3,16 @@ use std::sync::{Arc, OnceLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use crate::container::map::MapSet;
 use crate::encoding::ImportStatus;
 use crate::lock::{LockKind, LoroMutex};
+use crate::op::InnerContent;
 use crate::oplog::OpLog;
 use crate::version::{shrink_frontiers, Frontiers};
-use loro_common::{ContainerID, IdSpan, InternalString, LoroError, LoroResult, PeerID, ID};
+use loro_common::{
+    ContainerID, ContainerType, Counter, HasIdSpan, IdSpan, InternalString, Lamport, LoroError,
+    LoroResult, LoroValue, PeerID, ID,
+};
 
 use super::*;
 
@@ -24,52 +29,181 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
     /// registry lock is held, so it MUST NOT lock the registry.
     fn target(&self, this: &MultiHeadDoc<Self>, b: &BranchId) -> LoroResult<Frontiers>;
 
-    /// Publish the new tip after `b`'s head commits `last`. May be a no-op (the
-    /// index's tip IS its record). Runs OUTSIDE the registry lock.
-    fn after_commit(&self, this: &MultiHeadDoc<Self>, b: &BranchId, last: ID);
+    /// Publish the new tip after `b`'s head commits the ops in `committed` (the
+    /// change's full id span; its last id is the head's new single tip). May be
+    /// a no-op. Runs OUTSIDE the registry lock.
+    fn after_commit(&self, this: &MultiHeadDoc<Self>, b: &BranchId, committed: IdSpan);
 
     /// Given the spans that just landed on import, return the branches whose
     /// binding should be re-resolved.
     fn after_import(&self, this: &MultiHeadDoc<Self>, status: &ImportStatus) -> Vec<BranchId>;
 }
 
-/// Root-container name prefix for a branch's lineage list (`lineage:<b>`).
-const LINEAGE_PREFIX: &str = "lineage:";
+/// Root map that carries every branch's creation MARKER as a plain map value:
+/// `branch.name = "<b>"` (`Root{name: "branch"}`, key `"name"`).
+///
+/// The first op of a fresh index peer sets this key to the branch it was created
+/// for. Because the name travels as a `LoroValue::String` in the op log (a
+/// `MapSet` op, op-log-resident and readable by `after_import` with no
+/// materialized state), the whole index needs ONE marker root container rather
+/// than one per branch, and a branch name is any string (no container-id charset
+/// constraint).
+pub(super) const BRANCH_ROOT: &str = "branch";
+pub(super) const BRANCH_NAME_KEY: &str = "name";
 
-pub(super) fn lineage_name(b: &BranchId) -> String {
-    format!("{LINEAGE_PREFIX}{b}")
-}
+/// Key on the `branch` root map for a MERGE marker: `branch.merge = "<seq>:<b>"`
+/// where `<seq>` is a monotonic integer.
+///
+/// A repo-wide merge advances `into`'s index head to the join and needs ONE op
+/// naming `into`. It cannot reuse the `name` key: at the join `branch.name` may
+/// ALREADY equal `into` (the winner of the concurrent creation-marker LWW, or
+/// `into`'s own set causally dominating the source's), and a same-value map set
+/// emits NO op -- so `after_commit` never fires and the whole merge is silently
+/// dropped, on this peer AND on every peer that would fold the op stream. The
+/// `<seq>` prefix (read-then-increment of the current merge value) guarantees the
+/// value DIFFERS from whatever the last merge into `into` wrote, so the op always
+/// emits. The branch name is everything after the FIRST `:`, so a name that
+/// itself contains `:` is recovered intact (the seq is a decimal integer, no
+/// `:`). It stays a KEY on the existing `branch` map, so the root-container count
+/// is unchanged (still 2).
+pub(super) const BRANCH_MERGE_KEY: &str = "merge";
 
-/// If `idx` names a `lineage:<b>` root container, return `b`. Pure op-log
-/// discovery: the branch is encoded in the (name-addressable) container id, so
-/// `after_import` never needs a materialized state to identify it.
-fn lineage_branch_of(ol: &OpLog, idx: crate::container::idx::ContainerIdx) -> Option<BranchId> {
-    match ol.arena.idx_to_id(idx)? {
-        ContainerID::Root { name, .. } => name
-            .as_str()
-            .strip_prefix(LINEAGE_PREFIX)
-            .map(InternalString::from),
+/// The branch a marker op on the `branch` root map names, or `None` for a
+/// non-marker op. Pure op-log discovery: attribution never needs a materialized
+/// state to identify the branch. Two marker kinds:
+/// - `branch.name = "<b>"` (creation): the value IS the branch name;
+/// - `branch.merge = "<seq>:<b>"` (merge): the name is everything after the
+///   first `:` (the `<seq>` prefix keeps the map set from being a same-value
+///   no-op; see [`BRANCH_MERGE_KEY`]).
+fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
+    let InnerContent::Map(MapSet {
+        key,
+        value: Some(LoroValue::String(v)),
+    }) = &op.content
+    else {
+        return None;
+    };
+    let Some(ContainerID::Root {
+        name: root,
+        container_type: ContainerType::Map,
+    }) = ol.arena.idx_to_id(op.container)
+    else {
+        return None;
+    };
+    if root.as_str() != BRANCH_ROOT {
+        return None;
+    }
+    match key.as_str() {
+        BRANCH_NAME_KEY => Some(InternalString::from(v.as_ref())),
+        BRANCH_MERGE_KEY => v
+            .as_ref()
+            .split_once(':')
+            .map(|(_, name)| InternalString::from(name)),
         _ => None,
     }
 }
 
-/// The index's resolution policy: its OWN per-branch lineage IS the root of
-/// truth for where each branch is, so it consults no other index -- this breaks
-/// the `BranchingDoc`-depends-on-index circularity. Eager copy at branch
-/// creation means every index head is born `refs == 1` (never shared), so the
-/// sink guard never fires on an index head.
+/// Why an imported change (or its pre-marker prefix) was NOT attributed to any
+/// branch. A quarantined span stays in the op log; no branch's `tips` moves
+/// for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineReason {
+    /// No marker and no dependencies: a root change of unknown branch.
+    NoDeps,
+    /// A dependency lies outside every attribution run.
+    UnknownDep(ID),
+    /// The dependencies attribute to more than one branch (a change that
+    /// literally spans two branches' frontiers, which no engine path produces).
+    DepsDisagree(Vec<BranchId>),
+    /// An attributed id could not be shrunk against the DAG.
+    NotInDag(ID),
+}
+
+/// The index's derived branch projection (the maintainer's `active_branches`),
+/// folded from the op log by causal attribution: an op belongs to the branch
+/// named by the nearest marker in its causal past.
+#[derive(Debug, Default)]
+pub struct Attribution {
+    /// Branch -> its index frontier. `target(b)` is exactly `tips[b]`.
+    pub tips: FxHashMap<BranchId, Frontiers>,
+    /// Per-peer attribution runs, sorted by start counter: the op `(peer, c)`
+    /// belongs to the run with the greatest start `<= c`. A fresh index peer
+    /// has one run (its creation marker at counter 0); a peer whose head is
+    /// later rebound, or a peer that writes a marker mid-history, gains more.
+    pub runs: FxHashMap<PeerID, SmallVec<[(Counter, BranchId); 1]>>,
+    /// Spans that violated the model, keyed by their first op id; diagnostics.
+    pub quarantined: Vec<(ID, QuarantineReason)>,
+}
+
+impl Attribution {
+    /// The branch the op at `id` belongs to, if attributed.
+    pub fn branch_at(&self, id: ID) -> Option<&BranchId> {
+        self.runs
+            .get(&id.peer)?
+            .iter()
+            .rev()
+            .find(|(s, _)| *s <= id.counter)
+            .map(|(_, b)| b)
+    }
+
+    /// Make the run covering `(peer, start)` name `b`: a no-op if it already
+    /// does, else a new run starting at `start` (or a re-labelling of a run
+    /// that starts exactly there, for an idempotent re-fold of a stored change
+    /// that merged with an earlier one).
+    fn ensure_run(&mut self, peer: PeerID, start: Counter, b: &BranchId) {
+        let runs = self.runs.entry(peer).or_default();
+        match runs.iter().rposition(|(s, _)| *s <= start) {
+            Some(i) if runs[i].1 == *b => {}
+            Some(i) if runs[i].0 == start => runs[i].1 = b.clone(),
+            Some(i) => runs.insert(i + 1, (start, b.clone())),
+            None => runs.insert(0, (start, b.clone())),
+        }
+    }
+
+    /// The single branch every dependency attributes to.
+    fn branch_of_deps(&self, deps: &Frontiers) -> Result<BranchId, QuarantineReason> {
+        let mut found: Option<BranchId> = None;
+        for dep in deps.iter() {
+            let b = self
+                .branch_at(dep)
+                .ok_or(QuarantineReason::UnknownDep(dep))?;
+            match &found {
+                None => found = Some(b.clone()),
+                Some(f) if f == b => {}
+                Some(f) => {
+                    return Err(QuarantineReason::DepsDisagree(vec![f.clone(), b.clone()]))
+                }
+            }
+        }
+        found.ok_or(QuarantineReason::NoDeps)
+    }
+}
+
+/// The index's resolution policy: its OWN op log is the root of truth for where
+/// each branch is, so it consults no other index -- this breaks the
+/// `BranchingDoc`-depends-on-index circularity. Eager copy at branch creation
+/// means every index head is born `refs == 1` (never shared), so the sink guard
+/// never fires on an index head.
 ///
-/// `lineage` maps a branch to the peers of its index heads. It is rebuilt from
-/// the index's own op log: each index head writes under exactly one branch with
-/// a unique peer, so "the index ops of branch `b`" is exactly "the ops of the
-/// peers in `lineage:<b>`", and `b`'s index frontier is the join of those peers'
-/// latest ids.
+/// Attribution is CAUSAL, not by peer identity: a change belongs to the branch
+/// named by its own marker if it carries one, else to the branch of its
+/// dependencies (which must agree, or the change is quarantined). A head's
+/// state is always at `tips[b]` when it commits (`resolve` guarantees it), so
+/// every local change depends on `b`'s tips and inherits `b` with no
+/// declaration -- which is why a head minted by the resolve materialize arm
+/// needs no marker of its own: its first change's deps already attribute it.
+///
+/// Consistency of the derived `tips`: every mutation of `(tips, runs)` happens
+/// under the `Attribution` leaf lock as one critical section (a whole fold, or
+/// a whole `after_commit`), so a reader holding that lock sees all of a fold or
+/// none of it. `after_commit` publishes AFTER the commit returns; a session is
+/// single-writer, so its own next `resolve` runs after that publish.
 #[allow(missing_debug_implementations)]
 pub struct SelfRooted {
-    // Created lazily in the doc's lock group (`LockKind::Lineage`, the leaf
-    // acquired only after `OpLog`) on first use, since the group exists only
-    // once `MultiHeadDoc::new` has run.
-    lineage: OnceLock<LoroMutex<FxHashMap<BranchId, SmallVec<[PeerID; 2]>>>>,
+    // Created lazily in the doc's lock group (`LockKind::Attribution`, the leaf
+    // acquired alone or after `OpLog`) on first use, since the group exists
+    // only once `MultiHeadDoc::new` has run.
+    attr: OnceLock<LoroMutex<Attribution>>,
 }
 
 impl Default for SelfRooted {
@@ -81,86 +215,135 @@ impl Default for SelfRooted {
 impl SelfRooted {
     pub fn new() -> Self {
         SelfRooted {
-            lineage: OnceLock::new(),
+            attr: OnceLock::new(),
         }
     }
 
-    pub(super) fn lineage(
-        &self,
-        this: &MultiHeadDoc<SelfRooted>,
-    ) -> &LoroMutex<FxHashMap<BranchId, SmallVec<[PeerID; 2]>>> {
-        self.lineage.get_or_init(|| {
+    pub(super) fn attribution(&self, this: &MultiHeadDoc<SelfRooted>) -> &LoroMutex<Attribution> {
+        self.attr.get_or_init(|| {
             this.lock_group
-                .new_lock(FxHashMap::default(), LockKind::Lineage)
+                .new_lock(Attribution::default(), LockKind::Attribution)
         })
     }
+}
+
+/// One imported change, as the fold sees it: its position in the DAG plus the
+/// counters of its marker ops.
+struct Imported {
+    lamport: Lamport,
+    peer: PeerID,
+    start: Counter,
+    last: Counter,
+    deps: Frontiers,
+    /// `(op counter, branch)` per marker op, in counter order. A stored change
+    /// may merge several consecutive commits of one peer, so a marker can sit
+    /// past the first op; each marker starts a new attribution segment.
+    markers: SmallVec<[(Counter, BranchId); 1]>,
 }
 
 impl HeadPolicy for SelfRooted {
     const COPY: CopyMode = CopyMode::Eager;
 
-    /// Branch `b`'s index frontier = the join of the latest ids of the peers in
-    /// `lineage:<b>`, shrunk against the op-log DAG. The causal past does the
-    /// rest: a peer's ops depend on the tip its head forked from, so this brings
-    /// the inherited parent record and `b`'s own writes, never a sibling's later
-    /// writes (which no `b` peer depends on).
+    /// `tips[b]`, or the empty (root) frontier for an unknown branch.
     fn target(&self, this: &MultiHeadDoc<Self>, b: &BranchId) -> LoroResult<Frontiers> {
-        let ol = this.oplog.lock(); // OpLog before Lineage
-        let peers: SmallVec<[PeerID; 2]> = self
-            .lineage(this)
+        Ok(self
+            .attribution(this)
             .lock()
+            .tips
             .get(b)
             .cloned()
-            .unwrap_or_default();
-        let ids: Vec<ID> = peers
-            .iter()
-            .filter_map(|p| ol.vv().get_last(*p).map(|c| ID::new(*p, c)))
-            .collect();
-        shrink_frontiers(&Frontiers::from(ids), &ol.dag).map_err(LoroError::FrontiersNotFound)
+            .unwrap_or_default())
     }
 
-    /// The index tip IS the record; nothing extra to publish.
-    fn after_commit(&self, _this: &MultiHeadDoc<Self>, _b: &BranchId, _last: ID) {}
+    /// The head that committed sat at `tips[b]`, so its new single tip IS the
+    /// branch's frontier; its peer's run covers the committed counters as `b`.
+    fn after_commit(&self, this: &MultiHeadDoc<Self>, b: &BranchId, committed: IdSpan) {
+        let mut attr = self.attribution(this).lock();
+        attr.ensure_run(committed.peer, committed.counter.start, b);
+        attr.tips
+            .insert(b.clone(), Frontiers::from_id(committed.id_last()));
+    }
 
-    /// Walk the just-imported spans: an op in a `lineage:<b>` container names a
-    /// (possibly remote) peer of `b`; any op by a known lineage peer marks its
-    /// branch touched. Returns the branches whose index head should be rebound.
+    /// The causal fold. Collect the just-imported changes, sort them by
+    /// `(lamport, peer, counter)` (a topological order: a change's lamport
+    /// exceeds every dependency's), then attribute each in that order, so every
+    /// dependency of a successful change is in `runs` before it is looked up
+    /// (Loro holds a change back in `pending` until its deps are present).
+    /// Returns the branches whose `tips` moved.
     fn after_import(&self, this: &MultiHeadDoc<Self>, st: &ImportStatus) -> Vec<BranchId> {
-        // Collect under the OpLog lock, then fold into the lineage map (leaf
-        // lock, acquired alone) -- never nesting the two here.
-        let mut lineage_ops: Vec<(BranchId, PeerID)> = Vec::new();
-        let mut change_peers: Vec<PeerID> = Vec::new();
-        {
-            let ol = this.oplog.lock();
-            for (peer, (start, end)) in st.success.iter() {
-                for ch in ol.iter_changes(IdSpan::new(*peer, *start, *end)) {
-                    let cp = ch.peer();
-                    change_peers.push(cp);
-                    for op in ch.ops().iter() {
-                        if let Some(b) = lineage_branch_of(&ol, op.container) {
-                            lineage_ops.push((b, cp));
+        let ol = this.oplog.lock(); // OpLog before Attribution
+        let mut batch: Vec<Imported> = Vec::new();
+        for (peer, (start, end)) in st.success.iter() {
+            for ch in ol.iter_changes(IdSpan::new(*peer, *start, *end)) {
+                let mut markers = SmallVec::new();
+                for op in ch.ops().iter() {
+                    if let Some(b) = marker_branch_of(&ol, op) {
+                        markers.push((op.counter, b));
+                    }
+                }
+                batch.push(Imported {
+                    lamport: ch.lamport(),
+                    peer: ch.peer(),
+                    start: ch.id().counter,
+                    last: ch.id_last().counter,
+                    deps: ch.deps().clone(),
+                    markers,
+                });
+            }
+        }
+        batch.sort_by_key(|c| (c.lamport, c.peer, c.start));
+
+        let mut touched: FxHashSet<BranchId> = FxHashSet::default();
+        let mut attr = self.attribution(this).lock();
+        for c in batch {
+            // Segments `(first counter, last counter, branch)`: the prefix
+            // before the first marker is attributed by deps; each marker
+            // attributes the ops from itself up to the next marker.
+            let mut segments: SmallVec<[(Counter, Counter, BranchId); 2]> = SmallVec::new();
+            let first_marker = c.markers.first().map(|(k, _)| *k);
+            if first_marker != Some(c.start) {
+                let seg_last = first_marker.map_or(c.last, |k| k - 1);
+                match attr.branch_of_deps(&c.deps) {
+                    Ok(b) => segments.push((c.start, seg_last, b)),
+                    Err(reason) => {
+                        tracing::warn!(
+                            "index attribution: quarantined {}..={} of peer {}: {:?}",
+                            c.start,
+                            seg_last,
+                            c.peer,
+                            reason
+                        );
+                        attr.quarantined.push((ID::new(c.peer, c.start), reason));
+                    }
+                }
+            }
+            for (i, (k, b)) in c.markers.iter().enumerate() {
+                let seg_last = c.markers.get(i + 1).map_or(c.last, |(n, _)| *n - 1);
+                segments.push((*k, seg_last, b.clone()));
+            }
+            for (s, l, b) in segments {
+                attr.ensure_run(c.peer, s, &b);
+                let mut f = attr.tips.get(&b).cloned().unwrap_or_default();
+                f.push(ID::new(c.peer, l));
+                match shrink_frontiers(&f, &ol.dag) {
+                    Ok(nf) => {
+                        if attr.tips.get(&b) != Some(&nf) {
+                            attr.tips.insert(b.clone(), nf);
+                            touched.insert(b);
                         }
+                    }
+                    Err(id) => {
+                        tracing::warn!(
+                            "index attribution: id {id} of branch {b} not in the DAG; quarantined"
+                        );
+                        attr.quarantined
+                            .push((ID::new(c.peer, s), QuarantineReason::NotInDag(id)));
                     }
                 }
             }
         }
-        let mut touched: FxHashSet<BranchId> = FxHashSet::default();
-        let mut lineage = self.lineage(this).lock();
-        for (b, p) in lineage_ops {
-            let entry = lineage.entry(b.clone()).or_default();
-            if !entry.contains(&p) {
-                entry.push(p);
-            }
-            touched.insert(b);
-        }
-        for cp in change_peers {
-            for (b, peers) in lineage.iter() {
-                if peers.contains(&cp) {
-                    touched.insert(b.clone());
-                }
-            }
-        }
-        drop(lineage);
+        drop(attr);
+        drop(ol);
         touched.into_iter().collect()
     }
 }
@@ -204,7 +387,8 @@ impl HeadPolicy for Delegated {
     }
 
     /// Publish this commit's new tip into the index: `docs[doc].heads[peer] = c`.
-    fn after_commit(&self, _this: &MultiHeadDoc<Self>, b: &BranchId, last: ID) {
+    fn after_commit(&self, _this: &MultiHeadDoc<Self>, b: &BranchId, committed: IdSpan) {
+        let last = committed.id_last();
         let _ = self.index.record_head(b, &self.id, last.peer, last.counter);
     }
 
@@ -262,11 +446,11 @@ impl HeadPolicy for Manual {
             .unwrap_or_default())
     }
 
-    fn after_commit(&self, _this: &MultiHeadDoc<Self>, b: &BranchId, last: ID) {
+    fn after_commit(&self, _this: &MultiHeadDoc<Self>, b: &BranchId, committed: IdSpan) {
         self.targets
             .lock()
             .unwrap()
-            .insert(b.clone(), Frontiers::from_id(last));
+            .insert(b.clone(), Frontiers::from_id(committed.id_last()));
     }
 
     fn after_import(&self, _this: &MultiHeadDoc<Self>, _status: &ImportStatus) -> Vec<BranchId> {

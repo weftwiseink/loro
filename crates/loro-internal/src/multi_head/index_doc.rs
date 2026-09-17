@@ -1,63 +1,131 @@
-use crate::version::Frontiers;
-use loro_common::{Counter, InternalString, LoroResult, PeerID, ID};
+use rustc_hash::FxHashMap;
 
-use super::policy::lineage_name;
+use std::cmp::Ordering;
+
+use crate::version::{shrink_frontiers, Frontiers};
+use loro_common::{Counter, InternalString, Lamport, LoroError, LoroResult, PeerID, ID};
+
+use super::policy::{BRANCH_MERGE_KEY, BRANCH_NAME_KEY, BRANCH_ROOT, QuarantineReason};
 use super::ROOT_HEAD_ID;
 use super::*;
 
-/// The repo's index doc. Its heads hold only frontiers: a root map
-/// `docs: LoroMap<DocId, LoroMap<"heads", LoroMap<PeerID, Counter>>>` plus one
-/// root list per branch, `lineage:<b>`. No weft filesystem metadata (that is a
+/// The repo's index doc. Its heads hold only frontiers: TWO root maps total, a
+/// `docs: LoroMap<DocId, LoroMap<"heads", LoroMap<PeerID, Counter>>>` and a
+/// `branch` map whose `name` key set (`branch.name = "<b>"`) is a branch's
+/// creation MARKER (see `SelfRooted`). No weft filesystem metadata (that is a
 /// TS-side content doc). The only types that appear are `ID`/`Frontiers`/
 /// `DocId`/`BranchId`.
 pub type IndexDoc = MultiHeadDoc<SelfRooted>;
 
 impl MultiHeadDoc<SelfRooted> {
-    /// Establish the first (genesis) branch, bound to the pinned root head, and
-    /// seed its lineage with the root's peer. Must be called once before other
-    /// branches are created.
+    /// Establish the first (genesis) branch, bound to the pinned root head, by
+    /// writing its creation marker as the root's first op: `branch.name =
+    /// "<genesis>"`. The commit hook's `after_commit` sets `tips[genesis]` to
+    /// that op. Must be called once before other branches are created.
     pub fn init_genesis(&self, genesis: &BranchId) -> LoroResult<()> {
         let root = self.head_doc(ROOT_HEAD_ID).expect("root head exists");
-        let peer = root.peer_id();
         self.with_reg(|this, reg| this.rebind(reg, genesis, ROOT_HEAD_ID));
-        // The genesis lineage op, authored by the root's peer, written directly
-        // on the root head; then recorded, so target(genesis) == root's tip.
-        root.get_list(lineage_name(genesis).as_str())
-            .push(peer as i64)?;
+        root.get_map(BRANCH_ROOT)
+            .insert(BRANCH_NAME_KEY, genesis.as_str())?;
         root.commit_then_renew();
-        self.policy()
-            .lineage(self)
-            .lock()
-            .entry(genesis.clone())
-            .or_default()
-            .push(peer);
         Ok(())
     }
 
     /// Create `new` from `from` by EAGER copy: fork `from`'s index head (a state
-    /// of a few map entries), then write the copy's first op -- appending the
-    /// copy's fresh peer to `lineage:<new>` -- directly on the copy so its tip is
-    /// `[peer]` and `target(new)` is consistent. Every index head is thus born
-    /// `refs == 1`.
+    /// of a few map entries), then write the copy's first op -- the creation
+    /// marker, `branch.name = "<new>"` (overwriting the copied parent's name) --
+    /// directly on the copy. That op depends on `tips[from]` and names `new`, so
+    /// the commit hook's `after_commit` sets `tips[new]` to it. Every index head
+    /// is thus born `refs == 1`.
+    ///
+    /// The name travels as a plain map value (a `LoroValue::String` in the op
+    /// log), so `new` may be any string -- no container-id charset constraint.
+    ///
+    /// Errors if `new` already exists (mirroring `create_branch_at`): re-forking
+    /// a live name would otherwise mint a second creation marker for it, and
+    /// `tips[new]` would become the join of two unrelated lineages.
     pub fn create_index_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
+        if self.branches().contains(new) {
+            return Err(LoroError::ArgErr(
+                format!("cannot create_index_branch: branch '{new}' already exists")
+                    .into_boxed_str(),
+            ));
+        }
         let (from_head, _) = self.resolve(from, Intent::Read)?;
         let copy_doc = self.with_reg(|this, reg| {
             let c = this.copy_head(reg, from_head);
             this.rebind(reg, new, c);
             reg.heads[&c].doc.clone()
         });
-        let peer = copy_doc.peer_id();
         copy_doc
-            .get_list(lineage_name(new).as_str())
-            .push(peer as i64)?;
+            .get_map(BRANCH_ROOT)
+            .insert(BRANCH_NAME_KEY, new.as_str())?;
         copy_doc.commit_then_renew();
-        self.policy()
-            .lineage(self)
-            .lock()
-            .entry(new.clone())
-            .or_default()
-            .push(peer);
         Ok(())
+    }
+
+    /// Merge branch `from` into `into` REPO-WIDE with a SINGLE index marker op.
+    ///
+    /// Advance `into`'s index head to `join(tips[into], tips[from])`, whose CRDT
+    /// state IS the per-key union of every doc's `docs[D].heads` map (a mergeable
+    /// per-peer VV, so a concurrent same-branch writer on either side survives --
+    /// Spike S5), then commit ONE `branch.name = "<into>"` marker on it. The
+    /// per-doc `record_frontier` loop the content-level `BranchingDoc::merge`
+    /// walks is not needed here: the union of both branches' recorded frontiers
+    /// falls out of the checkout for free.
+    ///
+    /// The marker's dependencies ARE the join (a frontier spanning both
+    /// branches), so on a remote import the causal fold attributes it to `into`
+    /// (a marker needs no dep agreement) and `tips[into]` becomes `[marker]`.
+    /// `from` is untouched: a merge never moves the source's head or tips, so a
+    /// source merged into two targets is simply two marker ops on two heads.
+    ///
+    /// Returns `AlreadyContained` (nothing written) when `into` already contains
+    /// `from`, else `FastForward` / `Merged` (one marker written either way).
+    pub fn merge(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
+        let ti = self.policy().target(self, into)?;
+        let tf = self.policy().target(self, from)?;
+        let (outcome, join) = {
+            let ol = self.oplog.lock();
+            let outcome = match ol.dag.cmp_frontiers(&ti, &tf).map_err(LoroError::from)? {
+                Some(Ordering::Equal) | Some(Ordering::Greater) => {
+                    return Ok(MergeOutcome::AlreadyContained)
+                }
+                Some(Ordering::Less) => MergeOutcome::FastForward,
+                None => MergeOutcome::Merged,
+            };
+            // The join: shrink(union of both tips' ids). Every id of `from` is in
+            // the union, so no op is dropped.
+            let mut u = ti.clone();
+            for id in tf.iter() {
+                u.push(id);
+            }
+            (
+                outcome,
+                shrink_frontiers(&u, &ol.dag).map_err(LoroError::FrontiersNotFound)?,
+            )
+        };
+        // Bind `into` (at tips[into], refs == 1 eager), advance its head to the
+        // join, and commit the single merge marker. The commit hook's
+        // `after_commit` sets `tips[into]` to the marker.
+        //
+        // The marker goes on the `branch.merge` key as "<seq>:<into>", NOT on
+        // `branch.name`: at the join `branch.name` may already equal `into`, and
+        // a same-value map set emits NO op -- which would leave the merge with no
+        // op to carry it (dropping it locally and on every peer). The `<seq>`
+        // prefix, read-then-incremented from the current merge value, guarantees
+        // the set writes a fresh value and always emits. See `BRANCH_MERGE_KEY`.
+        self.resolve(into, Intent::Read)?;
+        let doc = self.advance_bound_writable(into, &join)?;
+        let branch_map = doc.get_map(BRANCH_ROOT);
+        let next_seq = branch_map
+            .get(BRANCH_MERGE_KEY)
+            .and_then(|v| v.into_string().ok())
+            .and_then(|s| s.split_once(':').and_then(|(seq, _)| seq.parse::<i64>().ok()))
+            .map_or(0, |n| n + 1);
+        branch_map.insert(BRANCH_MERGE_KEY, format!("{next_seq}:{into}"))?;
+        doc.commit_then_renew();
+        Ok(outcome)
     }
 
     /// Record `docs[doc].heads[peer] = counter` on `b`'s index head: the
@@ -148,18 +216,95 @@ impl MultiHeadDoc<SelfRooted> {
         })
     }
 
-    /// The branches this session knows, from the lineage map.
+    /// The branches this session knows: the keys of the derived `tips`.
     pub fn branches(&self) -> Vec<BranchId> {
-        self.policy().lineage(self).lock().keys().cloned().collect()
+        self.policy()
+            .attribution(self)
+            .lock()
+            .tips
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Every branch's index frontier (`{b: target(b)}`), the derived read-only
+    /// `active_branches` projection.
+    pub fn tips(&self) -> FxHashMap<BranchId, Frontiers> {
+        self.policy().attribution(self).lock().tips.clone()
+    }
+
+    /// The imported spans the causal fold refused to attribute (see
+    /// `QuarantineReason`), keyed by first op id. Empty on a well-formed
+    /// history; a non-empty report is the loud, local signal of a model
+    /// violation whose ops stayed in the op log without moving any `tips`.
+    pub fn quarantine_report(&self) -> Vec<(ID, QuarantineReason)> {
+        self.policy().attribution(self).lock().quarantined.clone()
+    }
+
+    /// The index frontier branch `b` was forked from: the DEPENDENCIES of `b`'s
+    /// creation marker (the causally-earliest op attributed to `b`).
+    ///
+    /// Empty for the genesis branch (its creation marker is the root op, which
+    /// has no deps) and for an unknown branch. For a branch created from a
+    /// parent, this is the parent's index tips at the moment `b` was forked --
+    /// the cross-doc fork point, which lives ONLY in the index (a content doc's
+    /// own log cannot answer where `b` forked for a doc nobody has touched on `b`
+    /// yet).
+    pub fn fork_point(&self, b: &BranchId) -> Frontiers {
+        let starts: Vec<ID> = {
+            let attr = self.policy().attribution(self).lock();
+            attr.runs
+                .iter()
+                .flat_map(|(peer, runs)| {
+                    runs.iter()
+                        .filter(|(_, br)| br == b)
+                        .map(move |(start, _)| ID::new(*peer, *start))
+                })
+                .collect()
+        };
+        let ol = self.oplog.lock();
+        starts
+            .into_iter()
+            .min_by_key(|id| {
+                ol.get_change_at(*id)
+                    .map(|c| c.lamport())
+                    .unwrap_or(Lamport::MAX)
+            })
+            .and_then(|id| ol.get_deps_of(id))
+            .unwrap_or_default()
+    }
+
+    /// The document ids branch `b` has frontier records for: the keys of its
+    /// `docs` map at `tips[b]`. Empty for an unknown branch.
+    ///
+    /// NOTE(claude-opus-4-8/index-causal-attribution): this returns the docs
+    /// RECORDED on `b` (a superset that INCLUDES docs inherited from `b`'s fork
+    /// parent), which is the useful "which docs does branch `b` know about" read.
+    /// The proposal's finer "docs `b`'s OWN changes touched since `fork_point`"
+    /// delta needs a per-doc state diff between `fork_point(b)` and `tips[b]`;
+    /// it is DEFERRED because no consumer requires it yet (see the Round 5
+    /// TS-reader enumeration: no weftwise caller reads the branching index).
+    pub fn touched_docs(&self, b: &BranchId) -> LoroResult<Vec<DocId>> {
+        self.read(b, |d| {
+            d.get_deep_value()
+                .as_map()
+                .and_then(|root| root.get("docs").cloned())
+                .and_then(|v| v.into_map().ok())
+                .map(|docs| docs.keys().map(|k| DocId::from(k.as_str())).collect())
+                .unwrap_or_default()
+        })
     }
 
     /// Remove a branch from the index: unbind its index head (retiring it) and
-    /// drop its lineage entry, so `branches()` no longer lists it and no
-    /// `bound`/`by_tip` entry dangles. (The durable cross-peer "discard" is the
-    /// wrapper's lifecycle log; this is the local registry cleanup.)
+    /// drop its `tips` entry, so `branches()` no longer lists it and no
+    /// `bound`/`by_tip` entry dangles. Its attribution runs are kept, so a
+    /// later-imported change that depends on its history still attributes (and
+    /// re-lists the branch, exactly as a re-imported marker did before). The
+    /// durable cross-peer "discard" is the wrapper's lifecycle log; this is the
+    /// local registry cleanup.
     pub fn delete_index_branch(&self, name: &BranchId) {
         self.unbind(name);
-        self.policy().lineage(self).lock().remove(name);
+        self.policy().attribution(self).lock().tips.remove(name);
     }
 
     /// The registry HeadId of branch `b`'s (self-rooted) index head, resolving

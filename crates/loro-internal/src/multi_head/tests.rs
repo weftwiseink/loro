@@ -4,7 +4,7 @@ use crate::handler::HandlerTrait;
 use crate::lock::{LockKind, LoroLockGroup};
 use crate::version::Frontiers;
 use crate::LoroDoc;
-use loro_common::{LoroError, LoroResult};
+use loro_common::{LoroError, LoroResult, PeerID, ID};
 use std::sync::{Arc, Mutex};
 
 fn b(s: &str) -> BranchId {
@@ -658,7 +658,7 @@ fn index_remote_lineage_import_rebinds_branch() {
         "feat unknown before import"
     );
 
-    // Importing A's history discovers `feat` via the lineage scan and
+    // Importing A's history discovers `feat` via the marker scan and
     // rebinds it (after_import -> resolve).
     bb.import(&updates).unwrap();
     assert!(
@@ -676,7 +676,7 @@ fn index_remote_lineage_import_rebinds_branch() {
 }
 
 #[test]
-fn index_target_is_join_of_lineage_peers() {
+fn index_target_is_join_of_same_name_branch_markers() {
     // Session A creates `shared` and records doc "A" on it.
     let a = IndexDoc::new(SelfRooted::new());
     a.init_genesis(&b("main")).unwrap();
@@ -692,16 +692,17 @@ fn index_target_is_join_of_lineage_peers() {
     assert!(doc_has_key(&bb, &b("shared"), "B"));
     assert!(!doc_has_key(&bb, &b("shared"), "A"), "B has not seen A yet");
 
-    // Import A's history: `shared` now has TWO lineage peers on B, and its
-    // frontier is their JOIN -> B's shared head shows BOTH records.
+    // Import A's history: `shared` now has TWO creation markers on B (one per
+    // session), and its frontier is their JOIN -> B's shared head shows BOTH
+    // records.
     bb.import(&a_updates).unwrap();
     assert!(
         doc_has_key(&bb, &b("shared"), "A"),
-        "join of lineage peers brought session A's record"
+        "join of both markers brought session A's record"
     );
     assert!(
         doc_has_key(&bb, &b("shared"), "B"),
-        "join of lineage peers kept session B's record"
+        "join of both markers kept session B's record"
     );
 }
 
@@ -1375,6 +1376,269 @@ fn create_branch_at_multi_peer_parent_excludes_other_peers() {
     );
 }
 
+// ------------------------------------------------------------------
+// Causal attribution keeps branches apart by their markers, not by peer
+// identity: one peer writing two branches' markers does not cross-pollute their
+// frontiers, and re-creating an existing branch name errors (the guard).
+// ------------------------------------------------------------------
+
+#[test]
+fn index_create_existing_branch_errors_and_no_peer_serves_two_branches() {
+    // S2. Single session, many branches (some forked from each other), plus
+    // content writes that call record_head. Re-forking an EXISTING name must
+    // error (the existence guard, mirroring create_branch_at) instead of
+    // silently minting a second creation marker for it; and via the normal
+    // API no index peer ever attributes to two branches.
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+
+    repo.create_branch(&b("b1"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("b2"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("b1a"), &b("b1")).unwrap();
+    let tips_before = repo.index().tips();
+    assert!(
+        matches!(
+            repo.create_branch(&b("b1a"), &b("b2")),
+            Err(LoroError::ArgErr(_))
+        ),
+        "re-forking an existing branch name errors"
+    );
+    assert_eq!(
+        repo.index().tips(),
+        tips_before,
+        "a refused re-fork moves no branch's frontier"
+    );
+
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "main").unwrap())
+        .unwrap();
+    g.branch("b1")
+        .write(|h| h.get_text("t").insert_unicode(0, "one").unwrap())
+        .unwrap();
+    g.branch("b2")
+        .write(|h| h.get_text("t").insert_unicode(0, "two").unwrap())
+        .unwrap();
+    g.branch("b1a")
+        .write(|h| h.get_text("t").insert_unicode(0, "onea").unwrap())
+        .unwrap();
+
+    let idx = repo.index();
+    let attr = idx.policy().attribution(idx).lock();
+    let multi: Vec<(PeerID, usize)> = attr
+        .runs
+        .iter()
+        .filter(|(_, runs)| runs.len() != 1)
+        .map(|(p, runs)| (*p, runs.len()))
+        .collect();
+    assert!(
+        multi.is_empty(),
+        "via the normal API every index peer has exactly one attribution run: {multi:?}"
+    );
+    assert!(attr.quarantined.is_empty());
+    assert_eq!(attr.tips.len(), 4, "main, b1, b2, b1a");
+}
+
+#[test]
+fn index_crafted_shared_peer_across_two_markers_attributes_causally() {
+    // S1. A hand-crafted history (bypassing the IndexDoc API) in which ONE
+    // peer writes the creation marker of `alpha`, then of `beta`, then an
+    // unrelated op. Attribution keys on the nearest marker in each op's causal
+    // past, NOT on peer identity, so one peer serving two branches does not
+    // collapse their frontiers: tips[alpha] = [create(alpha)], tips[beta] =
+    // [unrelated] (the unrelated op's nearest marker is beta's).
+    const SHARED_PEER: PeerID = 999;
+    let ext = LoroDoc::new();
+    ext.start_auto_commit();
+    ext.set_peer_id(SHARED_PEER).unwrap();
+    ext.get_map("branch").insert("name", "alpha").unwrap();
+    ext.commit_then_renew();
+    let create_alpha = ext.state_frontiers();
+    ext.get_map("branch").insert("name", "beta").unwrap();
+    ext.commit_then_renew();
+    ext.get_map("docs").insert("unrelated", "poison").unwrap();
+    ext.commit_then_renew();
+    let unrelated_tip = ext.state_frontiers();
+    let payload = ext.export(ExportMode::all_updates()).unwrap();
+
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.import(&payload).unwrap();
+
+    assert!(idx.branches().contains(&b("alpha")));
+    assert!(idx.branches().contains(&b("beta")));
+    let target_alpha = idx.policy().target(&idx, &b("alpha")).unwrap();
+    let target_beta = idx.policy().target(&idx, &b("beta")).unwrap();
+    assert_eq!(
+        target_alpha, create_alpha,
+        "alpha's frontier is its own creation marker, not the peer's latest op"
+    );
+    assert_eq!(
+        target_beta, unrelated_tip,
+        "beta's frontier is the unrelated op, whose nearest marker names beta"
+    );
+    assert_ne!(target_alpha, target_beta, "the two branches are kept apart");
+    assert!(
+        idx.quarantine_report().is_empty(),
+        "a well-formed (if odd) history quarantines nothing"
+    );
+}
+
+#[test]
+fn spike_scenario2_diamond_topology_forks_merges_are_stable() {
+    // A (genesis) -> fork B, fork C. Write on B, write on C. Merge B into A,
+    // merge C into A. Fork D from A's now-merged state. Verify D inherits
+    // both contributions (nothing dropped, nothing duplicated) and that
+    // target(B)/target(C) remain stable (still just their own lineage) after
+    // A absorbed them.
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    let a_after_base = g.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+
+    repo.create_branch(&b("B"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("C"), &b(GENESIS_BRANCH)).unwrap();
+
+    g.branch("B")
+        .write(|h| h.get_text("t").insert_unicode(4, "-b").unwrap())
+        .unwrap();
+    g.branch("C")
+        .write(|h| h.get_text("t").insert_unicode(4, "-c").unwrap())
+        .unwrap();
+    let b_frontier_before = g.frontier_of(&b("B")).unwrap();
+    let c_frontier_before = g.frontier_of(&b("C")).unwrap();
+
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("B")).unwrap(),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("C")).unwrap(),
+        MergeOutcome::Merged
+    );
+
+    let a_text = g
+        .branch(GENESIS_BRANCH)
+        .read(|h| h.get_text("t").to_string())
+        .unwrap();
+    assert!(
+        a_text.contains("-b") && a_text.contains("-c") && a_text.starts_with("base"),
+        "A absorbed both B's and C's contributions, got {a_text:?}"
+    );
+    assert_eq!(
+        a_text.chars().count(),
+        8,
+        "base(4) + -b(2) + -c(2), nothing dropped/duplicated, got {a_text:?}"
+    );
+
+    // Fork D from A's now-merged state.
+    repo.create_branch(&b("D"), &b(GENESIS_BRANCH)).unwrap();
+    let d_text = g
+        .branch("D")
+        .read(|h| h.get_text("t").to_string())
+        .unwrap();
+    assert_eq!(
+        d_text, a_text,
+        "D inherits exactly A's merged state, both contributions present once"
+    );
+
+    // B and C themselves are STABLE: still just their own (unmerged) content,
+    // unaffected by A's absorption of them.
+    assert_eq!(
+        g.frontier_of(&b("B")).unwrap(),
+        b_frontier_before,
+        "B's own frontier unaffected by being merged into A"
+    );
+    assert_eq!(
+        g.frontier_of(&b("C")).unwrap(),
+        c_frontier_before,
+        "C's own frontier unaffected by being merged into A"
+    );
+    assert_eq!(
+        g.branch("B").read(|h| h.get_text("t").to_string()).unwrap(),
+        "base-b",
+        "B still reads only its own lineage's content"
+    );
+    assert_eq!(
+        g.branch("C").read(|h| h.get_text("t").to_string()).unwrap(),
+        "base-c",
+        "C still reads only its own lineage's content"
+    );
+    // Sanity: A's post-base frontier is properly an ancestor (both merges
+    // strictly advanced it).
+    assert_ne!(a_after_base, g.frontier_of(&b(GENESIS_BRANCH)).unwrap());
+}
+
+#[test]
+fn spike_scenario3_repeated_merge_into_same_target_no_drop_no_dup() {
+    // Fork b from main, write, merge b into main. Continue writing on b.
+    // Merge b into main AGAIN. Confirm main reflects both merges (nothing
+    // dropped, nothing double-counted), i.e. merge does not assume "b is
+    // merged only once".
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feature"), &b(GENESIS_BRANCH))
+        .unwrap();
+
+    g.branch("feature")
+        .write(|h| h.get_text("t").insert_unicode(4, "-1").unwrap())
+        .unwrap();
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(
+        g.branch(GENESIS_BRANCH)
+            .read(|h| h.get_text("t").to_string())
+            .unwrap(),
+        "base-1"
+    );
+
+    // Continue writing on feature past the point already merged.
+    g.branch("feature")
+        .write(|h| h.get_text("t").insert_unicode(6, "-2").unwrap())
+        .unwrap();
+    // main also advances independently, concurrently with feature's second
+    // edit, so the second merge is a real join (not another fast-forward).
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(6, "-m").unwrap())
+        .unwrap();
+
+    let outcome2 = g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap();
+    assert_eq!(outcome2, MergeOutcome::Merged, "second merge is a real join");
+
+    let final_text = g
+        .branch(GENESIS_BRANCH)
+        .read(|h| h.get_text("t").to_string())
+        .unwrap();
+    assert!(
+        final_text.contains("-1") && final_text.contains("-2") && final_text.contains("-m"),
+        "both merges' content present, got {final_text:?}"
+    );
+    assert_eq!(
+        final_text.chars().count(),
+        10,
+        "base(4) + -1(2) + -2(2) + -m(2) = 10, no drop/dup across repeated merges, \
+         got {final_text:?}"
+    );
+    // A third merge (already contained) must be a true no-op.
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+        MergeOutcome::AlreadyContained
+    );
+    assert_eq!(
+        g.branch(GENESIS_BRANCH)
+            .read(|h| h.get_text("t").to_string())
+            .unwrap(),
+        final_text,
+        "a no-op AlreadyContained merge changes nothing"
+    );
+}
+
 #[test]
 fn create_branch_at_existing_name_errors() {
     let repo = BranchingDocRepo::open().unwrap();
@@ -1391,4 +1655,816 @@ fn create_branch_at_existing_name_errors() {
         doc.create_branch_at(&b("hist"), &f).is_err(),
         "re-create of an existing branch errors"
     );
+}
+
+#[test]
+fn index_snapshot_restore_preserves_tips_for_every_branch() {
+    // Does `SelfRooted`'s derived `tips` projection (folded from the marker
+    // history by `after_import` over `ImportStatus::success`) survive a Snapshot
+    // export/import into a COMPLETELY FRESH `IndexDoc`? Build a non-trivial
+    // multi-branch history (3 forks, one nested, one genuine divergent merge,
+    // and one branch created by TWO independent sessions), snapshot it, import
+    // the snapshot into a doc that has NEVER seen an incremental update, and
+    // compare `branches()` / `target(b)` before vs after exactly.
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+
+    // main (genesis) gets a base write.
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+
+    // Two forks off genesis, plus a NESTED fork off one of them.
+    repo.create_branch(&b("feat1"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("feat2"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("feat1-nested"), &b("feat1")).unwrap();
+
+    g.branch("feat1")
+        .write(|h| h.get_text("t").insert_unicode(4, "-f1").unwrap())
+        .unwrap();
+    g.branch("feat2")
+        .write(|h| h.get_text("t").insert_unicode(4, "-f2").unwrap())
+        .unwrap();
+    g.branch("feat1-nested")
+        .write(|h| h.get_text("t").insert_unicode(4, "-n").unwrap())
+        .unwrap();
+
+    // A genuine divergent merge (not a fast-forward): main advances
+    // independently of feat2 before the merge, forcing a real join.
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-m").unwrap())
+        .unwrap();
+    let outcome = g.merge(&b(GENESIS_BRANCH), &b("feat2")).unwrap();
+    assert_eq!(
+        outcome,
+        MergeOutcome::Merged,
+        "the merge must be a real divergent join, not a fast-forward"
+    );
+
+    // A branch created by TWO independent sessions (two creation markers naming
+    // one branch): a second, fully independent session creates the SAME branch
+    // name off its own genesis, then syncs with the first via a plain
+    // index-history import (mirrors `index_target_is_join_of_same_name_branch_markers`),
+    // so `shared`'s frontier is the join of both markers.
+    let session_b = IndexDoc::new(SelfRooted::new());
+    session_b.init_genesis(&b(GENESIS_BRANCH)).unwrap();
+    session_b
+        .create_index_branch(&b("shared"), &b(GENESIS_BRANCH))
+        .unwrap();
+    session_b
+        .record_head(&b("shared"), &d("OTHER"), 999, 3)
+        .unwrap();
+    let b_updates = session_b.export(ExportMode::all_updates()).unwrap();
+    repo.create_branch(&b("shared"), &b(GENESIS_BRANCH)).unwrap();
+    repo.index().import(&b_updates).unwrap();
+    assert_eq!(
+        repo.index().tips()[&b("shared")].len(),
+        2,
+        "sanity: 'shared' must be a genuine two-marker (two-id) frontier before the snapshot"
+    );
+
+    // --- BEFORE baseline: branches() + target(b) for every branch --------
+    let idx = repo.index();
+    let mut before_branches = idx.branches();
+    before_branches.sort();
+    let before_targets: Vec<(BranchId, LoroResult<Frontiers>)> = before_branches
+        .iter()
+        .map(|br| (br.clone(), idx.policy().target(idx, br)))
+        .collect();
+    for (br, t) in &before_targets {
+        assert!(t.is_ok(), "pre-snapshot target({br}) must resolve");
+    }
+
+    // --- Export a SNAPSHOT (not just updates) and import into a doc that --
+    // --- has NEVER seen ANY incremental update (only the snapshot bytes). -
+    let snap = idx.export(ExportMode::Snapshot).unwrap();
+    let restored = IndexDoc::new(SelfRooted::new());
+    let status = restored.import(&snap).unwrap();
+    // The concern under test: does a snapshot import's `ImportStatus::success`
+    // cover the FULL history (so `after_import`'s attribution walk sees every
+    // marker op), or does it come back empty/partial?
+    assert!(
+        !status.success.is_empty(),
+        "snapshot import's ImportStatus::success must be non-empty for after_import \
+         to rebuild tips at all"
+    );
+
+    let mut after_branches = restored.branches();
+    after_branches.sort();
+    assert_eq!(
+        before_branches, after_branches,
+        "branches() must match exactly after a fresh snapshot restore"
+    );
+
+    for (br, before) in &before_targets {
+        let after = restored.policy().target(&restored, br);
+        match (before, after) {
+            (Ok(bf), Ok(af)) => assert_eq!(
+                bf, &af,
+                "target({br}) frontier must match exactly before vs after snapshot restore"
+            ),
+            other => panic!("target({br}) resolution mismatch before/after: {other:?}"),
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// S0: a local record on a REMOTELY-DISCOVERED branch must survive the next
+// resolve and reach the peer. Control: `index_import_then_record_converges`
+// (identical, except session B CREATES `feat` locally before importing).
+// ------------------------------------------------------------------
+
+#[test]
+fn index_remote_discovered_branch_local_record_survives() {
+    // Session A creates `feat` and records doc D on it.
+    let a = IndexDoc::new(SelfRooted::new());
+    a.init_genesis(&b("main")).unwrap();
+    a.create_index_branch(&b("feat"), &b("main")).unwrap();
+    a.record_head(&b("feat"), &d("D"), 111, 7).unwrap();
+    let a_updates = a.export(ExportMode::all_updates()).unwrap();
+
+    // Session B never creates `feat`: it LEARNS it from A's import (the
+    // `loro_repo.ts` `ensureFsBranch` path), so its `feat` index head is minted
+    // by the resolve MATERIALIZE arm, which no `branch.name` marker names.
+    let bb = IndexDoc::new(SelfRooted::new());
+    bb.init_genesis(&b("main")).unwrap();
+    bb.import(&a_updates).unwrap();
+    let after_import = bb.recorded_ids(&b("feat"), &d("D")).unwrap();
+    assert_eq!(
+        after_import,
+        vec![ID::new(111, 7)],
+        "B discovered feat and materialized A's record"
+    );
+
+    // B records locally on the discovered branch.
+    bb.record_head(&b("feat"), &d("D"), 222, 9).unwrap();
+    let mut after_record = bb.recorded_ids(&b("feat"), &d("D")).unwrap();
+    after_record.sort();
+    assert_eq!(
+        after_record,
+        vec![ID::new(111, 7), ID::new(222, 9)],
+        "B's local record on a remotely-discovered branch is LOST on B: {after_record:?}"
+    );
+
+    // ... and the record reaches A.
+    let b_updates = bb.export(ExportMode::all_updates()).unwrap();
+    a.import(&b_updates).unwrap();
+    let mut on_a = a.recorded_ids(&b("feat"), &d("D")).unwrap();
+    on_a.sort();
+    assert_eq!(
+        on_a,
+        vec![ID::new(111, 7), ID::new(222, 9)],
+        "B's record never reached A: {on_a:?}"
+    );
+}
+
+// ------------------------------------------------------------------
+// S4: the single-pass lamport-ordered fold attributes EVERY change of a
+// multi-peer, multi-branch history (diamond + repeated merge + two-session
+// same-branch) on a cold import, with zero quarantines and tips equal to the
+// source's.
+// ------------------------------------------------------------------
+
+/// Build the S4 history on a fresh repo and return its index.
+fn s4_history() -> BranchingDocRepo {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+
+    // Diamond: B, C fork from main; both merge into main; D forks from the
+    // post-merge main and writes.
+    repo.create_branch(&b("B"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("C"), &b(GENESIS_BRANCH)).unwrap();
+    g.branch("B")
+        .write(|h| h.get_text("t").insert_unicode(4, "-b").unwrap())
+        .unwrap();
+    g.branch("C")
+        .write(|h| h.get_text("t").insert_unicode(4, "-c").unwrap())
+        .unwrap();
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("B")).unwrap(),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("C")).unwrap(),
+        MergeOutcome::Merged
+    );
+    repo.create_branch(&b("D"), &b(GENESIS_BRANCH)).unwrap();
+    g.branch("D")
+        .write(|h| h.get_text("t").insert_unicode(0, "d:").unwrap())
+        .unwrap();
+
+    // Repeated merge: feature merged into main twice (fast-forward, then a
+    // real join), then a redundant third merge.
+    repo.create_branch(&b("feature"), &b(GENESIS_BRANCH))
+        .unwrap();
+    g.branch("feature")
+        .write(|h| h.get_text("t").insert_unicode(0, "f1").unwrap())
+        .unwrap();
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+        MergeOutcome::FastForward
+    );
+    g.branch("feature")
+        .write(|h| h.get_text("t").insert_unicode(0, "f2").unwrap())
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "m").unwrap())
+        .unwrap();
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+        MergeOutcome::Merged
+    );
+    assert_eq!(
+        g.merge(&b(GENESIS_BRANCH), &b("feature")).unwrap(),
+        MergeOutcome::AlreadyContained
+    );
+
+    // Two sessions on one branch, with the S0 shape on the second: session 2
+    // learns `shared` from the repo, records on it (a materialize-arm peer),
+    // and the repo takes that record back; then the repo records again on top.
+    repo.create_branch(&b("shared"), &b(GENESIS_BRANCH)).unwrap();
+    repo.index()
+        .record_head(&b("shared"), &d("OTHER"), 500, 1)
+        .unwrap();
+    let session2 = IndexDoc::new(SelfRooted::new());
+    session2.init_genesis(&b(GENESIS_BRANCH)).unwrap();
+    session2
+        .import(&repo.index().export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    session2
+        .record_head(&b("shared"), &d("OTHER"), 600, 2)
+        .unwrap();
+    repo.index()
+        .import(&session2.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    repo.index()
+        .record_head(&b("shared"), &d("OTHER"), 500, 3)
+        .unwrap();
+    repo
+}
+
+#[test]
+fn index_cold_import_of_diamond_repeated_merge_two_session_history_attributes_all() {
+    let repo = s4_history();
+    let src = repo.index();
+    assert!(
+        src.quarantine_report().is_empty(),
+        "source quarantined: {:?}",
+        src.quarantine_report()
+    );
+    let src_tips = src.tips();
+    assert_eq!(src_tips.len(), 6, "main, B, C, D, feature, shared");
+
+    let bytes = src.export(ExportMode::all_updates()).unwrap();
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&bytes).unwrap();
+
+    let q = cold.quarantine_report();
+    assert!(q.is_empty(), "cold import quarantined {} span(s): {q:?}", q.len());
+    assert_eq!(cold.tips(), src_tips, "tips equal on the cold import");
+    let mut sb = src.branches();
+    sb.sort();
+    let mut cb = cold.branches();
+    cb.sort();
+    assert_eq!(sb, cb);
+    // The two-session branch reads back both sessions' records on the cold side.
+    let mut ids = cold.recorded_ids(&b("shared"), &d("OTHER")).unwrap();
+    ids.sort();
+    assert_eq!(ids, vec![ID::new(500, 3), ID::new(600, 2)]);
+}
+
+// ------------------------------------------------------------------
+// S7: quarantine is loud and local. A crafted NON-marker change whose deps
+// span two branches' frontiers is reported, its ops stay in the op log, and
+// neither branch's tips moves.
+// ------------------------------------------------------------------
+
+#[test]
+fn index_change_spanning_two_branches_is_quarantined_without_moving_tips() {
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("alpha"), &b("main")).unwrap();
+    idx.create_index_branch(&b("beta"), &b("main")).unwrap();
+    idx.record_head(&b("alpha"), &d("A"), 1, 1).unwrap();
+    idx.record_head(&b("beta"), &d("B"), 2, 2).unwrap();
+    let tips_before = idx.tips();
+
+    // A plain LoroDoc holding the index's whole history sits at the join of
+    // every branch tip; a local write there depends on alpha's AND beta's tips.
+    let ext = LoroDoc::new();
+    ext.start_auto_commit();
+    ext.import(&idx.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    let ext_deps = ext.state_frontiers();
+    assert!(
+        ext_deps.contains(&tips_before[&b("alpha")].as_single().unwrap())
+            && ext_deps.contains(&tips_before[&b("beta")].as_single().unwrap()),
+        "the crafted change depends on both branches' tips: {ext_deps:?}"
+    );
+    ext.get_map("docs").insert("poison", 1).unwrap();
+    ext.commit_then_renew();
+    let poison = ext.state_frontiers().as_single().unwrap();
+    let ext_bytes = ext.export(ExportMode::updates(&idx.oplog_vv())).unwrap();
+
+    idx.import(&ext_bytes).unwrap();
+
+    let q = idx.quarantine_report();
+    assert_eq!(q.len(), 1, "exactly the crafted change is quarantined: {q:?}");
+    assert_eq!(q[0].0, poison);
+    assert!(
+        matches!(&q[0].1, QuarantineReason::DepsDisagree(bs) if bs.len() == 2),
+        "reason names the disagreeing branches: {:?}",
+        q[0].1
+    );
+    assert_eq!(idx.tips(), tips_before, "no branch's tips moved");
+    assert!(
+        idx.oplog_vv().get_last(poison.peer) == Some(poison.counter),
+        "the quarantined ops stay in the op log"
+    );
+    // Both branches still read their own records only.
+    assert_eq!(
+        idx.recorded_ids(&b("alpha"), &d("A")).unwrap(),
+        vec![ID::new(1, 1)]
+    );
+    assert!(idx.recorded_ids(&b("alpha"), &d("B")).unwrap().is_empty());
+}
+
+// ------------------------------------------------------------------
+// The `branch.name` root-map marker: two root containers total (`branch` +
+// `docs`), and no branch-name charset constraint (the name is a map VALUE, not
+// a container id).
+// ------------------------------------------------------------------
+
+#[test]
+fn index_arbitrary_branch_names_round_trip() {
+    // A branch name is a map VALUE, not a container id, so a name with spaces,
+    // unicode, ':' or '/' round-trips through creation, snapshot export, cold
+    // import, and reads.
+    let names = ["a branch with spaces", "café ☕ 名前", "boc/abc123", "a:b:c"];
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    for (i, n) in names.iter().enumerate() {
+        idx.create_index_branch(&b(n), &b("main")).unwrap();
+        idx.record_head(&b(n), &d("G"), 1000 + i as u64, i as i32 + 1)
+            .unwrap();
+    }
+    let names = ["a branch with spaces", "café ☕ 名前", "boc/abc123", "a:b:c"];
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    for (i, n) in names.iter().enumerate() {
+        idx.create_index_branch(&b(n), &b("main")).unwrap();
+        idx.record_head(&b(n), &d("G"), 1000 + i as u64, i as i32 + 1)
+            .unwrap();
+    }
+
+    let snap = idx.export(ExportMode::Snapshot).unwrap();
+    let restored = IndexDoc::new(SelfRooted::new());
+    restored.import(&snap).unwrap();
+
+    assert!(restored.quarantine_report().is_empty());
+    for (i, n) in names.iter().enumerate() {
+        assert!(
+            restored.branches().contains(&b(n)),
+            "branch {n:?} restored from the snapshot"
+        );
+        assert!(
+            restored
+                .policy()
+                .target(&restored, &b(n))
+                .unwrap()
+                .as_single()
+                .is_some(),
+            "target({n:?}) resolves"
+        );
+        assert_eq!(
+            restored.recorded_ids(&b(n), &d("G")).unwrap(),
+            vec![ID::new(1000 + i as u64, i as i32 + 1)],
+            "record for {n:?} round-trips"
+        );
+    }
+}
+
+#[test]
+fn index_root_container_count_is_two_regardless_of_branch_count() {
+    // The index has exactly TWO root containers total (`branch` + `docs`),
+    // independent of branch count (the branch NAME is a map value, not a
+    // per-branch container).
+    use crate::arena::LoadAllFlag;
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    for i in 0..50 {
+        idx.create_index_branch(&b(&format!("feat{i}")), &b("main"))
+            .unwrap();
+    }
+    idx.record_head(&b("main"), &d("G"), 1, 1).unwrap();
+
+    let roots = idx.arena.top_level_root_containers(LoadAllFlag);
+    let names: Vec<_> = roots.iter().filter_map(|c| idx.arena.idx_to_id(*c)).collect();
+    assert_eq!(
+        roots.len(),
+        2,
+        "exactly `branch` and `docs` after 50 branches, not one root per branch: {names:?}"
+    );
+}
+
+// ------------------------------------------------------------------
+// Phase 3: repo-wide `IndexDoc::merge` is a SINGLE marker op (checkout + join),
+// not a per-doc `record_frontier` loop. Spike S5's per-key union of
+// `docs[D].heads` is the load-bearing premise; it lands here as a permanent
+// regression.
+// ------------------------------------------------------------------
+
+/// Total ops in the shared index op log (sum of the per-peer VV counters).
+fn total_ops(idx: &IndexDoc) -> i64 {
+    idx.oplog_vv().values().map(|c| *c as i64).sum()
+}
+
+#[test]
+fn index_merge_one_marker_unions_docs_per_key() {
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("into"), &b("main")).unwrap();
+    idx.create_index_branch(&b("from"), &b("main")).unwrap();
+
+    // The same doc D is recorded CONCURRENTLY on both branches (distinct peer
+    // keys), plus a doc E touched only on `from`.
+    idx.record_head(&b("into"), &d("D"), 111, 5).unwrap();
+    idx.record_head(&b("from"), &d("D"), 222, 7).unwrap();
+    idx.record_head(&b("from"), &d("E"), 333, 3).unwrap();
+
+    let ops_before = total_ops(&idx);
+    let outcome = idx.merge(&b("into"), &b("from")).unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged, "into and from diverged");
+
+    // Exactly ONE op was written by the merge (the marker), NOT one-per-doc.
+    assert_eq!(
+        total_ops(&idx) - ops_before,
+        1,
+        "merge writes a single index marker op, not one per merged doc"
+    );
+
+    // Per-key UNION of docs[D].heads survives (S5 property, now permanent): both
+    // concurrent writers' entries are present on `into` after the merge.
+    let mut d_ids = idx.recorded_ids(&b("into"), &d("D")).unwrap();
+    d_ids.sort();
+    assert_eq!(
+        d_ids,
+        vec![ID::new(111, 5), ID::new(222, 7)],
+        "both concurrent same-doc writers survive the merge (per-key VV union)"
+    );
+    // The doc touched only on `from` crossed the merge for free.
+    assert_eq!(
+        idx.recorded_ids(&b("into"), &d("E")).unwrap(),
+        vec![ID::new(333, 3)]
+    );
+    // `from` is untouched: a merge never moves the source.
+    assert_eq!(
+        idx.recorded_ids(&b("from"), &d("D")).unwrap(),
+        vec![ID::new(222, 7)]
+    );
+    assert_eq!(
+        idx.recorded_ids(&b("from"), &d("E")).unwrap(),
+        vec![ID::new(333, 3)]
+    );
+
+    // tips read correctly: into moved to a single marker, from unchanged, both
+    // branches still known, nothing quarantined.
+    assert!(
+        idx.tips()[&b("into")].as_single().is_some(),
+        "into's tip is the single merge marker"
+    );
+    let mut branches = idx.branches();
+    branches.sort();
+    assert_eq!(branches, vec![b("from"), b("into"), b("main")]);
+    assert!(idx.quarantine_report().is_empty());
+
+    // The merge marker is a new KEY on the `branch` map, not a new container:
+    // the P2 root-container count (branch + docs) is unchanged.
+    assert_eq!(
+        idx.arena
+            .top_level_root_containers(crate::arena::LoadAllFlag)
+            .len(),
+        2,
+        "a merge marker adds no root container"
+    );
+
+    // The merge marker (deps = the cross-branch join) folds cleanly on a COLD
+    // import: it is a marker, so the fold attributes it to `into` with no dep
+    // agreement needed and no quarantine.
+    let bytes = idx.export(ExportMode::all_updates()).unwrap();
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&bytes).unwrap();
+    assert!(
+        cold.quarantine_report().is_empty(),
+        "cold import of a merge marker quarantines nothing: {:?}",
+        cold.quarantine_report()
+    );
+    assert_eq!(cold.tips(), idx.tips(), "tips equal on the cold import");
+    let mut cold_d = cold.recorded_ids(&b("into"), &d("D")).unwrap();
+    cold_d.sort();
+    assert_eq!(cold_d, vec![ID::new(111, 5), ID::new(222, 7)]);
+}
+
+#[test]
+fn index_merge_fast_forward_and_already_contained() {
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("feat"), &b("main")).unwrap();
+    // Only feat advances -> main merging feat is a FAST-FORWARD.
+    idx.record_head(&b("feat"), &d("D"), 111, 5).unwrap();
+
+    let ops_before = total_ops(&idx);
+    assert_eq!(
+        idx.merge(&b("main"), &b("feat")).unwrap(),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(total_ops(&idx) - ops_before, 1, "ff still writes one marker");
+    assert_eq!(
+        idx.recorded_ids(&b("main"), &d("D")).unwrap(),
+        vec![ID::new(111, 5)],
+        "main fast-forwarded to feat's record"
+    );
+
+    // A second, redundant merge is AlreadyContained and writes NOTHING.
+    let ops_now = total_ops(&idx);
+    assert_eq!(
+        idx.merge(&b("main"), &b("feat")).unwrap(),
+        MergeOutcome::AlreadyContained
+    );
+    assert_eq!(total_ops(&idx) - ops_now, 0, "already-contained writes no op");
+}
+
+#[test]
+fn repo_merge_branch_content_catches_up() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+
+    // Diverge: feat and main each edit the same doc.
+    g.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(4, "-f").unwrap())
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-m").unwrap())
+        .unwrap();
+
+    let idx_ops_before = total_ops(repo.index());
+    let outcome = repo.merge_branch(&b(GENESIS_BRANCH), &b("feat")).unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+    // Exactly one INDEX op for the whole repo-wide merge (the marker).
+    assert_eq!(
+        total_ops(repo.index()) - idx_ops_before,
+        1,
+        "repo-wide merge is a single index marker, not one record per doc"
+    );
+
+    // main's content head caught up: it now contains BOTH divergent edits.
+    let text = g
+        .branch(GENESIS_BRANCH)
+        .read(|h| h.get_text("t").to_string())
+        .unwrap();
+    assert!(
+        text.contains("base") && text.contains("-f") && text.contains("-m"),
+        "merged main content contains base + both edits: {text:?}"
+    );
+    // feat is untouched by the merge.
+    assert!(repo.branches().contains(&b("feat")));
+}
+
+// ------------------------------------------------------------------
+// Phase 3 FIX (Round 4): the merge marker must ALWAYS emit an op, even when
+// `into` already won the branch.name LWW at the join. A same-value map set is a
+// no-op -> after_commit never fires -> the whole merge (docs union + from-only
+// docs) is silently lost, locally AND on cold import (no op propagates). These
+// three tests reproduce that loss on the pre-fix tree.
+// ------------------------------------------------------------------
+
+#[test]
+fn index_merge_into_lww_winner_still_emits_and_propagates() {
+    // merge(feat, main) with into = feat: feat's branch.name set is CAUSALLY
+    // AFTER main's (eager copy), so branch.name == "feat" at the join
+    // deterministically (no peer luck). Re-setting branch.name = "feat" would be
+    // a no-op. The merge marker must still emit so main's record reaches feat and
+    // propagates to a cold peer.
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("feat"), &b("main")).unwrap();
+    idx.record_head(&b("main"), &d("D"), 111, 5).unwrap();
+    idx.record_head(&b("feat"), &d("E"), 222, 7).unwrap();
+
+    let ops_before = total_ops(&idx);
+    assert_eq!(
+        idx.merge(&b("feat"), &b("main")).unwrap(),
+        MergeOutcome::Merged
+    );
+    assert_eq!(
+        total_ops(&idx) - ops_before,
+        1,
+        "the merge emits exactly one marker op even when `into` wins the name LWW"
+    );
+
+    // main's record crossed into feat (the docs union); feat kept its own.
+    assert_eq!(
+        idx.recorded_ids(&b("feat"), &d("D")).unwrap(),
+        vec![ID::new(111, 5)],
+        "main's record must reach feat"
+    );
+    assert_eq!(
+        idx.recorded_ids(&b("feat"), &d("E")).unwrap(),
+        vec![ID::new(222, 7)]
+    );
+
+    // Propagation: a remote peer sees only the op stream; with no marker op it
+    // would never learn the merge happened.
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&idx.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    assert!(cold.quarantine_report().is_empty());
+    assert_eq!(cold.tips(), idx.tips(), "merge propagates: cold tips equal");
+    assert_eq!(
+        cold.recorded_ids(&b("feat"), &d("D")).unwrap(),
+        vec![ID::new(111, 5)],
+        "the merge reaches a cold-importing peer"
+    );
+}
+
+#[test]
+fn index_merge_preserves_docs_in_both_sibling_creation_orders() {
+    // Two siblings off main; merge `from` into `into`. Their branch.name sets are
+    // CONCURRENT, so the LWW tie-break by (lamport, peer) decides the join value:
+    // the later-created sibling wins. Whichever order makes `into` win is the
+    // bug's trigger; BOTH orders must preserve the merge after the fix.
+    for (first, second) in [("into", "from"), ("from", "into")] {
+        let idx = IndexDoc::new(SelfRooted::new());
+        idx.init_genesis(&b("main")).unwrap();
+        idx.create_index_branch(&b(first), &b("main")).unwrap();
+        idx.create_index_branch(&b(second), &b("main")).unwrap();
+        idx.record_head(&b("into"), &d("D"), 111, 5).unwrap();
+        idx.record_head(&b("from"), &d("E"), 222, 7).unwrap();
+
+        assert_eq!(
+            idx.merge(&b("into"), &b("from")).unwrap(),
+            MergeOutcome::Merged,
+            "order {first}->{second}"
+        );
+        assert_eq!(
+            idx.recorded_ids(&b("into"), &d("E")).unwrap(),
+            vec![ID::new(222, 7)],
+            "from's record E lost in order {first}->{second}"
+        );
+        assert_eq!(
+            idx.recorded_ids(&b("into"), &d("D")).unwrap(),
+            vec![ID::new(111, 5)],
+            "into's own record D in order {first}->{second}"
+        );
+
+        let cold = IndexDoc::new(SelfRooted::new());
+        cold.import(&idx.export(ExportMode::all_updates()).unwrap())
+            .unwrap();
+        assert_eq!(
+            cold.tips(),
+            idx.tips(),
+            "cold tips equal in order {first}->{second}"
+        );
+        assert_eq!(
+            cold.recorded_ids(&b("into"), &d("E")).unwrap(),
+            vec![ID::new(222, 7)],
+            "from's record E lost on cold import, order {first}->{second}"
+        );
+    }
+}
+
+#[test]
+fn index_repeated_merge_into_same_target_each_emits() {
+    // Two merges into the SAME target, with `from` advancing between them. The
+    // second merge writes the same branch NAME as the first, so a name-keyed
+    // marker would no-op (dropping the second merge). The seq'd merge marker must
+    // emit on BOTH.
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    idx.create_index_branch(&b("into"), &b("main")).unwrap();
+    idx.create_index_branch(&b("from"), &b("main")).unwrap();
+
+    idx.record_head(&b("from"), &d("D"), 111, 1).unwrap();
+    idx.record_head(&b("into"), &d("Z"), 999, 1).unwrap(); // into diverges so 1st merge is real
+    assert_eq!(idx.merge(&b("into"), &b("from")).unwrap(), MergeOutcome::Merged);
+    assert_eq!(idx.recorded_ids(&b("into"), &d("D")).unwrap(), vec![ID::new(111, 1)]);
+
+    // `from` advances, then a SECOND merge into the same target.
+    idx.record_head(&b("from"), &d("E"), 222, 2).unwrap();
+    let ops_before = total_ops(&idx);
+    assert_eq!(idx.merge(&b("into"), &b("from")).unwrap(), MergeOutcome::Merged);
+    assert_eq!(
+        total_ops(&idx) - ops_before,
+        1,
+        "the second merge into the same target still emits one op"
+    );
+    assert_eq!(
+        idx.recorded_ids(&b("into"), &d("E")).unwrap(),
+        vec![ID::new(222, 2)],
+        "the second merge's new doc reaches into"
+    );
+
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&idx.export(ExportMode::all_updates()).unwrap()).unwrap();
+    assert_eq!(cold.tips(), idx.tips());
+    assert_eq!(cold.recorded_ids(&b("into"), &d("E")).unwrap(), vec![ID::new(222, 2)]);
+}
+
+// ------------------------------------------------------------------
+// Phase 4: derived reads (fork_point, touched_docs) + the tips-replace-vs-join
+// serialization resolution.
+// ------------------------------------------------------------------
+
+#[test]
+fn index_fork_point_and_touched_docs() {
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b("main")).unwrap();
+    // Genesis has no fork point (its creation marker is the root op, no deps).
+    assert_eq!(idx.fork_point(&b("main")), Frontiers::default());
+
+    idx.record_head(&b("main"), &d("D"), 111, 5).unwrap();
+    let main_after_d = idx.tips()[&b("main")].clone();
+
+    idx.create_index_branch(&b("feat"), &b("main")).unwrap();
+    // feat forked from main AFTER main recorded D: fork_point(feat) is main's
+    // tip at the fork moment (the cross-doc fork point).
+    assert_eq!(idx.fork_point(&b("feat")), main_after_d);
+
+    idx.record_head(&b("feat"), &d("E"), 222, 7).unwrap();
+    // touched_docs = docs recorded on the branch (D inherited from the fork, E
+    // feat's own).
+    let mut td = idx.touched_docs(&b("feat")).unwrap();
+    td.sort();
+    assert_eq!(td, vec![d("D"), d("E")]);
+    assert_eq!(idx.touched_docs(&b("main")).unwrap(), vec![d("D")]);
+    // Unknown branch -> empty.
+    assert!(idx.touched_docs(&b("nope")).unwrap().is_empty());
+    assert_eq!(idx.fork_point(&b("nope")), Frontiers::default());
+}
+
+#[test]
+fn index_local_commit_after_import_preserves_both_lineages() {
+    // The R1 tips-replace-vs-join nit, RESOLVED empirically. `after_commit`
+    // REPLACES tips[b] with the single committed op, while `after_import` JOINs.
+    // This is safe because a local write RESOLVES b to its current (possibly
+    // just-joined) tips BEFORE the edit, so the committed op causally DOMINATES
+    // the join and reading at the new single tip reconstructs the full per-peer
+    // VV. Interleave an import (fold JOINs to two ids) with a local commit
+    // (after_commit REPLACES to one id) on ONE IndexDoc and show no record lost.
+    let a = IndexDoc::new(SelfRooted::new());
+    a.init_genesis(&b("main")).unwrap();
+    a.create_index_branch(&b("shared"), &b("main")).unwrap();
+    a.record_head(&b("shared"), &d("D"), 111, 1).unwrap();
+    let a_updates = a.export(ExportMode::all_updates()).unwrap();
+
+    let bb = IndexDoc::new(SelfRooted::new());
+    bb.init_genesis(&b("main")).unwrap();
+    bb.create_index_branch(&b("shared"), &b("main")).unwrap();
+    bb.record_head(&b("shared"), &d("D"), 222, 2).unwrap();
+
+    // Import A: the fold JOINs both creation lineages -> tips is two ids.
+    bb.import(&a_updates).unwrap();
+    assert_eq!(bb.tips()[&b("shared")].len(), 2, "join of two lineages");
+    let mut both = bb.recorded_ids(&b("shared"), &d("D")).unwrap();
+    both.sort();
+    assert_eq!(both, vec![ID::new(111, 1), ID::new(222, 2)]);
+
+    // Local commit AFTER the import: after_commit REPLACES tips[shared] with the
+    // single new op. The write resolved shared to the joined tips first, so the
+    // new op dominates the join.
+    bb.record_head(&b("shared"), &d("E"), 222, 3).unwrap();
+    assert_eq!(
+        bb.tips()[&b("shared")].len(),
+        1,
+        "after_commit replaced the joined tips with one id"
+    );
+    // ...yet BOTH prior lineages' records still resolve (self-heal via causal
+    // dominance): the per-peer VV was never actually lost.
+    let mut still = bb.recorded_ids(&b("shared"), &d("D")).unwrap();
+    still.sort();
+    assert_eq!(
+        still,
+        vec![ID::new(111, 1), ID::new(222, 2)],
+        "both lineages' D records survive the tips REPLACE"
+    );
+    assert_eq!(
+        bb.recorded_ids(&b("shared"), &d("E")).unwrap(),
+        vec![ID::new(222, 3)]
+    );
+
+    // And it converges on a cold peer: the single-tip op carries the full past.
+    let cold = IndexDoc::new(SelfRooted::new());
+    cold.import(&bb.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    let mut cd = cold.recorded_ids(&b("shared"), &d("D")).unwrap();
+    cd.sort();
+    assert_eq!(cd, vec![ID::new(111, 1), ID::new(222, 2)]);
 }

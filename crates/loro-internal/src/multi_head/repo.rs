@@ -64,15 +64,35 @@ impl BranchingDocRepo {
         self.index.create_index_branch(new, from)
     }
 
+    /// Repo-wide merge of `from` into `into`: ONE index marker op (the union of
+    /// both branches' recorded doc frontiers falls out of the index checkout, no
+    /// per-doc record), then re-resolve every OPEN content doc so its branch
+    /// subscribers receive their catch-up event. A content doc not currently open
+    /// picks up the merged frontier lazily on reopen (the index carries it).
+    ///
+    /// Returns the index-level `MergeOutcome` (`AlreadyContained` when `into`
+    /// already contains `from`).
+    pub fn merge_branch(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
+        let outcome = self.index.merge(into, from)?;
+        // Catch every open content doc up to the merged index frontier. A resolve
+        // that cannot yet advance (ids not held) is non-fatal, exactly as the
+        // import ingest path treats it.
+        for doc in self.docs.lock().unwrap().values() {
+            let _ = doc.resolve(into, Intent::Read);
+        }
+        Ok(outcome)
+    }
+
     /// Repo-wide branch deletion: unbind the branch from every open content doc
     /// AND the index, and drop its index lineage. `branches()` then excludes it
     /// with no dangling `bound`/`by_tip` entry anywhere; the pinned root is never
     /// removed. Its committed ops stay in each doc's history (unreferenced).
     ///
     /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): this is LOCAL-ONLY
-    /// registry cleanup. The branch's `lineage:<name>` ops remain in the shared
-    /// index history, so a later sync that re-imports them re-discovers the
-    /// branch (`SelfRooted::after_import`). Durable cross-peer deletion /
+    /// registry cleanup. The branch's marker op (`branch.name = "<name>"`)
+    /// remains in the shared index history, so a later sync that re-imports it
+    /// re-discovers the branch (`SelfRooted::after_import`). Durable cross-peer
+    /// deletion /
     /// tombstoning is the wrapper's lifecycle-log job and a Phase-5 follow-up;
     /// this method does not attempt it.
     pub fn delete_branch(&self, name: &BranchId) -> LoroResult<()> {
