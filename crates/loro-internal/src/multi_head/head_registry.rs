@@ -462,4 +462,23 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             Ok(doc.clone())
         })
     }
+
+    /// Read the state at an ARBITRARY frontier `target` without disturbing any
+    /// bound head: materialize a throwaway scratch head (copy the pinned root,
+    /// check it out to `target`), run `f` on it, then retire the scratch. Used by
+    /// derived reads that must observe a doc's state at a frontier other than a
+    /// branch's current tip (e.g. a fork-point diff). Read-only: `f` must not
+    /// mutate (the scratch retires at `refs == 0`, which asserts no pending ops).
+    pub(super) fn read_at<R>(
+        &self,
+        target: &Frontiers,
+        f: impl FnOnce(&LoroDoc) -> R,
+    ) -> LoroResult<R> {
+        self.with_reg(|this, reg| {
+            let scratch = this.materialize(reg, target)?;
+            let out = f(&reg.heads[&scratch].doc);
+            this.retire(reg, scratch);
+            Ok(out)
+        })
+    }
 }
