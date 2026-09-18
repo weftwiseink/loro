@@ -264,13 +264,13 @@ impl<P: HeadPolicy> Branch<'_, P> {
     // nothing to freeze on `Branch`. `fork` / `fork_at` (eject) stay as the
     // history-adjacent affordance we keep.
 
-    /// Branch-scoped container subscription. A registry op: installed on the
-    /// branch's current head.
-    ///
-    /// > NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): re-installing the
-    /// > subscription on the new head across a copy-on-divergence / merge rebind
-    /// > (registry-owned `subs`, proposal L183/L411) is the Phase-3 BODY; this
-    /// > unit freezes the signature and installs on the current head.
+    /// Branch-scoped container subscription. Parity contract: it delivers the
+    /// same events for every update as a subscription on a plain `LoroDoc` would.
+    /// It fires on the branch's current head (local commits) AND, because the
+    /// registry re-installs it across a rebind and every head transition
+    /// synthesizes and dispatches its diff, on every advance / merge / import-
+    /// driven move of the branch. A move is tagged `Import` (live content), never
+    /// `Checkout`.
     pub fn subscribe(&self, cid: &ContainerID, cb: Subscriber) -> LoroResult<BranchSubscription> {
         self.doc.subscribe_branch(&self.name, Some(cid.clone()), cb)
     }

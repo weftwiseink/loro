@@ -89,7 +89,10 @@ pub(super) struct Registry {
     pub(super) bound: FxHashMap<BranchId, HeadId>,
     /// Branch-scoped subscriptions, registry-owned so they can be RE-INSTALLED
     /// on the branch's new head across a rebind (copy-on-divergence / merge),
-    /// instead of going silent on the old head.
+    /// instead of going silent on the old head. They are ALSO the delivery target
+    /// of a transition: `resolve` snapshots them and dispatches the move's
+    /// synthesized diff to them after the lock drops (parity contract -- a
+    /// branch-surfaced doc emits the same events a plain `LoroDoc` would).
     pub(super) subs: FxHashMap<BranchId, Vec<BranchSub>>,
     pub(super) next_id: HeadId,
     pub(super) next_sub_id: u64,

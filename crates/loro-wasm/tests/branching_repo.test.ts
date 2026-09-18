@@ -266,9 +266,10 @@ describe("Branch subscriptions deliver change events", () => {
 
   it("a TRUE 3-way merge delivers a catch-up event to the target subscriber", () => {
     // The discriminator the fast-forward case misses: two DIVERGENT edits at the same position
-    // force a real merge (outcome "merged"), which catches the target head up via
-    // `advance_in_place` -> `head.checkout`, enqueuing a `by:"checkout"` event. `merge` is
-    // decorated to auto-flush it, so the `main` subscriber must observe it with NO manual flush.
+    // force a real merge (outcome "merged"), which catches the target head up and dispatches the
+    // branch's diff tagged `by:"import"` (a merge/advance move reads as live content, NOT a
+    // detached `checkout`). `merge` is decorated to auto-flush it, so the `main` subscriber must
+    // observe it with NO manual flush.
     const repo = new BranchingDocRepo();
     const doc = repo.openDoc("G");
     doc.branch("main").write((h) => h.getText("t").insert(0, "base"));
@@ -285,7 +286,8 @@ describe("Branch subscriptions deliver change events", () => {
 
     // The catch-up event is delivered with no manual `callPendingEvents()`.
     expect(events.length).toBe(1);
-    expect(events[0].by).toBe("checkout"); // the copy/catch-up arm, not a local edit
+    expect(events[0].by).toBe("import"); // a merge/advance move reads as live content
+    expect(events[0].origin).toBe("advance");
     expect(events[0].events.some((ev) => ev.target === "cid:root-t:Text")).toBe(
       true,
     );
@@ -293,6 +295,83 @@ describe("Branch subscriptions deliver change events", () => {
     expect(
       doc.branch("main").read((h) => [...h.getText("t").toString()].length),
     ).toBe(6);
+
+    unsubscribe();
+  });
+
+  it("a FAST-FORWARD merge delivers a synthesized event (rebind-to-existing no longer silent)", () => {
+    // A fast-forward merge moves the target onto an EXISTING head (the rebind-to-existing arm).
+    // That arm used to be a pure pointer swap that delivered nothing; it now synthesizes and
+    // dispatches the target branch's diff(X -> Y). `merge` is decorated, so the `main` subscriber
+    // observes it with NO manual flush.
+    const repo = new BranchingDocRepo();
+    const doc = repo.openDoc("G");
+    doc.branch("main").write((h) => h.getText("t").insert(0, "base"));
+    repo.createBranch("feature", "main");
+    // Only feature diverges, so main <- feature is a pure fast-forward.
+    doc.branch("feature").write((h) => h.getText("t").insert(4, "-ff"));
+    expect(doc.contains("main", "feature")).toBe(false);
+
+    const events: LoroEventBatch[] = [];
+    const unsubscribe = doc.branch("main").subscribeRoot((e) => events.push(e));
+
+    expect(doc.merge("main", "feature")).toBe("fast-forward");
+
+    // The synthesized fast-forward diff is delivered synchronously (Phase 3).
+    expect(events.length).toBe(1);
+    expect(events[0].by).toBe("import"); // live content, not a detached checkout
+    expect(events[0].events.some((ev) => ev.target === "cid:root-t:Text")).toBe(
+      true,
+    );
+    expect(doc.branch("main").read((h) => h.getText("t").toString())).toBe(
+      "base-ff",
+    );
+
+    unsubscribe();
+  });
+
+  it("an event realized inside `read` is delivered before `read` returns to JS", () => {
+    // A content branch whose move is realized lazily on ACCESS (the common content-then-lineage
+    // arrival order, where `BranchingIndex.import` advances a branch's frontier but does NOT
+    // re-resolve open content docs, so the catch-up is realized on the NEXT `read`). `Branch.read`
+    // is decorated, so the branch subscriber's event flushes at `read`'s exit — NOT left in the
+    // global queue to be delivered by an unrelated later call (the pre-decoration leak this guards).
+    const UPDATE = { mode: "update" } as const;
+
+    // Peer A stage 1: main writes "base", feat forks (bound at the fork point).
+    const a = new BranchingDocRepo();
+    const da = a.openDoc("G");
+    da.branch("main").write((h) => h.getText("t").insert(0, "base"));
+    a.createBranch("feat", "main");
+    da.branch("feat").read((h) => h.getText("t").toString()); // bind feat at "base"
+    const lineageV1 = a.index().export(UPDATE);
+    const contentV1 = da.export(UPDATE);
+    // Peer A stage 2: feat diverges to "base-feat".
+    da.branch("feat").write((h) => h.getText("t").insert(4, "-feat"));
+    const lineageV2 = a.index().export(UPDATE);
+    const contentV2 = da.export(UPDATE);
+
+    // Peer B builds feat bound at "base" (stage 1), subscribes, then receives stage 2 as
+    // CONTENT-then-LINEAGE so the move is pending until the read.
+    const b = new BranchingDocRepo();
+    const db = b.openDoc("G");
+    b.index().import(lineageV1);
+    db.import(contentV1);
+
+    const events: LoroEventBatch[] = [];
+    const unsubscribe = db.branch("feat").subscribeRoot((e) => events.push(e));
+    db.branch("feat").read((h) => h.getText("t").toString()); // ensure bound at "base"
+
+    db.import(contentV2); // lands the -feat op; feat's index frontier is still v1, so NO move yet
+    b.index().import(lineageV2); // advances feat's frontier; content docs are NOT re-resolved
+    const beforeRead = events.length;
+
+    // The read realizes feat's move; the decoration flushes the event before `read` returns.
+    const text = db.branch("feat").read((h) => h.getText("t").toString());
+    expect(text).toBe("base-feat");
+    // At least one event was delivered synchronously within the read (no intervening call).
+    expect(events.length).toBeGreaterThan(beforeRead);
+    expect(events.slice(beforeRead).every((e) => e.by === "import")).toBe(true);
 
     unsubscribe();
   });

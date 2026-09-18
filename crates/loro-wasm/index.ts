@@ -6,6 +6,7 @@ import {
   BranchingDoc,
   BranchingDocHead,
   BranchingDocRepo,
+  BranchingIndex,
   EphemeralStoreWasm,
   PeerID,
   Container,
@@ -542,25 +543,30 @@ decorateMethods(BranchingDocHead.prototype, [
   "applyDiff",
 ]);
 
-// `Branch.write` commits its resolved content head internally, enqueuing branch-subscriber
-// events. Auto-flush them (mirroring `LoroDoc`/`BranchingDocHead.commit`) so a consumer doing
-// `subscribeRoot(cb); write(...)` observes the change with NO manual `callPendingEvents()`.
-// Only `write` mutates+commits+emits; `read`/`subscribe`/`subscribeRoot`/`fork` do not commit.
-decorateMethods(Branch.prototype, ["write"]);
+// `Branch` methods that can enqueue branch-subscriber events, auto-flushed here so a consumer
+// observes them with NO manual `callPendingEvents()`:
+//   - `write` commits its resolved content head, enqueuing the local-commit event.
+//   - `read`/`subscribe`/`subscribeRoot` each RESOLVE the branch first, and a resolve that
+//     MOVES the branch (a lazy realization on access -- the common content-then-lineage
+//     arrival order, where the move is realized on the next `read`) now dispatches its diff.
+//     Without this decoration that event would sit in the global pending queue and be flushed
+//     by an unrelated later decorated call (possibly on another repo), never inside the `read`.
+decorateMethods(Branch.prototype, ["write", "read", "subscribe", "subscribeRoot"]);
 
 // `BranchingDoc` mutating methods that enqueue branch-subscriber events, auto-flushed here:
 //   - `import`: lands remote ops then EAGERLY re-resolves every known branch (the `Delegated`
 //     policy's `after_import`); same precedent as the decorated `LoroDoc.import`.
-//   - `merge` / `advance`: a TRUE 3-way merge (and any advance that catches a head up by copy)
-//     takes the `advance_in_place` -> `head.checkout` arm, which enqueues a `by:"checkout"`
-//     event on the target branch's subscriber. Without this flush a subscriber goes STALE on a
-//     real merge.
-// WARN(claude-opus-4-8/loro-wasm-branchingdocrepo): a FAST-FORWARD advance/merge takes the REBIND
-// arm instead (re-points the subscription to an existing head at the target) and emits NO
-// `DiffEvent` at the Rust level, so on a fast-forward the subscriber is NOT notified. This is NOT
-// fixable in JS decoration (there is nothing enqueued to flush) — see the Phase-5 reactivity-gap
-// risk in the devlog; the fix is emit-on-rebind (Rust) or an explicit re-project consumer contract.
+//   - `merge` / `advance`: every advance arm (catch-up, copy+advance, and the fast-forward
+//     REBIND-to-existing arm) now synthesizes and dispatches the branch's `diff(X -> Y)`,
+//     tagged `by:"import"` with origin `"advance"`. Without this flush a subscriber goes STALE
+//     on a merge; a fast-forward is no longer silent (the rebind arm delivers a synthesized
+//     diff, so there IS an event to flush here).
 decorateMethods(BranchingDoc.prototype, ["import", "merge", "advance"]);
+
+// `BranchingIndex.import` lands lineage ops into the shared index op log. On a policy whose
+// `after_import` re-resolves content branches this can enqueue branch-subscriber events; flush
+// them at `import`'s exit so a lineage import delivers its consequences before returning to JS.
+decorateMethods(BranchingIndex.prototype, ["import"]);
 
 // `BranchingDocRepo.createBranch` commits a branch-marker op onto the shared INDEX op log (the
 // repo's `create_index_branch` sets the new branch's `branch.name` marker and `commit_then_renew`s).
