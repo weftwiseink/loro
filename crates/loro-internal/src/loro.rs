@@ -1876,6 +1876,72 @@ impl LoroDoc {
         result
     }
 
+    /// Checkout to `target` and RETURN the resulting `DocDiff`s WITHOUT emitting
+    /// them through this doc's observer. The registry (`MultiHeadDoc`) uses this
+    /// to move a head and then dispatch the diff to the branch's OWN subscribers
+    /// through a scratch observer (branch-scoped delivery, after the registry
+    /// lock drops), so a shared head's co-owner never receives another branch's
+    /// jump and no callback runs under the registry lock.
+    ///
+    /// It is the `diff()` trick applied once: force recording so a never-
+    /// subscribed fresh copy still records the jump (with `diff_start_version`
+    /// stamped at the pre-checkout frontier), drain the events, and restore the
+    /// prior recording state. Recording is cleared ONLY when it was off before
+    /// the call (a never-subscribed scratch / `CopyOf` head); on an already-
+    /// subscribed head recording is LEFT ON, because `take_events` re-stamps
+    /// `diff_start_version` to the last diff's `new_version`, which is the
+    /// correct `from` for that head's next local write.
+    pub(crate) fn checkout_collecting_events(
+        &self,
+        target: &Frontiers,
+        origin: InternalString,
+        by: EventTriggerKind,
+    ) -> LoroResult<Vec<DocDiff>> {
+        if self.is_owned() && !crate::multi_head::in_registry_op() {
+            return Err(LoroError::OwnedHeadOp("checkout_collecting_events"));
+        }
+        let was_detached = self.is_detached();
+        let (options, guard) = self.implicit_commit_then_stop();
+        let was_recording = {
+            let mut state = self.state.lock();
+            let was = state.is_recording();
+            if !was {
+                state.start_recording();
+            }
+            was
+        };
+        let result = self._checkout_without_emitting_with_event(target, true, true, origin, by);
+        let events = if result.is_ok() {
+            let mut state = self.state.lock();
+            let ev = state.take_events();
+            if !was_recording {
+                state.stop_and_clear_recording();
+            }
+            ev
+        } else {
+            if !was_recording {
+                self.state.lock().stop_and_clear_recording();
+            }
+            Vec::new()
+        };
+        drop(guard);
+        // Post-checkout txn / detached handling, identical to `checkout` (minus
+        // the emit): a registry-owned head keeps its peer across a checkout.
+        if self.config.detached_editing() {
+            if result.is_ok() && !self.is_owned() {
+                self.renew_peer_id();
+            }
+            self.renew_txn_if_auto_commit(options);
+        } else if result.is_err() {
+            if !was_detached {
+                self.renew_txn_if_auto_commit(options);
+            }
+        } else if !self.is_detached() {
+            self.renew_txn_if_auto_commit(options);
+        }
+        result.map(|_| events)
+    }
+
     /// NOTE: The caller of this method should ensure the txn is locked and set to None
     #[instrument(level = "info", skip(self))]
     pub(crate) fn _checkout_without_emitting(

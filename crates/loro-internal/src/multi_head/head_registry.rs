@@ -3,12 +3,17 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use crate::subscription::Subscriber;
+use crate::event::{DocDiff, EventTriggerKind};
+use crate::subscription::{Observer, Subscriber};
 use crate::sync::AtomicU8;
 use crate::utils::subscription::Subscription;
 use crate::version::Frontiers;
 use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
 use loro_common::{ContainerID, LoroError, LoroResult};
+
+/// A snapshot of a branch's subscriptions (container target + callback), taken
+/// under the registry lock and dispatched to AFTER the lock drops.
+pub(super) type SubsSnapshot = Vec<(Option<ContainerID>, Subscriber)>;
 
 use super::base::{install_forwarders, HeadOwner};
 use super::ROOT_HEAD_ID;
@@ -273,17 +278,74 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         }
     }
 
+    // --- branch-scoped dispatch --------------------------------------------
+
+    /// Snapshot branch `b`'s subscriptions (container target + callback) so the
+    /// diff of a transition can be delivered to them AFTER the registry lock
+    /// drops. Taken under the lock; dispatched to outside it.
+    pub(super) fn snapshot_subs(&self, reg: &Registry, b: &BranchId) -> SubsSnapshot {
+        reg.subs
+            .get(b)
+            .map(|v| v.iter().map(|s| (s.target.clone(), s.cb.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Deliver `events` to `subs` through a SCRATCH observer, reproducing a plain
+    /// doc's root / ancestor-match filtering (`Observer::emit_inner`). Branch-
+    /// scoped by construction: only this branch's callbacks are subscribed, so a
+    /// shared destination head's co-owner never receives the jump (constraint
+    /// C2). Runs AFTER the registry lock drops (constraint C3), so a callback may
+    /// safely re-enter the registry. The `Subscription` handles are held until
+    /// the last `emit` returns (dropping one unsubscribes its callback).
+    pub(super) fn dispatch_to_branch(&self, subs: SubsSnapshot, events: Vec<DocDiff>) {
+        if subs.is_empty() || events.is_empty() {
+            return;
+        }
+        let observer = Observer::new(self.arena.clone());
+        let mut handles = Vec::with_capacity(subs.len());
+        for (target, cb) in subs {
+            let handle = match &target {
+                Some(cid) => observer.subscribe(cid, cb),
+                None => observer.subscribe_root(cb),
+            };
+            handles.push(handle);
+        }
+        for ev in events {
+            observer.emit(ev);
+        }
+        drop(handles);
+    }
+
     // --- resolution --------------------------------------------------------
 
     /// Resolve branch `b` to the head it should use, copying-and-rebinding when
     /// a `Write` reaches a shared head. Returns the head id and a handle.
     ///
+    /// A transition that moves `b`'s tip delivers exactly one `DocDiff` batch for
+    /// `diff(old_tip -> new_tip)` to `b`'s subscribers (and nobody else), through
+    /// `dispatch_to_branch` AFTER the registry lock drops. A resolve that does
+    /// not move `b`'s tip delivers nothing.
+    ///
     /// Low-level: hands back a raw `LoroDoc`; only the `OwnedHeadOp` gates and
     /// the sink guard protect it. Consumers go through `Branch`.
     #[doc(hidden)]
     pub fn resolve(&self, b: &BranchId, intent: Intent) -> LoroResult<(HeadId, LoroDoc)> {
+        let (out, pending, subs) = self.resolve_collecting(b, intent)?;
+        self.dispatch_to_branch(subs, pending);
+        Ok(out)
+    }
+
+    /// The registry-locked core of `resolve`: picks an arm, moves `b`, and
+    /// returns the head handle PLUS the pending diff and a subscription snapshot
+    /// for the outer `resolve` to dispatch after the lock drops.
+    fn resolve_collecting(
+        &self,
+        b: &BranchId,
+        intent: Intent,
+    ) -> LoroResult<((HeadId, LoroDoc), Vec<DocDiff>, SubsSnapshot)> {
         self.with_reg(|this, reg| {
             let target = this.inner.policy.target(this, b)?;
+            let mut pending: Vec<DocDiff> = Vec::new();
 
             let mut id = match reg.bound.get(b).copied() {
                 Some(h) if reg.heads[&h].tip == target => h,
@@ -306,7 +368,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                             // the policy chose, so re-enable editing. This is a
                             // registry-internal move, so it correctly bypasses the
                             // external E1-A `attach`/`checkout_to_latest` gate.
-                            this.advance_in_place(reg, h, &target)?;
+                            pending = this.advance_in_place(reg, h, &target)?;
                             let doc = &reg.heads[&h].doc;
                             doc.set_detached(false);
                             doc.renew_txn_if_auto_commit(None);
@@ -323,8 +385,12 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                             // `AutoCommitNotStarted` (data loss). Clear it here in
                             // the caller (registry-internal, bypasses the E1-A
                             // gate). See the `advance_in_place` NOTE.
+                            // Phase 1 leaves the copy+advance arm's delivery
+                            // unchanged (still lossy): its diff is collected but
+                            // NOT dispatched until the Phase 2 rebind-first
+                            // restructure. `_events` is intentionally discarded.
                             let c = this.copy_head(reg, h);
-                            this.advance_in_place(reg, c, &target)?;
+                            let _events = this.advance_in_place(reg, c, &target)?;
                             let doc = &reg.heads[&c].doc;
                             doc.set_detached(false);
                             doc.renew_txn_if_auto_commit(None);
@@ -345,7 +411,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                             // "materialize read-only" only because the index/base
                             // never wrote to a materialized head; content branches
                             // do.)
-                            let m = this.materialize(reg, &target)?;
+                            // Phase 1: the materialize arm's diff is likewise
+                            // collected but not dispatched until Phase 2.
+                            let (m, _events) = this.materialize(reg, &target)?;
                             let doc = &reg.heads[&m].doc;
                             doc.set_detached(false);
                             doc.renew_txn_if_auto_commit(None);
@@ -366,22 +434,31 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 id = c;
             }
 
-            Ok((id, reg.heads[&id].doc.clone()))
+            let subs = this.snapshot_subs(reg, b);
+            Ok(((id, reg.heads[&id].doc.clone()), pending, subs))
         })
     }
 
-    /// Move a UNIQUELY-owned head to `target` by applying `diff(tip, target)`
-    /// (a checkout on the shared history). Precondition: `refs == 1`.
+    /// Move a head to `target` by applying `diff(tip, target)` (a checkout on the
+    /// shared history), COLLECTING the resulting `DocDiff`s instead of emitting
+    /// them through the head's observer. The caller decides whether to dispatch
+    /// the returned events to the branch's subscribers (a `resolve` that moved
+    /// the branch does; a scratch `read_at` discards them). Because the diff is
+    /// collected with recording forced on at the pre-checkout frontier, this is
+    /// correct even for a fresh, never-subscribed copy (the copy+advance and
+    /// materialize arms), whose diff the old emit path discarded.
     fn advance_in_place(
         &self,
         reg: &mut Registry,
         id: HeadId,
         target: &Frontiers,
-    ) -> LoroResult<()> {
-        let h = reg.heads.get_mut(&id).expect("head exists");
-        let old_tip = h.tip.clone();
+    ) -> LoroResult<Vec<DocDiff>> {
+        let (old_tip, doc) = {
+            let h = reg.heads.get(&id).expect("head exists");
+            (h.tip.clone(), h.doc.clone())
+        };
         if old_tip == *target {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `checkout` leaves
         // the head's `detached` flag set (state != the shared union) with its
@@ -403,14 +480,15 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         //     not this live-frontier resolve.)
         // In short: EVERY arm that hands back the branch's bound head at its
         // policy target clears; `advance_in_place` itself stays neutral.
-        h.doc.checkout(target)?;
-        let new_tip = h.doc.state_frontiers();
-        h.tip = new_tip.clone();
+        let events =
+            doc.checkout_collecting_events(target, "checkout".into(), EventTriggerKind::Checkout)?;
+        let new_tip = doc.state_frontiers();
+        reg.heads.get_mut(&id).expect("head exists").tip = new_tip.clone();
         if reg.by_tip.get(&old_tip) == Some(&id) {
             reg.by_tip.remove(&old_tip);
         }
         reg.by_tip.insert(new_tip, id);
-        Ok(())
+        Ok(events)
     }
 
     /// SECONDARY path: a frontier no live head sits at. Build a head by copying
@@ -422,10 +500,14 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     /// to the persistent-DocState follow-up SoW
     /// (`cdocs/proposals/2026-09-14-multiheaddoc-api-snapshots-persistent-state.md`).
     /// The root always exists (pinned), so this is always available.
-    fn materialize(&self, reg: &mut Registry, target: &Frontiers) -> LoroResult<HeadId> {
+    fn materialize(
+        &self,
+        reg: &mut Registry,
+        target: &Frontiers,
+    ) -> LoroResult<(HeadId, Vec<DocDiff>)> {
         let c = self.copy_head(reg, ROOT_HEAD_ID);
-        self.advance_in_place(reg, c, target)?;
-        Ok(c)
+        let events = self.advance_in_place(reg, c, target)?;
+        Ok((c, events))
     }
 
     /// Advance branch `b`'s BOUND, uniquely-owned (`refs == 1`) head to `target`
@@ -444,7 +526,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         b: &BranchId,
         target: &Frontiers,
     ) -> LoroResult<LoroDoc> {
-        self.with_reg(|this, reg| {
+        let (doc, pending, subs) = self.with_reg(|this, reg| {
             let id = *reg.bound.get(b).ok_or_else(|| {
                 LoroError::ArgErr(format!("cannot advance: branch '{b}' is not bound").into_boxed_str())
             })?;
@@ -452,15 +534,19 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 reg.heads[&id].refs, 1,
                 "advance_bound_writable requires a uniquely-owned (refs == 1) head"
             );
-            this.advance_in_place(reg, id, target)?;
-            let doc = &reg.heads[&id].doc;
+            let pending = this.advance_in_place(reg, id, target)?;
+            let doc = reg.heads[&id].doc.clone();
             // Same reasoning as the resolve catch-up arm: the head is now the
             // branch's live writable head at the merge join, so a following local
             // commit (the merge marker) must not fail `AutoCommitNotStarted`.
             doc.set_detached(false);
             doc.renew_txn_if_auto_commit(None);
-            Ok(doc.clone())
-        })
+            let subs = this.snapshot_subs(reg, b);
+            Ok::<_, LoroError>((doc, pending, subs))
+        })?;
+        // Deliver the advance's diff after the registry lock drops.
+        self.dispatch_to_branch(subs, pending);
+        Ok(doc)
     }
 
     /// Read the state at an ARBITRARY frontier `target` without disturbing any
@@ -475,7 +561,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         f: impl FnOnce(&LoroDoc) -> R,
     ) -> LoroResult<R> {
         self.with_reg(|this, reg| {
-            let scratch = this.materialize(reg, target)?;
+            // A scratch read discards the collected diff: no branch moved, so
+            // nothing is dispatched.
+            let (scratch, _events) = this.materialize(reg, target)?;
             let out = f(&reg.heads[&scratch].doc);
             this.retire(reg, scratch);
             Ok(out)

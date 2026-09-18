@@ -519,7 +519,6 @@ fn m11_sibling_isolation() {
 // RED (lock-order panic) on baseline in debug; GREEN after Phase 1 (dispatch
 // runs after the registry lock drops).
 #[test]
-#[ignore = "closed by Phase 1"]
 fn m12_reentrancy() {
     let md = MultiHeadDoc::new(Manual::new());
     md.bind(&b("main"), md.root_head_id());
