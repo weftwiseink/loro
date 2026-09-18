@@ -363,6 +363,35 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 Some(h) if reg.heads[&h].tip == target => h,
                 cur => match reg.by_tip.get(&target).copied() {
                     Some(h2) => {
+                        // Rebind-to-existing arm: a head (h2) already rests at
+                        // `target`, so the branch SHARES it instead of computing a
+                        // diff. `rebind` is a pointer swap that delivers nothing,
+                        // so synthesize `diff(X -> Y)` (X = the branch's old tip,
+                        // Y = target) from a PRIVATE scratch copy of the old head
+                        // and dispatch it to `b`'s subscribers ONLY. Emission
+                        // through h2's shared observer is never correct here: h2's
+                        // co-owner (a sibling branch) did not move (constraint C2).
+                        if let Some(old) = cur {
+                            let subs_nonempty =
+                                reg.subs.get(b).map(|v| !v.is_empty()).unwrap_or(false);
+                            if subs_nonempty && old != h2 {
+                                // Copy `old` BEFORE `rebind`, which may retire it
+                                // (`dec_refs` -> 0). Compute the diff on the scratch
+                                // doc DIRECTLY, never via `advance_in_place`, whose
+                                // `by_tip` re-key would clobber h2's key. The
+                                // scratch is a private copy (refs == 0, absent from
+                                // `by_tip`); `checkout_collecting_events` forces
+                                // recording on it so the diff survives.
+                                let scratch = this.copy_head(reg, old);
+                                let scratch_doc = reg.heads[&scratch].doc.clone();
+                                pending = scratch_doc.checkout_collecting_events(
+                                    &target,
+                                    "checkout".into(),
+                                    EventTriggerKind::Checkout,
+                                )?;
+                                this.retire(reg, scratch);
+                            }
+                        }
                         this.rebind(reg, b, h2);
                         h2
                     }

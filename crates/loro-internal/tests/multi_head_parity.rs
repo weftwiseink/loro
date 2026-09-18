@@ -410,7 +410,6 @@ fn setup_rebind_to_existing() -> (Branched, Frontiers, Vec<u8>) {
 // M8 rebind-to-existing: `main` moves onto `draft`'s existing head (by_tip hit).
 // RED on baseline (rebind is a pointer swap; no diff is ever computed).
 #[test]
-#[ignore = "closed by Phase 3"]
 fn m8_rebind_to_existing() {
     let (br, td, bytes) = setup_rebind_to_existing();
 
@@ -475,7 +474,6 @@ fn m9b_by_origin_resolve() {
 // M10 exactly-once: the rebind-to-existing move delivers exactly one event.
 // RED on baseline (0 delivered).
 #[test]
-#[ignore = "closed by Phase 3"]
 fn m10_exactly_once() {
     let (br, td, _bytes) = setup_rebind_to_existing();
     br.resolve_main_to(td);
@@ -550,7 +548,6 @@ fn m12_reentrancy() {
 // read re-realizes it (catch-up, "everything re-added"). RED on baseline (the
 // backwards rebind is silent).
 #[test]
-#[ignore = "closed by Phase 3"]
 fn m13_access_realized_backwards_rebind() {
     let br = Branched::open();
     // A sibling on the root keeps the pinned ROOT resting at [] while main
