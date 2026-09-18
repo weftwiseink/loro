@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex};
 use loro_internal::cursor::PosType;
 use loro_internal::encoding::ExportMode;
 use loro_internal::event::{DiffEvent, EventTriggerKind, Index, Path};
-use loro_internal::multi_head::{BranchId, BranchSubscription, Intent, Manual, MultiHeadDoc};
+use loro_internal::multi_head::{
+    BranchId, BranchSubscription, Intent, Manual, MultiHeadDoc, ResolveCause,
+};
 use loro_internal::version::Frontiers;
 use loro_internal::{ApplyDiff, LoroDoc, LoroValue, TextHandler};
 
@@ -174,10 +176,18 @@ impl Branched {
         }
     }
 
-    /// Resolve `main` to `target` (drives the transition + its dispatch).
+    /// Resolve `main` to `target` via the access path (drives the transition +
+    /// its dispatch); an access-realized move tags `("resolve", Import)`.
     fn resolve_main_to(&self, target: Frontiers) {
         self.md.policy().set_target(&b("main"), target);
         self.md.resolve(&b("main"), Intent::Read).unwrap();
+    }
+
+    /// Resolve `main` to `target` under an explicit cause (the import path tags
+    /// `(origin, Import)`, mirroring `after_import`'s realization of a move).
+    fn resolve_main_with(&self, target: Frontiers, cause: ResolveCause) {
+        self.md.policy().set_target(&b("main"), target);
+        self.md.resolve_with(&b("main"), Intent::Read, cause).unwrap();
     }
 }
 
@@ -429,7 +439,6 @@ fn m8_rebind_to_existing() {
 
 // M9a: import case -> Import + "" (strict, compared against the plain analog).
 #[test]
-#[ignore = "closed by Phase 4"]
 fn m9a_by_origin_import() {
     let r = remote();
     write_map_str(&r, "map", "a", "1");
@@ -441,7 +450,9 @@ fn m9a_by_origin_import() {
 
     let br = Branched::open();
     br.md.import(&bytes).unwrap();
-    br.resolve_main_to(r.state_frontiers());
+    // The import path realizes the move with the Import cause (origin ""),
+    // exactly as `MultiHeadDoc::import`'s after_import loop does.
+    br.resolve_main_with(r.state_frontiers(), ResolveCause::Import { origin: "".into() });
 
     assert_parity(
         &prec,
@@ -461,7 +472,6 @@ fn m9a_by_origin_import() {
 // `multi_head/tests.rs` (`resolve_with_advance_tags_import_advance`) since the
 // Manual harness drives moves through `resolve` (Access), not `merge`.
 #[test]
-#[ignore = "closed by Phase 4"]
 fn m9b_by_origin_resolve() {
     let (br, td, _bytes) = setup_rebind_to_existing();
     br.resolve_main_to(td);

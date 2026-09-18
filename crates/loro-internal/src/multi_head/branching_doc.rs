@@ -57,7 +57,8 @@ impl MultiHeadDoc<Delegated> {
     /// which SETS an exact frontier and must exclude other peers (`set_frontier`).
     pub fn advance(&self, b: &BranchId, to: &Frontiers) -> LoroResult<()> {
         self.index().record_frontier(b, self.doc_id(), to)?;
-        let _ = self.resolve(b, Intent::Read)?;
+        // An advance/merge moves the branch's live state forward: tag `Advance`.
+        let _ = self.resolve_with(b, Intent::Read, ResolveCause::Advance)?;
         Ok(())
     }
 

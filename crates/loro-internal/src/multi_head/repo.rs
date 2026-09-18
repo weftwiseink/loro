@@ -78,7 +78,7 @@ impl BranchingDocRepo {
         // that cannot yet advance (ids not held) is non-fatal, exactly as the
         // import ingest path treats it.
         for doc in self.docs.lock().unwrap().values() {
-            let _ = doc.resolve(into, Intent::Read);
+            let _ = doc.resolve_with(into, Intent::Read, ResolveCause::Advance);
         }
         Ok(outcome)
     }

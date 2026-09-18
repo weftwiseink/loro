@@ -9,7 +9,10 @@ use crate::sync::AtomicU8;
 use crate::utils::subscription::Subscription;
 use crate::version::Frontiers;
 use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
-use loro_common::{ContainerID, LoroError, LoroResult};
+use loro_common::{ContainerID, InternalString, LoroError, LoroResult};
+
+/// The `(origin, by)` an emitted transition diff carries (from `ResolveCause`).
+type EventTag = (InternalString, EventTriggerKind);
 
 /// A snapshot of a branch's subscriptions (container target + callback), taken
 /// under the registry lock and dispatched to AFTER the lock drops.
@@ -342,7 +345,20 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     /// the sink guard protect it. Consumers go through `Branch`.
     #[doc(hidden)]
     pub fn resolve(&self, b: &BranchId, intent: Intent) -> LoroResult<(HeadId, LoroDoc)> {
-        let (out, pending, subs) = self.resolve_collecting(b, intent)?;
+        self.resolve_with(b, intent, ResolveCause::Access)
+    }
+
+    /// `resolve`, tagging the delivered transition event with `cause` (so an
+    /// import-driven move reads as `Import`, a merge/advance as `("advance",
+    /// Import)`, and a lazy realization on access as `("resolve", Import)`).
+    #[doc(hidden)]
+    pub fn resolve_with(
+        &self,
+        b: &BranchId,
+        intent: Intent,
+        cause: ResolveCause,
+    ) -> LoroResult<(HeadId, LoroDoc)> {
+        let (out, pending, subs) = self.resolve_collecting(b, intent, cause)?;
         self.dispatch_to_branch(subs, pending);
         Ok(out)
     }
@@ -354,7 +370,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         &self,
         b: &BranchId,
         intent: Intent,
+        cause: ResolveCause,
     ) -> LoroResult<((HeadId, LoroDoc), Vec<DocDiff>, SubsSnapshot)> {
+        let ev = cause.to_event();
         self.with_reg(|this, reg| {
             let target = this.inner.policy.target(this, b)?;
             let mut pending: Vec<DocDiff> = Vec::new();
@@ -386,8 +404,8 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                                 let scratch_doc = reg.heads[&scratch].doc.clone();
                                 pending = scratch_doc.checkout_collecting_events(
                                     &target,
-                                    "checkout".into(),
-                                    EventTriggerKind::Checkout,
+                                    ev.0.clone(),
+                                    ev.1,
                                 )?;
                                 this.retire(reg, scratch);
                             }
@@ -406,9 +424,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                         // path). Registry-internal, so it bypasses the external
                         // E1-A `attach`/`checkout_to_latest` gate.
                         Some(h) if reg.heads[&h].refs == 1 => {
-                            let (id2, ev) =
-                                this.advance_via(reg, b, AdvanceSource::InPlace(h), &target, None)?;
-                            pending = ev;
+                            let (id2, evs) =
+                                this.advance_via(reg, b, AdvanceSource::InPlace(h), &target, None, &ev)?;
+                            pending = evs;
                             id2
                         }
                         // Copy+advance arm: a SHARED head (refs > 1) whose branch
@@ -417,14 +435,15 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                         // recording from the old tip), then advance the copy and
                         // deliver its diff. On error `b` is rebound back to `h`.
                         Some(h) => {
-                            let (c, ev) = this.advance_via(
+                            let (c, evs) = this.advance_via(
                                 reg,
                                 b,
                                 AdvanceSource::CopyOf(h),
                                 &target,
                                 Some(h),
+                                &ev,
                             )?;
-                            pending = ev;
+                            pending = evs;
                             c
                         }
                         // Materialize arm: a cold/unbound branch resolves to its
@@ -434,14 +453,15 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                         // write on the materialized head must succeed, so it is
                         // handed back writable.
                         None => {
-                            let (m, ev) = this.advance_via(
+                            let (m, evs) = this.advance_via(
                                 reg,
                                 b,
                                 AdvanceSource::CopyOf(ROOT_HEAD_ID),
                                 &target,
                                 None,
+                                &ev,
                             )?;
-                            pending = ev;
+                            pending = evs;
                             m
                         }
                     },
@@ -476,6 +496,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         reg: &mut Registry,
         id: HeadId,
         target: &Frontiers,
+        ev: &EventTag,
     ) -> LoroResult<Vec<DocDiff>> {
         let (old_tip, doc) = {
             let h = reg.heads.get(&id).expect("head exists");
@@ -504,8 +525,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         //     not this live-frontier resolve.)
         // In short: EVERY arm that hands back the branch's bound head at its
         // policy target clears; `advance_in_place` itself stays neutral.
-        let events =
-            doc.checkout_collecting_events(target, "checkout".into(), EventTriggerKind::Checkout)?;
+        let events = doc.checkout_collecting_events(target, ev.0.clone(), ev.1)?;
         let new_tip = doc.state_frontiers();
         reg.heads.get_mut(&id).expect("head exists").tip = new_tip.clone();
         if reg.by_tip.get(&old_tip) == Some(&id) {
@@ -539,17 +559,18 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         src: AdvanceSource,
         target: &Frontiers,
         fallback: Option<HeadId>,
+        ev: &EventTag,
     ) -> LoroResult<(HeadId, Vec<DocDiff>)> {
         let (id, pending) = match src {
             AdvanceSource::InPlace(id) => {
-                let pending = self.advance_in_place(reg, id, target)?;
+                let pending = self.advance_in_place(reg, id, target, ev)?;
                 (id, pending)
             }
             AdvanceSource::CopyOf(src_id) => {
                 let c = self.copy_head(reg, src_id);
                 // Rebind FIRST: moves refs and re-installs subs on the copy.
                 self.rebind(reg, b, c);
-                match self.advance_in_place(reg, c, target) {
+                match self.advance_in_place(reg, c, target, ev) {
                     Ok(pending) => (c, pending),
                     Err(e) => {
                         match fallback {
@@ -583,9 +604,10 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         &self,
         reg: &mut Registry,
         target: &Frontiers,
+        ev: &EventTag,
     ) -> LoroResult<(HeadId, Vec<DocDiff>)> {
         let c = self.copy_head(reg, ROOT_HEAD_ID);
-        let events = self.advance_in_place(reg, c, target)?;
+        let events = self.advance_in_place(reg, c, target, ev)?;
         Ok((c, events))
     }
 
@@ -613,7 +635,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 reg.heads[&id].refs, 1,
                 "advance_bound_writable requires a uniquely-owned (refs == 1) head"
             );
-            let pending = this.advance_in_place(reg, id, target)?;
+            // A merge/advance move: tag it as an advance-caused `Import`.
+            let ev = ResolveCause::Advance.to_event();
+            let pending = this.advance_in_place(reg, id, target, &ev)?;
             let doc = reg.heads[&id].doc.clone();
             // Same reasoning as the resolve catch-up arm: the head is now the
             // branch's live writable head at the merge join, so a following local
@@ -641,8 +665,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     ) -> LoroResult<R> {
         self.with_reg(|this, reg| {
             // A scratch read discards the collected diff: no branch moved, so
-            // nothing is dispatched.
-            let (scratch, _events) = this.materialize(reg, target)?;
+            // nothing is dispatched (the event tag is irrelevant here).
+            let ev = ResolveCause::Access.to_event();
+            let (scratch, _events) = this.materialize(reg, target, &ev)?;
             let out = f(&reg.heads[&scratch].doc);
             this.retire(reg, scratch);
             Ok(out)

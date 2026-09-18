@@ -115,7 +115,7 @@ impl MultiHeadDoc<SelfRooted> {
         // op to carry it (dropping it locally and on every peer). The `<seq>`
         // prefix, read-then-incremented from the current merge value, guarantees
         // the set writes a fresh value and always emits. See `BRANCH_MERGE_KEY`.
-        self.resolve(into, Intent::Read)?;
+        self.resolve_with(into, Intent::Read, ResolveCause::Advance)?;
         let doc = self.advance_bound_writable(into, &join)?;
         let branch_map = doc.get_map(BRANCH_ROOT);
         let next_seq = branch_map

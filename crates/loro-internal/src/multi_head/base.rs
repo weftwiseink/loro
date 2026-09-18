@@ -433,7 +433,10 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         // the next import (resolve errors are non-fatal here).
         let touched = self.inner.policy.after_import(self, &status)?;
         for b in touched {
-            let _ = self.resolve(&b, Intent::Read);
+            // The branch moves by imported (remote) ops: tag the delivered event
+            // `Import` (with the import's origin), exactly as a plain doc's import
+            // does. `MultiHeadDoc::import` carries no origin, so it is empty.
+            let _ = self.resolve_with(&b, Intent::Read, ResolveCause::Import { origin: "".into() });
         }
         if !self.history_subs.inner().is_empty() {
             self.history_subs.emit(&(), bytes.to_vec());

@@ -2543,3 +2543,41 @@ fn index_local_commit_after_import_preserves_both_lineages() {
     cd.sort();
     assert_eq!(cd, vec![ID::new(111, 1), ID::new(222, 2)]);
 }
+
+#[test]
+fn resolve_with_advance_tags_import_advance() {
+    // The merge/advance cause maps to `("advance", Import)`, so a branch-surfaced
+    // subscriber sees a merge-driven move as live `Import` content, not
+    // `Checkout`. (The parity harness covers the import and access causes; this
+    // pins the advance cause the harness drives through `resolve` cannot reach.)
+    use crate::event::{DiffEvent, EventTriggerKind};
+    let md = MultiHeadDoc::new(Manual::new());
+    md.bind(&b("main"), 0);
+    md.create_branch(&b("draft"), &b("main")).unwrap();
+    md.write(&b("draft"), |d| d.get_text("t").insert_unicode(0, "X").unwrap())
+        .unwrap();
+    let td = md.head_tip(md.bound_head(&b("draft")).unwrap()).unwrap();
+
+    let seen: Arc<Mutex<Vec<(EventTriggerKind, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let _sub = md
+        .subscribe_branch(
+            &b("main"),
+            None,
+            Arc::new(move |ev: DiffEvent| {
+                s2.lock()
+                    .unwrap()
+                    .push((ev.event_meta.by, ev.event_meta.origin.to_string()));
+            }),
+        )
+        .unwrap();
+
+    md.policy().set_target(&b("main"), td);
+    md.resolve_with(&b("main"), Intent::Read, ResolveCause::Advance)
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one advance event delivered");
+    assert_eq!(seen[0].0, EventTriggerKind::Import, "advance tagged Import");
+    assert_eq!(seen[0].1, "advance", "advance origin");
+}

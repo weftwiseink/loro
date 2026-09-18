@@ -84,3 +84,32 @@ pub enum Intent {
     Read,
     Write,
 }
+
+/// Why a `resolve` moved a branch, which determines the `by`/`origin` of the
+/// event it delivers so a branch-surfaced doc tags a move exactly as a plain
+/// doc would. An import- or advance-driven move, and a lazy realization on
+/// access, all move the branch's LIVE state forward by ops that are not this
+/// head's local commits, which is what `Import` means to every consumer;
+/// `Checkout` (detached time-travel, filtered as non-content) is reserved for a
+/// future explicit history view.
+#[derive(Debug, Clone)]
+pub enum ResolveCause {
+    /// A move driven by imported (remote) ops; `origin` is the import's origin.
+    Import { origin: InternalString },
+    /// A move driven by a local `advance` / `merge`.
+    Advance,
+    /// A lazy realization on access (`read` / `write` / `subscribe`).
+    Access,
+}
+
+impl ResolveCause {
+    /// The `(origin, by)` an emitted `DocDiff` carries for this cause.
+    pub(super) fn to_event(&self) -> (InternalString, crate::event::EventTriggerKind) {
+        use crate::event::EventTriggerKind;
+        match self {
+            ResolveCause::Import { origin } => (origin.clone(), EventTriggerKind::Import),
+            ResolveCause::Advance => ("advance".into(), EventTriggerKind::Import),
+            ResolveCause::Access => ("resolve".into(), EventTriggerKind::Import),
+        }
+    }
+}
