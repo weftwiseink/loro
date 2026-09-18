@@ -34,8 +34,9 @@ use loro_internal::{
     TreeParentId, UndoManager as InnerUndoManager, VersionVector as InternalVersionVector,
 };
 use loro_internal::multi_head::{
-    BranchId, BranchSubscription, BranchingDoc as BranchingDocContent, BranchingDocRepo as RepoInner,
-    IndexDoc, MergeOutcome,
+    BranchId, BranchSource, BranchSourceKind, BranchSubscription,
+    BranchingDoc as BranchingDocContent, BranchingDocRepo as RepoInner, ForkDiff, IndexDoc,
+    MergeOutcome,
 };
 use loro_internal::subscription::Subscriber;
 use parking_lot::lock_api::ReentrantMutex;
@@ -331,6 +332,12 @@ extern "C" {
     pub type JsIDs;
     #[wasm_bindgen(typescript_type = "Record<string, { peer: PeerID, counter: number }[]>")]
     pub type JsBranchTips;
+    #[wasm_bindgen(typescript_type = "Record<string, BranchSource>")]
+    pub type JsBranchSources;
+    #[wasm_bindgen(typescript_type = "ForkDiff")]
+    pub type JsForkDiff;
+    #[wasm_bindgen(typescript_type = "[ContainerID, Diff][]")]
+    pub type JsContainerDiffBatch;
     #[wasm_bindgen(typescript_type = "{ start: number, end: number }")]
     pub type JsRange;
     #[wasm_bindgen(typescript_type = "number|bool|string|null")]
@@ -557,6 +564,45 @@ fn frontiers_to_ids(frontiers: &Frontiers) -> JsResult<JsIDs> {
 
     let value: JsValue = js_arr.into();
     Ok(value.into())
+}
+
+/// The JS string for a `BranchSourceKind`. A single variant under the current
+/// index recovery (`runs` discards a marker's kind), so always `"create"`; the
+/// `BranchSourceKind` TS type keeps the contract's `"create" | "merge"` union.
+fn branch_source_kind_str(kind: BranchSourceKind) -> &'static str {
+    match kind {
+        BranchSourceKind::Create => "create",
+    }
+}
+
+/// A `BranchSource` as `{ op: OpId, kind: BranchSourceKind, parent: string | null }`.
+fn branch_source_to_js(src: &BranchSource) -> JsResult<JsValue> {
+    let obj = Object::new();
+    Reflect::set(&obj, &"op".into(), &id_to_js(&src.op)?)?;
+    Reflect::set(
+        &obj,
+        &"kind".into(),
+        &JsValue::from_str(branch_source_kind_str(src.kind)),
+    )?;
+    let parent = match &src.parent {
+        Some(p) => JsValue::from_str(p),
+        None => JsValue::NULL,
+    };
+    Reflect::set(&obj, &"parent".into(), &parent)?;
+    Ok(obj.into())
+}
+
+/// A `DiffBatch` as the `[ContainerID, Diff][]` array `doc.diff` produces (real
+/// `Diff`, not the `for_json` `JsonDiff` variant).
+fn diff_batch_to_js_array(batch: &DiffBatch) -> JsResult<Array> {
+    let arr = Array::new();
+    for (id, d) in batch.iter() {
+        let entry = Array::new();
+        entry.push(&id.to_string().into());
+        entry.push(&resolved_diff_to_js(d, false)?);
+        arr.push(&entry.into());
+    }
+    Ok(arr)
 }
 
 fn js_value_to_container_id(
@@ -2702,6 +2748,45 @@ interface BranchingDocHead<T extends Record<string, Container> = Record<string, 
 }
 "#;
 
+/// Hand-written TypeScript for the branch-diff producer surface's named types.
+/// The bound methods (`branchSources` / `diffFromFork` / `mergePreview` /
+/// `diffBranches`) are typed by wasm-bindgen from their `typescript_type` extern
+/// returns, which reference these named types; only the types are hand-authored.
+///
+/// The raw two-frontier `BranchingDocHead.diff` (the Rust delegate the
+/// conveniences' isolation is built beside) is deliberately NOT bound to wasm:
+/// no consumer datum calls it directly, so the conveniences are the only exposed
+/// content-diff entry points. Re-add a `BranchingDocHead.diff` binding only if a
+/// raw branch-inspection view later wants it.
+#[wasm_bindgen(typescript_custom_section)]
+const BRANCH_DIFF_TYPES: &str = r#"
+/**
+ * How a branch came into being. Always "create" in practice: the index
+ * attribution runs discard a marker's kind, so `branchSources()` reports every
+ * branch's CREATION marker. Kept as the contract's union for forward-compat.
+ */
+export type BranchSourceKind = "create" | "merge";
+/**
+ * Where a branch came from: the op-id of its creation marker plus the parent
+ * branch NAME (null for genesis). `op` is the marker op itself, distinct from
+ * `tips[b]` (the drifted current frontier) and `forkPoint(b)` (the parent frontier).
+ */
+export type BranchSource = {
+    readonly op: OpId;
+    readonly kind: BranchSourceKind;
+    readonly parent: string | null;
+};
+/**
+ * The branch-vs-fork-base content diff plus the base doc's shallow TEXT length,
+ * both from one `diffFromFork()` call (so the consumer's edited-weight needs no
+ * second round-trip). `diff` is the `[ContainerID, Diff][]` `doc.diff` produces.
+ */
+export type ForkDiff = {
+    readonly diff: [ContainerID, Diff][];
+    readonly mergeBaseLength: number;
+};
+"#;
+
 /// Hand-written TypeScript for the `skip_typescript` `subscribeLocalUpdates` on the
 /// branching doc/index (a `js_sys::Function` argument cannot generate a good
 /// signature), mirroring `LoroDoc.subscribeLocalUpdates`. `version()` /
@@ -2930,6 +3015,38 @@ impl BranchingIndex {
             .map(|d| d.to_string())
             .collect())
     }
+
+    /// Every branch's SOURCE as `{ [branch]: BranchSource }` -- the creation
+    /// marker's op-id, its kind (always `"create"` under the current recovery),
+    /// and the parent branch name (`null` for genesis). The holistic sibling of
+    /// `tips()` (where each branch IS) and `forkPoint()` (a branch's parent
+    /// FRONTIER): this surfaces the creation-marker op itself.
+    #[wasm_bindgen(js_name = "branchSources")]
+    pub fn branch_sources(&self) -> JsResult<JsBranchSources> {
+        let obj = Object::new();
+        for (branch, src) in self.0.branch_sources()? {
+            Reflect::set(
+                &obj,
+                &JsValue::from_str(&branch),
+                &branch_source_to_js(&src)?,
+            )?;
+        }
+        Ok(JsValue::from(obj).into())
+    }
+
+    /// The doc-ids whose recorded head DIFFERS between branches `a` and `b`: a
+    /// SYMMETRIC head-vs-head doc-set diff over the UNION of both branches' keys
+    /// (captures a doc changed on either side, unlike the asymmetric
+    /// `docsModifiedOnBranch`). Empty when `a == b` or their heads match.
+    #[wasm_bindgen(js_name = "diffDocs")]
+    pub fn diff_docs(&self, a: &str, b: &str) -> JsResult<Vec<String>> {
+        Ok(self
+            .0
+            .diff_docs(&a.into(), &b.into())?
+            .iter()
+            .map(|d| d.to_string())
+            .collect())
+    }
 }
 
 /// One content document: branch resolution delegates to the repo's index, with
@@ -2977,6 +3094,63 @@ impl BranchingDoc {
     #[wasm_bindgen(js_name = "frontierOf")]
     pub fn frontier_of(&self, b: &str) -> JsResult<JsIDs> {
         frontiers_to_ids(&self.0.frontier_of(&b.into())?)
+    }
+
+    /// What `branch` changed since it forked from `against`: `{ diff, mergeBaseLength }`.
+    /// The diff's baseline is the DYNAMIC merge-base (git-style GCA over the two
+    /// content frontiers), NOT the static `forkPoint`, so it stays correct after a
+    /// cross-merge. `mergeBaseLength` is the base doc's shallow TEXT length. Backs
+    /// the consumer's divergence weight AND per-doc line +/- from one call.
+    #[wasm_bindgen(js_name = "diffFromFork")]
+    pub fn diff_from_fork(&self, branch: &str, against: &str) -> JsResult<JsForkDiff> {
+        let fork: ForkDiff = self.0.diff_from_fork(&branch.into(), &against.into())?;
+        let obj = Object::new();
+        let diff_arr: JsValue = diff_batch_to_js_array(&fork.diff)?.into();
+        Reflect::set(&obj, &"diff".into(), &diff_arr)?;
+        Reflect::set(
+            &obj,
+            &"mergeBaseLength".into(),
+            &(fork.merge_base_length as f64).into(),
+        )?;
+        Ok(JsValue::from(obj).into())
+    }
+
+    /// What merging `source` into `target` would ADD to `target`: the additive
+    /// VV-union effect `diff(targetHead, union(target, source))`. EMPTY when
+    /// `source` is already contained in `target`, and free of spurious deletions
+    /// of `target`'s own edits (the union is a superset of `target`). NOT
+    /// head-vs-head. An unresolvable frontier throws (never a silent empty preview).
+    #[wasm_bindgen(js_name = "mergePreview")]
+    pub fn merge_preview(&self, target: &str, source: &str) -> JsResult<JsContainerDiffBatch> {
+        let batch = self.0.merge_preview(&target.into(), &source.into())?;
+        let arr = diff_batch_to_js_array(&batch)?;
+        let v: JsValue = arr.into();
+        Ok(v.into())
+    }
+
+    /// A raw head-vs-head content diff between two branches
+    /// (`diff(frontierOf(a), frontierOf(b))`). For a "compare two branches"
+    /// inspection view ONLY -- never a merge-base or merge-preview backing, which
+    /// it would mis-serve by double-counting each side's concurrent changes.
+    #[wasm_bindgen(js_name = "diffBranches")]
+    pub fn diff_branches(&self, a: &str, b: &str) -> JsResult<JsContainerDiffBatch> {
+        let batch = self.0.diff_branches(&a.into(), &b.into())?;
+        let arr = diff_batch_to_js_array(&batch)?;
+        let v: JsValue = arr.into();
+        Ok(v.into())
+    }
+
+    /// The oplog history between two content frontiers as update bytes, for
+    /// evidence / inspection. `to` omitted exports everything since `from`; a
+    /// bounded `to` exports the range `(from, to]`. An unresolvable frontier throws.
+    #[wasm_bindgen(js_name = "exportOplogSlice")]
+    pub fn export_oplog_slice(&self, from: Vec<JsID>, to: Option<Vec<JsID>>) -> JsResult<Vec<u8>> {
+        let from = ids_to_frontiers(from)?;
+        let to = match to {
+            Some(to) => Some(ids_to_frontiers(to)?),
+            None => None,
+        };
+        Ok(self.0.export_oplog_slice(&from, to.as_ref())?)
     }
 
     /// Export this content doc's shared history for cross-peer sync (byte-level). Mirrors
