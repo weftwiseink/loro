@@ -2581,3 +2581,398 @@ fn resolve_with_advance_tags_import_advance() {
     assert_eq!(seen[0].0, EventTriggerKind::Import, "advance tagged Import");
     assert_eq!(seen[0].1, "advance", "advance origin");
 }
+
+// ==================================================================
+// Branch-diff PRODUCER surface: branch_sources, diff_docs, the
+// BranchingDocHead::diff delegate, and the diff_from_fork / merge_preview /
+// diff_branches / export_oplog_slice conveniences.
+// (cdocs/proposals/2026-09-18-branch-diff-producer-fork-api.md)
+// ==================================================================
+
+use crate::event::Diff as EvDiff;
+use crate::handler::TextDelta;
+use crate::undo::DiffBatch;
+
+fn doc_id(s: &str) -> DocId {
+    s.into()
+}
+
+/// Every TextDelta across a DiffBatch (text containers only), in order.
+fn text_deltas(batch: &DiffBatch) -> Vec<TextDelta> {
+    batch
+        .iter()
+        .flat_map(|(_, diff)| match diff {
+            EvDiff::Text(t) => TextDelta::from_text_diff(t.iter()),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// The concatenation of every inserted string across a DiffBatch.
+fn inserted_text(batch: &DiffBatch) -> String {
+    text_deltas(batch)
+        .into_iter()
+        .filter_map(|td| match td {
+            TextDelta::Insert { insert, .. } => Some(insert),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The total number of deleted chars across a DiffBatch.
+fn delete_count(batch: &DiffBatch) -> usize {
+    text_deltas(batch)
+        .into_iter()
+        .map(|td| match td {
+            TextDelta::Delete { delete } => delete,
+            _ => 0,
+        })
+        .sum()
+}
+
+#[test]
+fn branch_sources_creation_marker_kind_and_parent() {
+    let repo = BranchingDocRepo::open().unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+
+    let sources = repo.index().branch_sources().unwrap();
+    let feat = sources.get(&b("feat")).expect("feat present");
+    assert_eq!(feat.kind, BranchSourceKind::Create);
+    assert_eq!(feat.parent, Some(b(GENESIS_BRANCH)), "feat forked from main");
+    assert_eq!(
+        feat.op.counter, 0,
+        "creation marker is the first op of feat's fresh index peer"
+    );
+
+    let main = sources.get(&b(GENESIS_BRANCH)).expect("genesis present");
+    assert_eq!(main.kind, BranchSourceKind::Create);
+    assert_eq!(main.parent, None, "genesis has no parent (empty deps)");
+}
+
+#[test]
+fn branch_sources_agree_with_fork_point() {
+    // Pins the shared min-lamport-run-start helper: get_deps_of(op) == fork_point.
+    let repo = BranchingDocRepo::open().unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    repo.create_branch(&b("feat2"), &b("feat")).unwrap();
+
+    let sources = repo.index().branch_sources().unwrap();
+    for (name, src) in &sources {
+        let deps = repo
+            .index()
+            .oplog
+            .lock()
+            .get_deps_of(src.op)
+            .unwrap_or_default();
+        assert_eq!(
+            deps,
+            repo.index().fork_point(name),
+            "get_deps_of(branch_sources()[{name}].op) == fork_point({name})"
+        );
+    }
+}
+
+#[test]
+fn branch_sources_stable_across_cross_merge() {
+    // FAILURE PICTURE: a branch created off main, then main cross-merged into it,
+    // MUST still report parent == main and the ORIGINAL creation op-id. A
+    // tips/frontier-based impl would drift to the post-merge frontier.
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "A").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+
+    let op_before = repo.index().branch_sources().unwrap()[&b("feat")].op;
+
+    // main advances, then cross-merge main -> feat.
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(1, "B").unwrap())
+        .unwrap();
+    repo.merge_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+
+    let after = repo.index().branch_sources().unwrap();
+    assert_eq!(
+        after[&b("feat")].op, op_before,
+        "creation-marker op-id is stable across a cross-merge (min-lamport causal root)"
+    );
+    assert_eq!(
+        after[&b("feat")].parent,
+        Some(b(GENESIS_BRANCH)),
+        "parent stays main after cross-merge"
+    );
+}
+
+#[test]
+fn diff_docs_symmetric_over_key_union() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let d1 = repo.open_doc("D1".into());
+    let d2 = repo.open_doc("D2".into());
+    let d3 = repo.open_doc("D3".into());
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+
+    // feat edits D1, D2; main edits D3 (which feat never touches).
+    d1.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(0, "x").unwrap())
+        .unwrap();
+    d2.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(0, "y").unwrap())
+        .unwrap();
+    d3.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "z").unwrap())
+        .unwrap();
+
+    // Symmetric: BOTH sides, including main-only D3 (the failure picture).
+    assert_eq!(
+        repo.index().diff_docs(&b(GENESIS_BRANCH), &b("feat")).unwrap(),
+        vec![doc_id("D1"), doc_id("D2"), doc_id("D3")],
+        "diff_docs captures both feat's D1/D2 and main-only D3"
+    );
+    // Asymmetric docs_modified_on_branch(feat) omits the main-only D3.
+    assert_eq!(
+        repo.index().docs_modified_on_branch(&b("feat")).unwrap(),
+        vec![doc_id("D1"), doc_id("D2")],
+        "docs_modified_on_branch is one-sided (drops D3)"
+    );
+    // Empty when a == b.
+    assert!(repo
+        .index()
+        .diff_docs(&b("feat"), &b("feat"))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn branching_doc_head_diff_passthrough_state_preserving() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "AB").unwrap())
+        .unwrap();
+    let f0 = g.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(2, "CD").unwrap())
+        .unwrap();
+    let f1 = g.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+
+    let (before, batch) = g
+        .branch(GENESIS_BRANCH)
+        .read(|h| (h.state_frontiers(), h.diff(&f0, &f1).unwrap()))
+        .unwrap();
+    let after = g.branch(GENESIS_BRANCH).read(|h| h.state_frontiers()).unwrap();
+
+    assert_eq!(before, after, "diff self-restores the head's frontier");
+    assert_eq!(inserted_text(&batch), "CD", "f0 -> f1 inserts CD");
+}
+
+#[test]
+fn diff_from_fork_dynamic_gca_baseline() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    // feat and main diverge concurrently.
+    g.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(4, "-feat").unwrap())
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-main").unwrap())
+        .unwrap();
+
+    let fork = g.diff_from_fork(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    assert_eq!(
+        inserted_text(&fork.diff),
+        "-feat",
+        "delta is feat's post-fork insert against the GCA base only"
+    );
+    assert_eq!(delete_count(&fork.diff), 0, "no deletion of main's concurrent edit");
+    assert_eq!(fork.merge_base_length, 4, "merge_base_length = len('base')");
+}
+
+#[test]
+fn diff_from_fork_dynamic_gca_moves_after_ff_merge() {
+    // FAILURE PICTURE: the baseline is the DYNAMIC merge-base (GCA), which MOVES
+    // as branches merge, NOT the static index fork_point. Here feat forks, main
+    // advances alone, main FAST-FORWARDS into feat, then feat edits. The GCA of
+    // feat and main is now main's head ("base-main"); a static fork_point("feat")
+    // baseline would be "base" and wrongly report "-main-feat" with
+    // merge_base_length == 4.
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    // main advances alone; feat does NOT edit concurrently (so the later merge is
+    // a clean fast-forward and the GCA moves up rather than retreating to base).
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-main").unwrap())
+        .unwrap();
+    repo.merge_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    // feat now edits atop the merged "base-main".
+    g.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(9, "-feat").unwrap())
+        .unwrap();
+
+    let fork = g.diff_from_fork(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    let inserted = inserted_text(&fork.diff);
+    assert_eq!(
+        inserted, "-feat",
+        "dynamic GCA = main's merged head: only feat's post-merge insert"
+    );
+    assert!(
+        !inserted.contains("-main"),
+        "a static fork_point baseline would wrongly include -main"
+    );
+    assert_eq!(
+        fork.merge_base_length, 9,
+        "merge_base_length = len('base-main') (dynamic base), not len('base')"
+    );
+    assert_eq!(delete_count(&fork.diff), 0);
+}
+
+#[test]
+fn merge_preview_additive_and_empty_for_contained() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    g.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(4, "-feat").unwrap())
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-main").unwrap())
+        .unwrap();
+
+    // What merging feat INTO main adds to main: feat's insert, no deletions of
+    // main's own "-main" edit (union is a superset of the target).
+    let preview = g.merge_preview(&b(GENESIS_BRANCH), &b("feat")).unwrap();
+    assert_eq!(inserted_text(&preview), "-feat", "merge adds feat's insert");
+    assert_eq!(
+        delete_count(&preview),
+        0,
+        "no spurious deletion of the target's own edit"
+    );
+
+    // Already-contained: after main -> feat, preview merging main into feat is empty.
+    repo.merge_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    let empty = g.merge_preview(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    assert_eq!(inserted_text(&empty), "", "already-contained preview is empty");
+    assert_eq!(delete_count(&empty), 0);
+}
+
+#[test]
+fn merge_preview_loud_error_on_unresolvable_frontier() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "x").unwrap())
+        .unwrap();
+    let valid = g.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+    let bogus = Frontiers::from_id(ID::new(999_999, 999));
+    assert!(
+        g.union_frontier(&valid, &bogus).is_err(),
+        "an unresolvable frontier is a LOUD error, never a silently-empty union"
+    );
+    assert!(g.union_frontier(&bogus, &valid).is_err());
+}
+
+#[test]
+fn diff_branches_head_vs_head() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    g.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(4, "-feat").unwrap())
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-main").unwrap())
+        .unwrap();
+
+    // Head-vs-head: transforming feat's head into main's counts feat's side as a
+    // deletion (why it must NOT back divergence / merge preview).
+    let batch = g.diff_branches(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    assert_eq!(inserted_text(&batch), "-main");
+    assert!(
+        delete_count(&batch) > 0,
+        "head-vs-head double-counts each side's concurrent change"
+    );
+}
+
+#[test]
+fn export_oplog_slice_round_trips() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "AA").unwrap())
+        .unwrap();
+    let from = g.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(2, "BB").unwrap())
+        .unwrap();
+    let to = g.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+
+    // Bounded slice (from, to] carries only the "BB" ops; base carries "AA".
+    let base = g
+        .export_oplog_slice(&Frontiers::default(), Some(&from))
+        .unwrap();
+    let slice = g.export_oplog_slice(&from, Some(&to)).unwrap();
+    assert!(!slice.is_empty());
+
+    let plain = LoroDoc::new();
+    plain.import(&base).unwrap();
+    plain.import(&slice).unwrap();
+    assert_eq!(
+        plain.get_text("t").to_string(),
+        "AABB",
+        "base + bounded slice reconstruct the full content"
+    );
+
+    // Open-ended slice from empty is everything.
+    let full = g
+        .export_oplog_slice(&Frontiers::default(), None)
+        .unwrap();
+    let plain2 = LoroDoc::new();
+    plain2.import(&full).unwrap();
+    assert_eq!(plain2.get_text("t").to_string(), "AABB");
+}
+
+#[test]
+fn conveniences_leave_head_frontiers_unchanged() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    g.branch("feat")
+        .write(|h| h.get_text("t").insert_unicode(4, "-feat").unwrap())
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "-main").unwrap())
+        .unwrap();
+
+    let before_feat = g.frontier_of(&b("feat")).unwrap();
+    let before_main = g.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+    let sf_feat = g.branch("feat").read(|h| h.state_frontiers()).unwrap();
+
+    let _ = g.diff_from_fork(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+    let _ = g.merge_preview(&b(GENESIS_BRANCH), &b("feat")).unwrap();
+    let _ = g.diff_branches(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
+
+    assert_eq!(g.frontier_of(&b("feat")).unwrap(), before_feat);
+    assert_eq!(g.frontier_of(&b(GENESIS_BRANCH)).unwrap(), before_main);
+    assert_eq!(
+        g.branch("feat").read(|h| h.state_frontiers()).unwrap(),
+        sf_feat,
+        "the scratch-head diffs never disturb feat's live head"
+    );
+}

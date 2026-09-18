@@ -162,7 +162,7 @@ impl Attribution {
 
     /// The single branch every dependency attributes to, or a loud error if the
     /// deps are unknown, disagree, or absent (all malformed-input cases).
-    fn branch_of_deps(&self, deps: &Frontiers) -> LoroResult<BranchId> {
+    pub(super) fn branch_of_deps(&self, deps: &Frontiers) -> LoroResult<BranchId> {
         let mut found: Option<BranchId> = None;
         for dep in deps.iter() {
             let b = self.branch_at(dep).ok_or_else(|| {

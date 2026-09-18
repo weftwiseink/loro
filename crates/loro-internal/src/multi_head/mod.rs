@@ -30,7 +30,7 @@
 //! shared op log via `LoroDoc::import_to_history` under the all-heads barrier,
 //! never materializing into a live head.
 
-use loro_common::InternalString;
+use loro_common::{InternalString, ID};
 
 mod base;
 mod branch;
@@ -44,7 +44,7 @@ mod tests;
 
 pub use base::{MultiHeadDoc, MultiHeadInner};
 pub use branch::{Branch, BranchSubscription, BranchingDocHead};
-pub use branching_doc::{BranchingDoc, MergeOutcome};
+pub use branching_doc::{BranchingDoc, ForkDiff, MergeOutcome};
 pub use index_doc::IndexDoc;
 pub use policy::{Attribution, Delegated, HeadPolicy, Manual, SelfRooted};
 pub use repo::{BranchingDocRepo, GENESIS_BRANCH};
@@ -54,6 +54,34 @@ pub(crate) use head_registry::in_registry_op;
 pub type BranchId = InternalString;
 pub type DocId = InternalString;
 pub type HeadId = u64;
+
+/// How a branch came into being, as recovered from the index attribution runs.
+///
+/// A single-variant enum today: the `runs` structure discards a marker's kind
+/// (it stores only `(start, BranchId)` per segment), so a run-based recovery
+/// classifies every branch's source as its CREATION marker and cannot
+/// distinguish merge markers. It is kept an enum so a future merge-source
+/// surface can add `Merge` without changing `BranchSource`'s shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchSourceKind {
+    /// The branch's creation marker (`branch.name = "<b>"`).
+    Create,
+}
+
+/// Where a branch came from: the op-id of its creation marker plus the branch
+/// it was forked from. The holistic sibling of `tips` (where each branch IS)
+/// and `fork_point` (a branch's parent FRONTIER): this surfaces the creation
+/// marker op ITSELF, which neither `tips` nor `fork_point` returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchSource {
+    /// The creation-marker op's own id (its `(peer, counter)`), not its deps.
+    pub op: ID,
+    /// Always [`BranchSourceKind::Create`] under the current recovery.
+    pub kind: BranchSourceKind,
+    /// The parent branch NAME (the branch of the marker's deps), or `None` for
+    /// genesis (whose creation marker is the root op, with no deps).
+    pub parent: Option<BranchId>,
+}
 
 /// The pinned root head's id. Created at `refs == 0` and NEVER dropped: it is
 /// the anchor `import` / `export` / `materialize` lean on (they need at least

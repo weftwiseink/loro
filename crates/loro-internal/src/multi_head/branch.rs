@@ -31,10 +31,13 @@ use super::*;
 /// It deliberately has NO `Deref`, NO `From`/inner accessor, and does NOT
 /// forward the history / attachment / identity ops (`import*`, `export*`,
 /// `checkout`, `attach`, `checkout_to_latest`, `detach`, `oplog_*`, `fork`,
-/// `set_peer_id`, `diff`, config setters, ...). Those touch the shared op log or
+/// `set_peer_id`, config setters, ...). Those touch the shared op log or
 /// the head's attachment and are incoherent on a registry head, so they are
 /// ABSENT AT THE TYPE LEVEL: `head.import(..)` / `head.checkout(..)` /
-/// `head.attach()` do not compile. `subscribe*` and `checkout` are head-safe but
+/// `head.attach()` do not compile. `diff` is the exception among the
+/// history-adjacent ops: it is an intentional read passthrough (parallel to
+/// `state_frontiers`), because `LoroDoc::diff` self-restores the head's
+/// attach-state and frontier on exit, leaving the head exactly as before. `subscribe*` and `checkout` are head-safe but
 /// NOT branch-correct (they must re-key/re-install on rebind) and so live on
 /// `Branch`, not here.
 ///
@@ -144,6 +147,15 @@ impl BranchingDocHead {
     }
     pub fn state_frontiers(&self) -> Frontiers {
         self.0.state_frontiers()
+    }
+    /// The content delta between two frontiers, `apply_diff`-able onto `a` to
+    /// reach `b`. A read-only passthrough to the inner `LoroDoc::diff`, which
+    /// self-restores this head's attach-state and frontier on exit (it checks
+    /// out to `a`, records, checks out to `b`, then restores `old_frontiers`),
+    /// so the head is undisturbed. Consistent with the `state_frontiers` read
+    /// passthrough and the `apply_diff` / `revert_to` write passthroughs.
+    pub fn diff(&self, a: &Frontiers, b: &Frontiers) -> LoroResult<DiffBatch> {
+        self.0.diff(a, b)
     }
     pub fn state_vv(&self) -> VersionVector {
         self.0.state_vv()

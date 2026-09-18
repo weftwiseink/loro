@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use std::cmp::Ordering;
 
@@ -243,6 +243,25 @@ impl MultiHeadDoc<SelfRooted> {
     /// own log cannot answer where `b` forked for a doc nobody has touched on `b`
     /// yet).
     pub fn fork_point(&self, b: &BranchId) -> Frontiers {
+        self.creation_marker_id(b)
+            .and_then(|id| self.oplog.lock().get_deps_of(id))
+            .unwrap_or_default()
+    }
+
+    /// The op-id of branch `b`'s creation marker: the MIN-LAMPORT run-start
+    /// labelled `b` across all peers. The creation marker is `b`'s causal root,
+    /// so it uniquely minimizes lamport among `b`'s ops. `None` for an unknown
+    /// branch (no attribution run).
+    ///
+    /// This is the shared recovery both `fork_point` (which then takes the id's
+    /// DEPS) and [`branch_sources`](Self::branch_sources) (which surfaces the id
+    /// ITSELF) build on, so the two never diverge: `fork_point(b)` is exactly
+    /// `get_deps_of(branch_sources()[b].op)`.
+    ///
+    /// Reads Attribution (the `runs`) then OpLog (each candidate's lamport) with
+    /// the two locks never nested (Attribution is released before OpLog is
+    /// taken), matching the original single-read `fork_point` behaviour.
+    fn creation_marker_id(&self, b: &BranchId) -> Option<ID> {
         let starts: Vec<ID> = {
             let attr = self.policy().attribution(self).lock();
             attr.runs
@@ -255,15 +274,59 @@ impl MultiHeadDoc<SelfRooted> {
                 .collect()
         };
         let ol = self.oplog.lock();
-        starts
-            .into_iter()
-            .min_by_key(|id| {
-                ol.get_change_at(*id)
-                    .map(|c| c.lamport())
-                    .unwrap_or(Lamport::MAX)
-            })
-            .and_then(|id| ol.get_deps_of(id))
-            .unwrap_or_default()
+        starts.into_iter().min_by_key(|id| {
+            ol.get_change_at(*id)
+                .map(|c| c.lamport())
+                .unwrap_or(Lamport::MAX)
+        })
+    }
+
+    /// Every known branch's SOURCE: the op-id of its creation marker, its kind
+    /// (always [`BranchSourceKind::Create`]; see [`BranchSourceKind`]), and the
+    /// parent branch it forked from. The holistic sibling of [`tips`](Self::tips)
+    /// and [`fork_point`](Self::fork_point): where `tips[b]` is the (drifted)
+    /// current frontier and `fork_point(b)` is the parent FRONTIER, this surfaces
+    /// the creation-marker op itself and the parent branch NAME.
+    ///
+    /// `op` is the min-lamport run-start of `b` (the same id `fork_point`
+    /// selects then discards), so the recovery reuses the incrementally-maintained
+    /// `runs` structure rather than a raw op-log marker scan. `parent` is the
+    /// branch of the marker's deps ([`branch_of_deps`](super::Attribution)), and
+    /// `None` for genesis: `branch_of_deps` of EMPTY deps is a loud `Err`, not
+    /// `None`, so empty deps short-circuit to `parent: None` here.
+    ///
+    /// Assumes the index oplog is not shallow-trimmed below a branch root; there
+    /// the existing causal fold already degrades loudly (`branch_of_deps` raises
+    /// `invalid_attribution`), so this is not a new failure mode.
+    pub fn branch_sources(&self) -> LoroResult<FxHashMap<BranchId, BranchSource>> {
+        let mut out = FxHashMap::default();
+        for b in self.branches() {
+            let Some(op) = self.creation_marker_id(&b) else {
+                continue;
+            };
+            let deps = self.oplog.lock().get_deps_of(op).unwrap_or_default();
+            let parent = if deps.is_empty() {
+                // Genesis: `branch_of_deps(empty)` is an Err, not None -- short
+                // circuit to a genuine `None` parent.
+                None
+            } else {
+                Some(
+                    self.policy()
+                        .attribution(self)
+                        .lock()
+                        .branch_of_deps(&deps)?,
+                )
+            };
+            out.insert(
+                b,
+                BranchSource {
+                    op,
+                    kind: BranchSourceKind::Create,
+                    parent,
+                },
+            );
+        }
+        Ok(out)
     }
 
     /// The `docs` map (each `DocId` -> its `heads` value) as it stood at frontier
@@ -307,6 +370,30 @@ impl MultiHeadDoc<SelfRooted> {
             .into_iter()
             .filter(|(dc, v)| at_fork.get(dc) != Some(v))
             .map(|(dc, _)| dc)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// The doc-ids whose recorded head DIFFERS between branches `a` and `b`: a
+    /// SYMMETRIC head-vs-head diff over the UNION of both branches' doc-id keys.
+    /// A doc present on only one side (or with a differing `heads` value on the
+    /// two sides) is included; a doc identical at `tips[a]` and `tips[b]` is not.
+    ///
+    /// Unlike the asymmetric [`docs_modified_on_branch`](Self::docs_modified_on_branch)
+    /// (a fork-point diff that returns only what `b` ITSELF changed), this
+    /// captures divergence on BOTH sides -- a doc `a` moved that `b` never
+    /// touched is reported. Empty when `a == b` or their recorded heads match.
+    pub fn diff_docs(&self, a: &BranchId, b: &BranchId) -> LoroResult<Vec<DocId>> {
+        let ta = self.policy().target(self, a)?;
+        let tb = self.policy().target(self, b)?;
+        let at_a = self.docs_map_at(&ta)?;
+        let at_b = self.docs_map_at(&tb)?;
+        let keys: FxHashSet<&DocId> = at_a.keys().chain(at_b.keys()).collect();
+        let mut out: Vec<DocId> = keys
+            .into_iter()
+            .filter(|dc| at_a.get(*dc) != at_b.get(*dc))
+            .cloned()
             .collect();
         out.sort();
         Ok(out)
