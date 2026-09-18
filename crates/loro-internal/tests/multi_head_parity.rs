@@ -250,7 +250,6 @@ fn m2i_import_fast_forward_main_alone() {
 // refs == 2, so the move takes the copy+advance arm. RED on baseline (the jump
 // diff is discarded on the non-recording fresh copy).
 #[test]
-#[ignore = "closed by Phase 2"]
 fn m2ii_import_fast_forward_shared_root() {
     let r = remote();
     write_map_str(&r, "map", "a", "1");
@@ -298,7 +297,6 @@ fn m3_import_divergence_catchup() {
 
 // M4 new container created remotely, shared root (copy+advance). RED on baseline.
 #[test]
-#[ignore = "closed by Phase 2"]
 fn m4_new_container_remote_shared() {
     let r = remote();
     {
@@ -374,7 +372,6 @@ fn m6_subcontainer_filter_catchup() {
 // M7 sibling shares the head, remote writes on main: copy+advance (refs == 2).
 // RED on baseline (0 events while state advances).
 #[test]
-#[ignore = "closed by Phase 2"]
 fn m7_sibling_shares_head_copy_advance() {
     let r = remote();
     write_map_str(&r, "map", "a", "1");

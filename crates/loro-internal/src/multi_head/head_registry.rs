@@ -15,6 +15,18 @@ use loro_common::{ContainerID, LoroError, LoroResult};
 /// under the registry lock and dispatched to AFTER the lock drops.
 pub(super) type SubsSnapshot = Vec<(Option<ContainerID>, Subscriber)>;
 
+/// Where a branch's advance sources its state from. The three advancing arms are
+/// ONE operation ("advance branch `b` to `target` via source `S`") with three
+/// sources: the branch's own uniquely-owned head in place, a copy of its shared
+/// head, or a copy of the pinned root (materialize).
+enum AdvanceSource {
+    /// Advance the branch's uniquely-owned (`refs == 1`) bound head in place.
+    InPlace(HeadId),
+    /// Copy this head first (a shared head, or the pinned root for materialize),
+    /// rebind the branch onto the copy, then advance the copy.
+    CopyOf(HeadId),
+}
+
 use super::base::{install_forwarders, HeadOwner};
 use super::ROOT_HEAD_ID;
 use super::*;
@@ -355,69 +367,52 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                         h2
                     }
                     None => match cur {
+                        // Catch-up arm: the branch's bound LIVE head (refs == 1)
+                        // advances IN PLACE to its policy-computed target (e.g.
+                        // `after_import` moving a branch to its lineage join). The
+                        // head becomes the branch's live writable head at the
+                        // policy frontier; `advance_via` clears detached and
+                        // renews the txn so a subsequent local write does not fail
+                        // `AutoCommitNotStarted` (the import-then-record data-loss
+                        // path). Registry-internal, so it bypasses the external
+                        // E1-A `attach`/`checkout_to_latest` gate.
                         Some(h) if reg.heads[&h].refs == 1 => {
-                            // Catch-up arm: the branch's bound LIVE head (refs==1)
-                            // advances IN PLACE to its policy-computed target
-                            // (e.g. `after_import` moving a branch to its lineage
-                            // join). `advance_in_place` checks out, which leaves
-                            // the head `detached` with its auto-commit txn stopped
-                            // -> a subsequent local write (record_head after a
-                            // remote import) would fail `AutoCommitNotStarted` and
-                            // silently drop the record. The head is now the
-                            // branch's live writable head sitting at the frontier
-                            // the policy chose, so re-enable editing. This is a
-                            // registry-internal move, so it correctly bypasses the
-                            // external E1-A `attach`/`checkout_to_latest` gate.
-                            pending = this.advance_in_place(reg, h, &target)?;
-                            let doc = &reg.heads[&h].doc;
-                            doc.set_detached(false);
-                            doc.renew_txn_if_auto_commit(None);
-                            h
+                            let (id2, ev) =
+                                this.advance_via(reg, b, AdvanceSource::InPlace(h), &target, None)?;
+                            pending = ev;
+                            id2
                         }
+                        // Copy+advance arm: a SHARED head (refs > 1) whose branch
+                        // target moved off the shared tip. Copy it, rebind `b`
+                        // onto the copy FIRST (re-installs subs, leaves the copy
+                        // recording from the old tip), then advance the copy and
+                        // deliver its diff. On error `b` is rebound back to `h`.
                         Some(h) => {
-                            // Copy+advance arm: a SHARED head (refs>1) whose
-                            // branch target moved off the shared tip. Copy it,
-                            // advance the copy to the policy target, and hand it
-                            // to the branch as its live writable head. Like the
-                            // catch-up arm, `advance_in_place` checks out and
-                            // leaves the copy detached with its txn stopped, so a
-                            // subsequent local write would fail
-                            // `AutoCommitNotStarted` (data loss). Clear it here in
-                            // the caller (registry-internal, bypasses the E1-A
-                            // gate). See the `advance_in_place` NOTE.
-                            // Phase 1 leaves the copy+advance arm's delivery
-                            // unchanged (still lossy): its diff is collected but
-                            // NOT dispatched until the Phase 2 rebind-first
-                            // restructure. `_events` is intentionally discarded.
-                            let c = this.copy_head(reg, h);
-                            let _events = this.advance_in_place(reg, c, &target)?;
-                            let doc = &reg.heads[&c].doc;
-                            doc.set_detached(false);
-                            doc.renew_txn_if_auto_commit(None);
-                            this.rebind(reg, b, c);
+                            let (c, ev) = this.advance_via(
+                                reg,
+                                b,
+                                AdvanceSource::CopyOf(h),
+                                &target,
+                                Some(h),
+                            )?;
+                            pending = ev;
                             c
                         }
+                        // Materialize arm: a cold/unbound branch resolves to its
+                        // policy frontier via a fresh copy of the pinned ROOT
+                        // (the shared advance helper with `CopyOf(ROOT)`). Same
+                        // rebind-first delivery; a cold content branch's first
+                        // write on the materialized head must succeed, so it is
+                        // handed back writable.
                         None => {
-                            // Materialize arm: a cold/unbound branch resolves to
-                            // its policy frontier via a fresh head. `materialize`
-                            // checks out (detached). This head becomes the
-                            // branch's live bound head at its policy target, so a
-                            // first WRITE on it (a cold content branch created
-                            // then diverged after its parent moved on) must
-                            // succeed. Clear detached here too, unifying all three
-                            // advancing arms: any head handed back as the branch's
-                            // bound head at its policy target is writable. (This
-                            // extends the round-6 determination, which found
-                            // "materialize read-only" only because the index/base
-                            // never wrote to a materialized head; content branches
-                            // do.)
-                            // Phase 1: the materialize arm's diff is likewise
-                            // collected but not dispatched until Phase 2.
-                            let (m, _events) = this.materialize(reg, &target)?;
-                            let doc = &reg.heads[&m].doc;
-                            doc.set_detached(false);
-                            doc.renew_txn_if_auto_commit(None);
-                            this.rebind(reg, b, m);
+                            let (m, ev) = this.advance_via(
+                                reg,
+                                b,
+                                AdvanceSource::CopyOf(ROOT_HEAD_ID),
+                                &target,
+                                None,
+                            )?;
+                            pending = ev;
                             m
                         }
                     },
@@ -487,8 +482,63 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         if reg.by_tip.get(&old_tip) == Some(&id) {
             reg.by_tip.remove(&old_tip);
         }
-        reg.by_tip.insert(new_tip, id);
+        // `or_insert`, NOT `insert`: a `read_at` scratch head advanced to a
+        // frontier a LIVE head already rests at must not displace that head's
+        // `by_tip` key (the following `retire(scratch)` would then remove it,
+        // silently dropping the live head from `by_tip`). A `resolve` advance
+        // only ever reaches here on a `by_tip` MISS for `target`, so `or_insert`
+        // still installs the moved head as the resting owner in that case.
+        reg.by_tip.entry(new_tip).or_insert(id);
         Ok(events)
+    }
+
+    /// Advance branch `b` to `target` via `src`, deliver-collecting the diff.
+    /// Unifies the catch-up, copy+advance, and materialize arms.
+    ///
+    /// For a `CopyOf` source the copy is REBOUND to `b` BEFORE the advance: that
+    /// re-installs `b`'s subscriptions on the copy (so its `DocState` records
+    /// from the old tip) and moves refs; the advance then collects `diff(X -> Y)`
+    /// even on a fresh, never-subscribed copy. Every advancing arm hands back a
+    /// head that is the branch's live writable bound head at its policy target,
+    /// so detached is cleared and the auto-commit txn renewed. On an advance
+    /// error for a `CopyOf`, `b` is rebound to `fallback` (or unbound if it had
+    /// no prior head), which retires the copy.
+    fn advance_via(
+        &self,
+        reg: &mut Registry,
+        b: &BranchId,
+        src: AdvanceSource,
+        target: &Frontiers,
+        fallback: Option<HeadId>,
+    ) -> LoroResult<(HeadId, Vec<DocDiff>)> {
+        let (id, pending) = match src {
+            AdvanceSource::InPlace(id) => {
+                let pending = self.advance_in_place(reg, id, target)?;
+                (id, pending)
+            }
+            AdvanceSource::CopyOf(src_id) => {
+                let c = self.copy_head(reg, src_id);
+                // Rebind FIRST: moves refs and re-installs subs on the copy.
+                self.rebind(reg, b, c);
+                match self.advance_in_place(reg, c, target) {
+                    Ok(pending) => (c, pending),
+                    Err(e) => {
+                        match fallback {
+                            Some(old) => self.rebind(reg, b, old),
+                            None => {
+                                reg.bound.remove(b);
+                                self.dec_refs(reg, c);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        let doc = &reg.heads[&id].doc;
+        doc.set_detached(false);
+        doc.renew_txn_if_auto_commit(None);
+        Ok((id, pending))
     }
 
     /// SECONDARY path: a frontier no live head sits at. Build a head by copying
