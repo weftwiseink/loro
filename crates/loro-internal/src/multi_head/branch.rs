@@ -242,8 +242,9 @@ impl Drop for BranchSubscription {
 }
 
 /// A branch handle: a NAME plus its `MultiHeadDoc`. Every operation re-resolves
-/// the branch's head at call time. This is the frozen consumer contract: no
-/// public signature here names `LoroDoc` except `fork` (the escape hatch).
+/// the branch's head at call time. Two public signatures name `LoroDoc`: `fork`
+/// (the eject escape hatch) and `live_window` (the live head projection); every
+/// other signature stays on the head-safe `BranchingDocHead`.
 #[allow(missing_debug_implementations)]
 pub struct Branch<'a, P: HeadPolicy> {
     doc: &'a MultiHeadDoc<P>,
@@ -306,6 +307,30 @@ impl<P: HeadPolicy> Branch<'_, P> {
     pub fn fork(&self) -> LoroResult<LoroDoc> {
         let (_, head) = self.doc.resolve(&self.name, Intent::Read)?;
         head.fork_at(&head.state_frontiers())
+    }
+
+    /// The LIVE WINDOW: the branch head's OWN aliased `LoroDoc`, resolved with write
+    /// intent (copy-on-divergence up front, so a shared head becomes a writable Private
+    /// head). Unlike `fork` (which EJECTS a dead standalone snapshot), this returns the
+    /// registry head itself: an edit + `commit` on it advances THIS branch's head and
+    /// fires the branch's subscription, and an `UndoManager` binds to it because it is a
+    /// real `LoroDoc`. This is the one primitive editor / undo / presence / canvas all
+    /// bind to.
+    ///
+    /// NOTE(claude-opus-4-8/unified-branching-content/P1): the `BranchingDocHead`
+    /// containment (the head-safe wrapper that withholds `import`/`export`/`checkout`/
+    /// `fork`) is LIKELY OVER-CAUTIOUS: per a loro maintainer the `MultiHeadDoc` shared
+    /// oplog is always append-only, so wrapping a head to withhold history-bearing ops is
+    /// probably unnecessary. The DEEPER containment removal is DEFERRED pending triplicate
+    /// review; this accessor is the MINIMAL enablement that hands the live head out, and
+    /// nothing more. The window re-exposes the full `LoroDoc` history surface as a
+    /// deliberate, maintainer-accepted tradeoff on the append-only oplog; the discipline
+    /// that consumers issue ONLY local read/subscribe/edit/commit/undo/cursor on it is by
+    /// convention, not by type. In particular `checkout` on the window is incoherent while
+    /// the head is behind the shared union (see `fork`'s note) and must not be called.
+    pub fn live_window(&self) -> LoroResult<LoroDoc> {
+        let (_, head) = self.doc.resolve(&self.name, Intent::Write)?;
+        Ok(head)
     }
 }
 

@@ -3262,6 +3262,28 @@ impl Branch {
             root_event_sub: Arc::new(Mutex::new(None)),
         })
     }
+
+    /// The LIVE WINDOW: the branch head's OWN aliased `LoroDoc` -- the single primitive the
+    /// editor, `UndoManager`, presence, and canvas all bind to. Unlike `fork` (which EJECTS a
+    /// dead standalone snapshot), an edit + `commit` on the returned doc advances THIS branch's
+    /// head and fires its `subscribeRoot`, and `new UndoManager(window)` succeeds because the
+    /// window is a real `LoroDoc`.
+    ///
+    /// This hands out the FULL wasm `LoroDoc`, re-exposing the history surface
+    /// (`import`/`export`/`checkout`/`detach`/`fork`/version-travel) that `BranchingDocHead`
+    /// withholds. Per a loro maintainer the `MultiHeadDoc` shared oplog is always append-only,
+    /// so that containment is LIKELY OVER-CAUTIOUS; the DEEPER containment removal is DEFERRED
+    /// pending triplicate review, and this accessor is the MINIMAL enablement only (see
+    /// `loro_internal::multi_head::Branch::live_window`). The discipline that consumers issue
+    /// only local read/subscribe/edit/commit/undo/cursor on the window is by convention, not by
+    /// type; `checkout` on it is incoherent while the head is behind the shared union.
+    pub fn window(&self) -> JsResult<LoroDoc> {
+        let head = self.doc.branch(self.name.clone()).live_window()?;
+        Ok(LoroDoc {
+            doc: head,
+            root_event_sub: Arc::new(Mutex::new(None)),
+        })
+    }
 }
 
 /// Bridge a JS callback to a `Subscriber`, routing events through the pending-event queue (the
