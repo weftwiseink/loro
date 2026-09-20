@@ -554,10 +554,13 @@ fn dead_tip_rematerializes_via_replay_after_head_dropped() {
     let pre_value = md.read(&feature, |d| d.get_text("t").to_string()).unwrap();
     assert_eq!(pre_value, "F");
 
-    // Rebind feature OFF H (target back to the root's empty tip): H reaches
-    // refs 0 and is RETIRED (dropped), root is not.
-    md.policy().set_target(&feature, Frontiers::default());
-    md.resolve(&feature, Intent::Read).unwrap();
+    // Drop feature OFF H so H reaches refs 0 and is RETIRED (dropped), root is
+    // not. NOTE: this used to be driven by a BACKWARD resolve (set_target to the
+    // empty tip, then `resolve`), but the fast-forward-only guard now HOLDS a
+    // non-`Advance` backward resolve of a bound head (a regress: `cmp(tip,target)`
+    // is `Greater`), so a backward resolve no longer moves the head off H. Retire
+    // H via `unbind` instead, which is the production retirement path anyway.
+    md.unbind(&feature);
     assert!(
         md.head_doc(h).is_none(),
         "sole-owner head retired at refs 0"
@@ -2975,4 +2978,280 @@ fn conveniences_leave_head_frontiers_unchanged() {
         sf_feat,
         "the scratch-head diffs never disturb feat's live head"
     );
+}
+
+// ======================================================================
+// Branch.lens(): copy-on-open pin + fast-forward-only guard + lineage
+// trigger + lens-observer delivery.
+// See cdocs/proposals/2026-09-20-branch-bidirectional-lens.md.
+// ======================================================================
+
+/// A forward content import advances a BOUND lens head in place AND fires the
+/// lens's OWN observer (B.4) and the branch subscription exactly once each
+/// ("reads see imports naturally"). No manual re-resolve.
+#[test]
+fn lens_forward_import_advances_and_fires() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    // Producer: main = "hello", snapshot base; then " world", snapshot ahead.
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "hello").unwrap())
+        .unwrap();
+    let idx_base = a.index().export(ExportMode::all_updates()).unwrap();
+    let content_base = ga.export(ExportMode::all_updates()).unwrap();
+    let vv_before = ga.oplog_vv();
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(5, " world").unwrap())
+        .unwrap();
+    let idx_ahead = a.index().export(ExportMode::all_updates()).unwrap();
+    let content_fwd = ga
+        .export(ExportMode::updates_owned(vv_before))
+        .unwrap();
+
+    // Consumer holds the base, opens the lens on main.
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    bb.index().import(&idx_base).unwrap();
+    gb.import(&content_base).unwrap();
+    let lens = gb.branch(GENESIS_BRANCH).lens().unwrap();
+    assert_eq!(lens.get_text("t").to_string(), "hello", "lens opens at base");
+    let lens_head = gb.bound_head(&b(GENESIS_BRANCH)).unwrap();
+
+    // Count both the lens's OWN observer (B.4) and the branch subscription.
+    let lens_fires = Arc::new(AtomicUsize::new(0));
+    let lf = lens_fires.clone();
+    let _lens_sub = lens.subscribe_root(Arc::new(move |_ev: crate::event::DiffEvent| {
+        lf.fetch_add(1, SeqCst);
+    }));
+    let branch_fires = Arc::new(AtomicUsize::new(0));
+    let bf = branch_fires.clone();
+    let _branch_sub = gb
+        .branch(GENESIS_BRANCH)
+        .subscribe_root(Arc::new(move |_ev: crate::event::DiffEvent| {
+            bf.fetch_add(1, SeqCst);
+        }))
+        .unwrap();
+
+    // Healthy order: content ops arrive, then the lineage record.
+    gb.import(&content_fwd).unwrap();
+    bb.import_index(&idx_ahead).unwrap();
+
+    // Reads-see-imports: the SAME lens handle now reads the forward content, and
+    // its head never rebound (copy-on-open pin).
+    assert_eq!(
+        lens.get_text("t").to_string(),
+        "hello world",
+        "the bound lens advanced FORWARD in place on import"
+    );
+    assert_eq!(
+        gb.bound_head(&b(GENESIS_BRANCH)),
+        Some(lens_head),
+        "the lens head is pinned: no rebind on the forward advance"
+    );
+    assert!(
+        lens_fires.load(SeqCst) >= 1,
+        "the forward advance was delivered through the lens's OWN observer (B.4)"
+    );
+    assert_eq!(
+        branch_fires.load(SeqCst),
+        1,
+        "the branch subscription fired EXACTLY once per advance (no double-delivery)"
+    );
+    assert!(!gb.lens_held(&b(GENESIS_BRANCH)), "caught up: lensHeld is false");
+}
+
+/// A lineage-ahead import (the record moves past held content) HOLDS the bound
+/// lens: no regress, no event, `lensHeld` true; content catch-up then fills it.
+#[test]
+fn lens_lineage_ahead_holds_then_fills() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "BASE").unwrap())
+        .unwrap();
+    let idx_base = a.index().export(ExportMode::all_updates()).unwrap();
+    let content_base = ga.export(ExportMode::all_updates()).unwrap();
+    let vv_before = ga.oplog_vv();
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, " MORE").unwrap())
+        .unwrap();
+    let idx_ahead = a.index().export(ExportMode::all_updates()).unwrap();
+    let content_fwd = ga.export(ExportMode::updates_owned(vv_before)).unwrap();
+
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    bb.index().import(&idx_base).unwrap();
+    gb.import(&content_base).unwrap();
+    let lens = gb.branch(GENESIS_BRANCH).lens().unwrap();
+    assert_eq!(lens.get_text("t").to_string(), "BASE");
+
+    let branch_fires = Arc::new(AtomicUsize::new(0));
+    let bf = branch_fires.clone();
+    let _branch_sub = gb
+        .branch(GENESIS_BRANCH)
+        .subscribe_root(Arc::new(move |_ev: crate::event::DiffEvent| {
+            bf.fetch_add(1, SeqCst);
+        }))
+        .unwrap();
+
+    // Lineage-only: the record moves past held content. The guard HOLDS.
+    bb.import_index(&idx_ahead).unwrap();
+    assert_eq!(
+        lens.get_text("t").to_string(),
+        "BASE",
+        "HOLD: the lens did not regress on a lineage-ahead frame"
+    );
+    assert_eq!(
+        branch_fires.load(SeqCst),
+        0,
+        "no delete-all event reached the subscription (nothing to suppress downstream)"
+    );
+    assert!(
+        gb.lens_held(&b(GENESIS_BRANCH)),
+        "lensHeld is TRUE while behind the recorded content"
+    );
+
+    // Catch-up: the content ops arrive; the lens fast-forwards.
+    gb.import(&content_fwd).unwrap();
+    // A content import re-resolves via after_import; drive it explicitly too.
+    let _ = gb
+        .branch(GENESIS_BRANCH)
+        .read(|h| h.get_text("t").to_string());
+    assert_eq!(
+        lens.get_text("t").to_string(),
+        "BASE MORE",
+        "the lens filled FORWARD once content caught up"
+    );
+    assert!(
+        !gb.lens_held(&b(GENESIS_BRANCH)),
+        "lensHeld is FALSE after catch-up"
+    );
+}
+
+/// Copy-on-open (invariant 6): a sibling branch converging on an OPEN lens
+/// head's frontier does NOT share into it (no flip-to-shared) and does NOT
+/// retire it; a write through the lens after the sibling resolves succeeds.
+#[test]
+fn lens_sibling_convergence_does_not_break_open_head() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let doc = repo.open_doc("G".into());
+    doc.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+
+    // Open the lens on main: it pins main's head (unshared, refs 1).
+    let lens = doc.branch(GENESIS_BRANCH).lens().unwrap();
+    let main_head = doc.bound_head(&b(GENESIS_BRANCH)).unwrap();
+    assert_eq!(doc.refs_of(&b(GENESIS_BRANCH)), Some(1));
+
+    // A sibling branch created at main's frontier resolves: it must materialize
+    // its OWN head (the lens head is out of `by_tip`), never share main's.
+    repo.create_branch(&b("sib"), &b(GENESIS_BRANCH)).unwrap();
+    let _ = doc.branch("sib").read(|h| h.get_text("t").to_string());
+    assert_eq!(
+        doc.refs_of(&b(GENESIS_BRANCH)),
+        Some(1),
+        "main's lens head stayed refs == 1 (no sibling shared into it)"
+    );
+    assert_eq!(
+        doc.bound_head(&b(GENESIS_BRANCH)),
+        Some(main_head),
+        "main's lens head was not retired or rebound"
+    );
+    assert_ne!(
+        doc.bound_head(&b("sib")),
+        Some(main_head),
+        "the sibling got its own head, not the lens head"
+    );
+
+    // A write through the lens still works (no `Auto commit has not started`).
+    doc.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "!").unwrap())
+        .unwrap();
+    assert_eq!(lens.get_text("t").to_string(), "base!", "lens write survived");
+}
+
+/// A backward `advance` still regresses (exempt from the fast-forward guard): it
+/// is the branch's one intentional backward path.
+#[test]
+fn lens_backward_advance_is_guard_exempt() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let doc = repo.open_doc("G".into());
+    doc.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "A").unwrap())
+        .unwrap();
+    let at_a = doc.frontier_of(&b(GENESIS_BRANCH)).unwrap();
+    doc.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(1, "B").unwrap())
+        .unwrap();
+    // Open the lens (bind main), then advance BACKWARD to the "A" frontier.
+    let lens = doc.branch(GENESIS_BRANCH).lens().unwrap();
+    assert_eq!(lens.get_text("t").to_string(), "AB");
+    doc.advance(&b(GENESIS_BRANCH), &at_a).unwrap();
+    assert_eq!(
+        doc.branch(GENESIS_BRANCH)
+            .read(|h| h.get_text("t").to_string())
+            .unwrap(),
+        "A",
+        "a backward advance regressed the branch (guard-exempt)"
+    );
+}
+
+/// The lineage trigger (`import_index`) advances an OPEN doc's lens and does not
+/// open a doc that was never opened.
+#[test]
+fn lens_import_index_advances_open_doc_only() {
+    // Producer: two docs, G and H, each with content on main.
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    let ha = a.open_doc("H".into());
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "g").unwrap())
+        .unwrap();
+    ha.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "h").unwrap())
+        .unwrap();
+    let idx = a.index().export(ExportMode::all_updates()).unwrap();
+    let g_content = ga.export(ExportMode::all_updates()).unwrap();
+
+    // Consumer opens ONLY G, delivers G's content, then imports the index.
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    gb.import(&g_content).unwrap();
+    let lens = gb.branch(GENESIS_BRANCH).lens().unwrap();
+    bb.import_index(&idx).unwrap(); // must not panic / open H
+    assert_eq!(
+        lens.get_text("t").to_string(),
+        "g",
+        "G's lens advanced to its held content on the index import"
+    );
+    // H was never opened; the index knows main, but nothing forced H resident.
+    // (import_index loops only the already-open docs, so this is a smoke that it
+    // completed without materializing H.)
+    assert!(bb.branches().contains(&b(GENESIS_BRANCH)));
+}
+
+/// `lens_generation` is stable across `lens()` calls that do not rebind, and
+/// moves after a rebind (branch delete unbinds + invalidates).
+#[test]
+fn lens_generation_stable_then_bumps_on_rebind() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let doc = repo.open_doc("G".into());
+    doc.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    repo.create_branch(&b("draft"), &b(GENESIS_BRANCH)).unwrap();
+    let _l1 = doc.branch("draft").lens().unwrap();
+    let g1 = doc.lens_generation(&b("draft"));
+    let _l2 = doc.branch("draft").lens().unwrap();
+    let g2 = doc.lens_generation(&b("draft"));
+    assert_eq!(g1, g2, "generation stable across lens() calls with no rebind");
+    // Delete unbinds draft (a rebind path) and invalidates its generation.
+    repo.delete_branch(&b("draft")).unwrap();
+    let g3 = doc.lens_generation(&b("draft"));
+    assert!(g3 > g2, "generation bumped on the delete/unbind rebind");
 }

@@ -309,13 +309,17 @@ impl<P: HeadPolicy> Branch<'_, P> {
         head.fork_at(&head.state_frontiers())
     }
 
-    /// The LIVE WINDOW: the branch head's OWN aliased `LoroDoc`, resolved with write
-    /// intent (copy-on-divergence up front, so a shared head becomes a writable Private
-    /// head). Unlike `fork` (which EJECTS a dead standalone snapshot), this returns the
-    /// registry head itself: an edit + `commit` on it advances THIS branch's head and
-    /// fires the branch's subscription, and an `UndoManager` binds to it because it is a
-    /// real `LoroDoc`. This is the one primitive editor / undo / presence / canvas all
-    /// bind to.
+    /// The LENS: the branch head's OWN aliased `LoroDoc`, the single bidirectional
+    /// handle editor / undo / presence / canvas all bind to. COPY-ON-OPEN: the head is
+    /// resolved with write intent (copy-on-divergence up front) and then PINNED as the
+    /// branch's unique, unshared head for the life of the binding, so no converging
+    /// sibling can flip it shared or retire it out from under an open editor
+    /// (`open_lens`). Unlike `fork` (which EJECTS a dead standalone snapshot), this
+    /// returns the registry head itself: an edit + `commit` advances THIS branch's head
+    /// and fires the branch's subscription; an import that extends the branch FORWARD
+    /// advances this same head in place (guarded fast-forward-only) and fires it too; an
+    /// `UndoManager` binds to it because it is a real `LoroDoc`. Supersedes the earlier
+    /// `window()`; see `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
     ///
     /// NOTE(claude-opus-4-8/unified-branching-content/P1): the `BranchingDocHead`
     /// containment (the head-safe wrapper that withholds `import`/`export`/`checkout`/
@@ -328,9 +332,8 @@ impl<P: HeadPolicy> Branch<'_, P> {
     /// that consumers issue ONLY local read/subscribe/edit/commit/undo/cursor on it is by
     /// convention, not by type. In particular `checkout` on the window is incoherent while
     /// the head is behind the shared union (see `fork`'s note) and must not be called.
-    pub fn live_window(&self) -> LoroResult<LoroDoc> {
-        let (_, head) = self.doc.resolve(&self.name, Intent::Write)?;
-        Ok(head)
+    pub fn lens(&self) -> LoroResult<LoroDoc> {
+        self.doc.open_lens(&self.name)
     }
 }
 

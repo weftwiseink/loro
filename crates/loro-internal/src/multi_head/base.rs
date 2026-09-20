@@ -1,7 +1,7 @@
 use std::ops::Deref;
 use std::sync::{Arc, Weak};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::arena::SharedArena;
 use crate::configure::Configure;
@@ -168,6 +168,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                     doc: root,
                     tip: tip.clone(),
                     refs: 0,
+                    unshared: false,
                     _forward: forward,
                 },
             );
@@ -185,6 +186,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                         by_tip,
                         bound: FxHashMap::default(),
                         subs: FxHashMap::default(),
+                        open_branches: FxHashSet::default(),
+                        guard_held: FxHashMap::default(),
+                        generation: FxHashMap::default(),
                         next_id: ROOT_HEAD_ID + 1,
                         next_sub_id: 0,
                     },
@@ -236,6 +240,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     /// (a content doc binds a branch only lazily on first access).
     pub fn unbind(&self, b: &BranchId) {
         self.with_reg(|this, reg| {
+            // Release any copy-on-open pin (open flag, guard-hold) and invalidate
+            // the lens cache generation before dropping the binding.
+            this.release_open(reg, b);
             if let Some(old) = reg.bound.remove(b) {
                 this.dec_refs(reg, old);
             }
@@ -355,6 +362,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 return;
             };
             let new_tip = head.doc.state_frontiers();
+            let unshared = head.unshared;
             let old_tip = std::mem::replace(
                 &mut reg.heads.get_mut(&id).expect("head exists").tip,
                 new_tip.clone(),
@@ -363,7 +371,12 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 if reg.by_tip.get(&old_tip) == Some(&id) {
                     reg.by_tip.remove(&old_tip);
                 }
-                reg.by_tip.insert(new_tip.clone(), id);
+                // A lens (unshared) head is never a `by_tip` resting owner, so a
+                // local commit on it must not re-key it in (copy-on-open,
+                // invariant 6). Cold heads re-key as before.
+                if !unshared {
+                    reg.by_tip.insert(new_tip.clone(), id);
+                }
             }
             // Reverse lookup: only a refs == 1 head commits, so at most one
             // branch is bound here.

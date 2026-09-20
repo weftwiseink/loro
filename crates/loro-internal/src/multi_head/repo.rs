@@ -4,6 +4,8 @@ use rustc_hash::FxHashMap;
 
 use loro_common::LoroResult;
 
+use crate::encoding::ImportStatus;
+
 use super::*;
 
 /// The repo: one loro index doc plus its content docs. Branch existence and
@@ -81,6 +83,31 @@ impl BranchingDocRepo {
             let _ = doc.resolve_with(into, Intent::Read, ResolveCause::Advance);
         }
         Ok(outcome)
+    }
+
+    /// Import LINEAGE/index bytes (Trigger 2 of the bidirectional lens), then
+    /// re-resolve every index-known branch of every OPEN content doc so a lens
+    /// bound on a branch whose recorded frontier just moved advances FORWARD to it
+    /// (guarded fast-forward-only). This closes the content-first ordering gap: a
+    /// content op that arrived before its lineage record becomes a held descendant
+    /// the moment the record lands, and the re-resolve advances the lens then. A
+    /// resolve that cannot yet advance (ids not held) is a non-fatal no-op, exactly
+    /// as the content-import ingest treats it; nothing touches an unopened doc (the
+    /// loop is over `self.docs`, the docs already hydrated). Mirrors `merge_branch`,
+    /// with the imported-frontier `Import` cause rather than a local `Advance`.
+    ///
+    /// The index import itself is history-only + all-heads-barriered (it lands
+    /// index ops without moving a head), so the content re-resolves are the only
+    /// state moves. See `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
+    pub fn import_index(&self, bytes: &[u8]) -> LoroResult<ImportStatus> {
+        let status = self.index.import(bytes)?;
+        let branches = self.index.branches();
+        for doc in self.docs.lock().unwrap().values() {
+            for b in &branches {
+                let _ = doc.resolve_with(b, Intent::Read, ResolveCause::Import { origin: "".into() });
+            }
+        }
+        Ok(status)
     }
 
     /// Repo-wide branch deletion: unbind the branch from every open content doc

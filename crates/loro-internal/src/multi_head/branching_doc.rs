@@ -75,6 +75,34 @@ impl MultiHeadDoc<Delegated> {
         self.inner.policy.target(self, b)
     }
 
+    /// Whether branch `b`'s LENS is currently BEHIND its recorded content -- the
+    /// `lensHeld` signal a consumer renders as the head-lag affordance.
+    /// `lensHeld := guard_held || dropped_unheld`:
+    /// - `guard_held`: the fast-forward guard held the branch behind a non-forward
+    ///   (ancestor) target on its last resolve (a lineage-ahead regress caught before
+    ///   it could move the head).
+    /// - `dropped_unheld`: the branch's recorded content frontier references an op
+    ///   this doc's oplog does NOT yet hold, so `Delegated::target` filtered it out.
+    ///   Required for the S4 case (a fresh open of a doc edited elsewhere) where the
+    ///   reduced target equals the tip and the guard alone reads false.
+    ///
+    /// This never consults `frontier_of` (which collapses to the HELD frontier on a
+    /// regressed head, the refuted CF-1 signal); it uses the SAME raw recorded ids and
+    /// held-filter as the guard's target computation.
+    pub fn lens_held(&self, b: &BranchId) -> bool {
+        if self.guard_held_flag(b) {
+            return true;
+        }
+        match self.index().recorded_ids(b, self.doc_id()) {
+            Ok(raw) => {
+                let ol = self.oplog.lock();
+                raw.iter()
+                    .any(|id| !ol.vv().get_last(id.peer).is_some_and(|c| c >= id.counter))
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Whether branch `target` contains branch `source` (both of this doc).
     pub fn contains(&self, target: &BranchId, source: &BranchId) -> LoroResult<bool> {
         let ft = self.frontier_of(target)?;

@@ -1026,6 +1026,22 @@ impl LoroDoc {
         state.take_events()
     }
 
+    /// Emit already-collected `DocDiff`s through THIS doc's own observer.
+    ///
+    /// The `MultiHeadDoc` registry uses this to deliver a LENS head's forward
+    /// advance (collected under the registry lock via `checkout_collecting_events`)
+    /// through the head's own observer AFTER the lock drops: the branch's
+    /// subscriptions are installed there, and so is any `UndoManager` / raw
+    /// `subscribe` bound to the lens, so this is the "everything applies naturally"
+    /// delivery. It does the same root/ancestor-match filtering as any observer
+    /// emit. Contrast `dispatch_to_branch`, which emits through a scratch observer
+    /// for a SHARED head (whose own observer must not fire for one branch's move).
+    pub(crate) fn emit_collected_diffs(&self, events: Vec<DocDiff>) {
+        for event in events {
+            self.observer.emit(event);
+        }
+    }
+
     /// Import the json schema updates.
     ///
     /// only supports backward compatibility but not forward compatibility.

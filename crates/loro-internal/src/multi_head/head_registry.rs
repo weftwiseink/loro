@@ -1,13 +1,14 @@
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::event::{DocDiff, EventTriggerKind};
 use crate::subscription::{Observer, Subscriber};
 use crate::sync::AtomicU8;
 use crate::utils::subscription::Subscription;
-use crate::version::Frontiers;
+use crate::version::{shrink_frontiers, Frontiers};
 use crate::{DocOwner, LoroDoc, HEAD_MODE_PRIVATE};
 use loro_common::{ContainerID, InternalString, LoroError, LoroResult};
 
@@ -70,6 +71,15 @@ pub(super) struct Head {
     /// `1` = uniquely owned (writable in place); `> 1` = shared (immutable);
     /// `0` = retired (removed) -- except the pinned root, which rests at `0`.
     pub(super) refs: usize,
+    /// A LENS (copy-on-open) head: the uniquely-owned head an OPEN branch pins
+    /// for the life of its binding. Never inserted into `by_tip` (so no sibling
+    /// can share into it and flip it shared / retire it out from under an open
+    /// editor), and its forward advance is delivered through its OWN observer
+    /// (so an `UndoManager` / raw `subscribe` bound to the lens hears imports),
+    /// not through the scratch `dispatch_to_branch`. Set on the first `lens()`
+    /// and true for the head's whole life; a lens head is refs == 1 by
+    /// construction (invariant 6). See `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
+    pub(super) unshared: bool,
     /// Per-head forwarders that feed this head's local commits / first-commits
     /// into the doc-level `history_subs` / `first_commit_subs`. Kept alive for
     /// the head's lifetime; dropped (unsubscribed) when the head is evicted.
@@ -94,6 +104,23 @@ pub(super) struct Registry {
     /// synthesized diff to them after the lock drops (parity contract -- a
     /// branch-surfaced doc emits the same events a plain `LoroDoc` would).
     pub(super) subs: FxHashMap<BranchId, Vec<BranchSub>>,
+    /// Branches currently OPEN (lensed): a branch is open from its first `lens()`
+    /// until it is unbound (branch delete) or its doc is closed (`close_doc`
+    /// drops the whole doc). An open branch's bound head is a lens head
+    /// (`unshared`), never shares into a sibling, and never takes the
+    /// rebind-to-existing arm. (Copy-on-open, proposal Section A.)
+    pub(super) open_branches: FxHashSet<BranchId>,
+    /// The fast-forward guard's last hold decision per branch: `true` when the
+    /// most recent resolve HELD the branch behind a non-forward (ancestor)
+    /// target. One of the two `lensHeld` terms (the other is `dropped_unheld`,
+    /// recomputed on demand). Proposal Section A "Lag signal".
+    pub(super) guard_held: FxHashMap<BranchId, bool>,
+    /// A per-branch generation counter, bumped on every `rebind`. The JS-side
+    /// identity cache keys a minted lens handle by `(branch, generation)` and
+    /// re-mints only when the generation moved, so `lens()` is identity-stable
+    /// for the life of a binding and re-points after a rebind (branch delete,
+    /// backward advance). Proposal Section A "Identity cache".
+    pub(super) generation: FxHashMap<BranchId, u64>,
     pub(super) next_id: HeadId,
     pub(super) next_sub_id: u64,
 }
@@ -163,6 +190,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 doc,
                 tip,
                 refs: 0,
+                unshared: false,
                 _forward: forward,
             },
         );
@@ -205,13 +233,19 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         let (_opts, guard) = h.doc.implicit_commit_then_stop();
         let new_tip = h.doc.state_frontiers();
         h.doc.set_head_shared(true);
+        let unshared = h.unshared;
         h.tip = new_tip.clone();
         drop(guard);
         if old_tip != new_tip {
             if reg.by_tip.get(&old_tip) == Some(&id) {
                 reg.by_tip.remove(&old_tip);
             }
-            reg.by_tip.insert(new_tip, id);
+            // A lens (unshared) head is never a `by_tip` resting owner, so a
+            // sibling can never share into it (invariant 6). Defensive: a lens
+            // head is refs == 1 by construction and never reaches `flip_to_shared`.
+            if !unshared {
+                reg.by_tip.insert(new_tip, id);
+            }
         }
     }
 
@@ -271,6 +305,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             self.dec_refs(reg, old);
         }
         reg.bound.insert(b.clone(), new_id);
+        // Invalidate any cached lens handle for this branch: the head changed,
+        // so a `lens()` after this rebind must re-mint (identity cache, Section A).
+        *reg.generation.entry(b.clone()).or_insert(0) += 1;
         self.inc_refs(reg, new_id);
         self.reinstall_subs(reg, b, new_id);
     }
@@ -361,28 +398,116 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         intent: Intent,
         cause: ResolveCause,
     ) -> LoroResult<(HeadId, LoroDoc)> {
-        let (out, pending, subs) = self.resolve_collecting(b, intent, cause)?;
-        self.dispatch_to_branch(subs, pending);
+        let (out, pending, subs, lens_delivery) = self.resolve_collecting(b, intent, cause)?;
+        self.deliver(&out.1, subs, pending, lens_delivery);
         Ok(out)
     }
 
+    /// Deliver a transition's collected diffs after the registry lock has dropped
+    /// (constraint C3). For a LENS head (uniquely owned by one open branch,
+    /// invariant 6) emit through the head's OWN observer INSTEAD of the scratch
+    /// `dispatch_to_branch`: the branch's subscriptions are installed on that
+    /// observer (`reinstall_subs`), so this reaches every `Branch.subscribe`
+    /// callback (parity), the lens's own `UndoManager` (which composes an
+    /// `Import` event into its stacks, `undo.rs`), and any raw `subscribe` on the
+    /// lens -- the "everything applies naturally" behavior -- WITHOUT the double
+    /// delivery that emitting through BOTH observers would cause. A cold / shared
+    /// head keeps the scratch dispatch: its observer is a co-owner's too, and one
+    /// branch's move must not fire there (constraint C2).
+    fn deliver(
+        &self,
+        doc: &LoroDoc,
+        subs: SubsSnapshot,
+        pending: Vec<DocDiff>,
+        lens_delivery: bool,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        if lens_delivery {
+            doc.emit_collected_diffs(pending);
+        } else {
+            self.dispatch_to_branch(subs, pending);
+        }
+    }
+
     /// The registry-locked core of `resolve`: picks an arm, moves `b`, and
-    /// returns the head handle PLUS the pending diff and a subscription snapshot
-    /// for the outer `resolve` to dispatch after the lock drops.
+    /// returns the head handle PLUS the pending diff, a subscription snapshot,
+    /// and whether the resolved head is a LENS head (so the outer `resolve`
+    /// delivers through the head's own observer rather than the scratch
+    /// dispatcher) for the outer `resolve` to deliver after the lock drops.
+    ///
+    /// A fast-forward-only GUARD is hoisted here, ABOVE arm selection, for any
+    /// BOUND head (proposal Section B.1): after `target` is computed it compares
+    /// the bound head's tip against the target on the shared DAG. A `Greater`
+    /// (target is an ancestor of the tip: a regress) or an unheld-frontier error
+    /// HOLDS -- the head is returned unmoved, nothing is delivered, and the hold
+    /// is recorded for `lensHeld`. A `None` (parallel) advances to the join
+    /// `shrink(tip ∪ target)`, a fast-forward that never moves the head off the
+    /// branch's future. `Equal`/`Less` fall through to arm selection unchanged.
+    /// `ResolveCause::Advance` is EXEMPT (a backward `advance` is the branch's one
+    /// intentional backward path; a blanket guard would silently hold it). This
+    /// covers all three arms, including the rebind-to-existing arm the probed
+    /// lineage-ahead regress actually took (rebind to ROOT resting at `by_tip[[]]`).
     fn resolve_collecting(
         &self,
         b: &BranchId,
         intent: Intent,
         cause: ResolveCause,
-    ) -> LoroResult<((HeadId, LoroDoc), Vec<DocDiff>, SubsSnapshot)> {
+    ) -> LoroResult<((HeadId, LoroDoc), Vec<DocDiff>, SubsSnapshot, bool)> {
         let ev = cause.to_event();
         self.with_reg(|this, reg| {
-            let target = this.inner.policy.target(this, b)?;
+            let mut target = this.inner.policy.target(this, b)?;
             let mut pending: Vec<DocDiff> = Vec::new();
 
-            let mut id = match reg.bound.get(b).copied() {
+            // Fast-forward-only guard, above arm selection, for a bound head.
+            let bound_head = reg.bound.get(b).copied();
+            let mut hold = false;
+            if !matches!(cause, ResolveCause::Advance) {
+                if let Some(h) = bound_head {
+                    let tip = reg.heads[&h].tip.clone();
+                    let cmp = {
+                        let ol = this.oplog.lock();
+                        ol.dag.cmp_frontiers(&tip, &target)
+                    };
+                    match cmp {
+                        // target is an ancestor of tip (regress), or references an
+                        // unheld op: HOLD. The head does not move; no event.
+                        Ok(Some(Ordering::Greater)) | Err(_) => {
+                            hold = true;
+                        }
+                        // parallel: advance to the join, a fast-forward that never
+                        // moves the head off the branch's future (Resolved Q2).
+                        Ok(None) => {
+                            let union: Frontiers = tip.iter().chain(target.iter()).collect();
+                            let ol = this.oplog.lock();
+                            target = shrink_frontiers(&union, &ol.dag)
+                                .map_err(LoroError::FrontiersNotFound)?;
+                        }
+                        // Equal (no-op) or Less (fast-forward): fall through.
+                        Ok(Some(Ordering::Equal)) | Ok(Some(Ordering::Less)) => {}
+                    }
+                }
+            }
+            reg.guard_held.insert(b.clone(), hold);
+
+            let mut id = if hold {
+                // No move: keep the branch on its current head. The Write-copy
+                // tail below still privatizes if this is a `lens()` open of a
+                // shared head (a copy at the current tip does not move state).
+                bound_head.expect("hold implies a bound head")
+            } else {
+            match reg.bound.get(b).copied() {
                 Some(h) if reg.heads[&h].tip == target => h,
-                cur => match reg.by_tip.get(&target).copied() {
+                cur => match if reg.open_branches.contains(b) {
+                    // An OPEN (lensed) branch never takes the rebind-to-existing
+                    // arm: it advances its OWN unshared head in place instead of
+                    // rebinding onto a sibling's resting head (copy-on-open,
+                    // invariant 6). Force the arm selection past `by_tip`.
+                    None
+                } else {
+                    reg.by_tip.get(&target).copied()
+                } {
                     Some(h2) => {
                         // Rebind-to-existing arm: a head (h2) already rests at
                         // `target`, so the branch SHARES it instead of computing a
@@ -469,6 +594,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                         }
                     },
                 },
+            }
             };
 
             if intent == Intent::Write && reg.heads[&id].refs > 1 {
@@ -482,7 +608,8 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             }
 
             let subs = this.snapshot_subs(reg, b);
-            Ok(((id, reg.heads[&id].doc.clone()), pending, subs))
+            let lens_delivery = reg.heads[&id].unshared;
+            Ok(((id, reg.heads[&id].doc.clone()), pending, subs, lens_delivery))
         })
     }
 
@@ -530,7 +657,11 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         // policy target clears; `advance_in_place` itself stays neutral.
         let events = doc.checkout_collecting_events(target, ev.0.clone(), ev.1)?;
         let new_tip = doc.state_frontiers();
-        reg.heads.get_mut(&id).expect("head exists").tip = new_tip.clone();
+        let unshared = {
+            let h = reg.heads.get_mut(&id).expect("head exists");
+            h.tip = new_tip.clone();
+            h.unshared
+        };
         if reg.by_tip.get(&old_tip) == Some(&id) {
             reg.by_tip.remove(&old_tip);
         }
@@ -540,7 +671,13 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         // silently dropping the live head from `by_tip`). A `resolve` advance
         // only ever reaches here on a `by_tip` MISS for `target`, so `or_insert`
         // still installs the moved head as the resting owner in that case.
-        reg.by_tip.entry(new_tip).or_insert(id);
+        //
+        // A LENS (unshared) head is NEVER a resting owner: it stays out of
+        // `by_tip` for its whole life so no sibling shares into it (invariant 6,
+        // copy-on-open). Cold heads are unchanged.
+        if !unshared {
+            reg.by_tip.entry(new_tip).or_insert(id);
+        }
         Ok(events)
     }
 
@@ -630,7 +767,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         b: &BranchId,
         target: &Frontiers,
     ) -> LoroResult<LoroDoc> {
-        let (doc, pending, subs) = self.with_reg(|this, reg| {
+        let (doc, pending, subs, lens_delivery) = self.with_reg(|this, reg| {
             let id = *reg.bound.get(b).ok_or_else(|| {
                 LoroError::ArgErr(format!("cannot advance: branch '{b}' is not bound").into_boxed_str())
             })?;
@@ -648,10 +785,12 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             doc.set_detached(false);
             doc.renew_txn_if_auto_commit(None);
             let subs = this.snapshot_subs(reg, b);
-            Ok::<_, LoroError>((doc, pending, subs))
+            let lens_delivery = reg.heads[&id].unshared;
+            Ok::<_, LoroError>((doc, pending, subs, lens_delivery))
         })?;
-        // Deliver the advance's diff after the registry lock drops.
-        self.dispatch_to_branch(subs, pending);
+        // Deliver the advance's diff after the registry lock drops (lens head ->
+        // its own observer; cold head -> the branch-scoped scratch dispatcher).
+        self.deliver(&doc, subs, pending, lens_delivery);
         Ok(doc)
     }
 
@@ -675,5 +814,63 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             this.retire(reg, scratch);
             Ok(out)
         })
+    }
+
+    /// COPY-ON-OPEN: resolve branch `b`'s head for WRITE (privatizing a shared
+    /// head and rebinding onto the private copy, exactly as the superseded
+    /// `window` did), then PIN it as a lens head -- mark it `unshared`, record the
+    /// branch OPEN, and evict it from `by_tip` -- so for the life of the binding it
+    /// is refs == 1 (invariant 6), no sibling shares into it, and it never takes
+    /// the rebind-to-existing arm. Returns the live head `LoroDoc` (the lens); a
+    /// later import/read/write resolve advances THIS same head in place, guarded
+    /// fast-forward-only. This is the single primitive editor / undo / presence /
+    /// canvas bind to. See `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
+    ///
+    /// The window re-exposes the FULL `LoroDoc` history surface
+    /// (`import`/`export`/`checkout`/`detach`/`fork`/version-travel) that
+    /// `BranchingDocHead` withholds. Per a loro maintainer the `MultiHeadDoc`
+    /// shared oplog is always append-only, so that containment is LIKELY
+    /// OVER-CAUTIOUS; the DEEPER containment removal is DEFERRED pending triplicate
+    /// review, and this accessor is the MINIMAL enablement only. The discipline
+    /// that consumers issue only local read/subscribe/edit/commit/undo/cursor on
+    /// the lens is by convention, not by type; `checkout` on it is incoherent while
+    /// the head is behind the shared union.
+    pub fn open_lens(&self, b: &BranchId) -> LoroResult<LoroDoc> {
+        let (id, doc) = self.resolve(b, Intent::Write)?;
+        self.with_reg(|_, reg| {
+            reg.open_branches.insert(b.clone());
+            if let Some(h) = reg.heads.get_mut(&id) {
+                h.unshared = true;
+            }
+            // The open resolve's advance/materialize may have inserted this head
+            // into `by_tip`; evict it so no sibling can share into the lens.
+            let tip = reg.heads[&id].tip.clone();
+            if reg.by_tip.get(&tip) == Some(&id) {
+                reg.by_tip.remove(&tip);
+            }
+        });
+        Ok(doc)
+    }
+
+    /// The current identity generation for branch `b` (bumped on every `rebind`,
+    /// including copy-on-open privatize, branch delete, and backward advance). The
+    /// JS lens cache keys a minted handle by this and re-mints only when it moves.
+    pub fn lens_generation(&self, b: &BranchId) -> u64 {
+        self.with_reg(|_, reg| reg.generation.get(b).copied().unwrap_or(0))
+    }
+
+    /// Whether the fast-forward guard HELD `b` behind a non-forward target on its
+    /// last resolve (one of the two `lensHeld` terms; see `MultiHeadDoc<Delegated>::lens_held`).
+    pub(super) fn guard_held_flag(&self, b: &BranchId) -> bool {
+        self.with_reg(|_, reg| reg.guard_held.get(b).copied().unwrap_or(false))
+    }
+
+    /// Release a branch's copy-on-open pin bookkeeping (open flag, guard-hold flag)
+    /// and invalidate its lens cache generation. Called from `unbind` (branch
+    /// delete); `close_doc` drops the whole doc, taking the pins with it.
+    pub(super) fn release_open(&self, reg: &mut Registry, b: &BranchId) {
+        reg.open_branches.remove(b);
+        reg.guard_held.remove(b);
+        *reg.generation.entry(b.clone()).or_insert(0) += 1;
     }
 }

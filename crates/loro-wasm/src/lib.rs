@@ -2903,6 +2903,19 @@ impl BranchingDocRepo {
     pub fn index(&self) -> BranchingIndex {
         BranchingIndex(self.0.index().clone())
     }
+
+    /// Import LINEAGE/index bytes AND advance every open content doc's lens forward to any
+    /// branch frontier the import just recorded (guarded fast-forward-only). This is Trigger 2
+    /// of the bidirectional lens: use it (not `index().import`) as the lineage sink on a repo
+    /// with open content docs, so a lens bound on a branch whose recorded frontier moved follows
+    /// the import without a manual re-resolve, closing the content-first ordering gap. Mirrors
+    /// `mergeBranch`'s open-docs catch-up. See
+    /// `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
+    #[wasm_bindgen(js_name = "importIndex")]
+    pub fn import_index(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
+        let status = self.0.import_index(bytes)?;
+        Ok(import_status_to_js_value(status)?.into())
+    }
 }
 
 /// A byte-sync + read view of the repo's index doc (frontiers only). Branch existence and
@@ -3263,26 +3276,52 @@ impl Branch {
         })
     }
 
-    /// The LIVE WINDOW: the branch head's OWN aliased `LoroDoc` -- the single primitive the
-    /// editor, `UndoManager`, presence, and canvas all bind to. Unlike `fork` (which EJECTS a
-    /// dead standalone snapshot), an edit + `commit` on the returned doc advances THIS branch's
-    /// head and fires its `subscribeRoot`, and `new UndoManager(window)` succeeds because the
-    /// window is a real `LoroDoc`.
+    /// The LENS: the branch head's OWN aliased `LoroDoc` -- the single bidirectional handle the
+    /// editor, `UndoManager`, presence, and canvas all bind to. COPY-ON-OPEN: the head is
+    /// privatized once and PINNED as the branch's unique, unshared head for the life of the
+    /// binding, so no converging sibling can flip it shared or retire it out from under an open
+    /// editor. Unlike `fork` (which EJECTS a dead standalone snapshot), an edit + `commit`
+    /// advances THIS branch's head and fires its `subscribeRoot`; an import that extends the
+    /// branch FORWARD advances this same head in place (guarded fast-forward-only) and fires it
+    /// too; `new UndoManager(lens)` succeeds because the lens is a real `LoroDoc`. Supersedes the
+    /// earlier `window()`; see `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
     ///
     /// This hands out the FULL wasm `LoroDoc`, re-exposing the history surface
     /// (`import`/`export`/`checkout`/`detach`/`fork`/version-travel) that `BranchingDocHead`
     /// withholds. Per a loro maintainer the `MultiHeadDoc` shared oplog is always append-only,
     /// so that containment is LIKELY OVER-CAUTIOUS; the DEEPER containment removal is DEFERRED
     /// pending triplicate review, and this accessor is the MINIMAL enablement only (see
-    /// `loro_internal::multi_head::Branch::live_window`). The discipline that consumers issue
-    /// only local read/subscribe/edit/commit/undo/cursor on the window is by convention, not by
-    /// type; `checkout` on it is incoherent while the head is behind the shared union.
-    pub fn window(&self) -> JsResult<LoroDoc> {
-        let head = self.doc.branch(self.name.clone()).live_window()?;
+    /// `loro_internal::multi_head::Branch::lens`). The discipline that consumers issue only local
+    /// read/subscribe/edit/commit/undo/cursor on the lens is by convention, not by type;
+    /// `checkout` on it is incoherent while the head is behind the shared union.
+    ///
+    /// Identity: `lens()` mints a fresh JS `LoroDoc` wrapper per call at the wasm layer. The
+    /// consumer keys an identity cache by [`lensGeneration`](Self::lensGeneration) (a TS memo in
+    /// `EngineContentDoc`, re-minting only when the generation moved), which is the chosen cache
+    /// placement (proposal Resolved Question 3).
+    pub fn lens(&self) -> JsResult<LoroDoc> {
+        let head = self.doc.branch(self.name.clone()).lens()?;
         Ok(LoroDoc {
             doc: head,
             root_event_sub: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Whether this branch's lens is currently BEHIND its recorded content (the head-lag signal a
+    /// consumer renders as a read-only affordance): `guard_held || dropped_unheld`. The
+    /// checkable, DAG-keyed replacement for the refuted `isHeadCurrent`-via-`frontierOf`
+    /// derivation. See `MultiHeadDoc<Delegated>::lens_held`.
+    #[wasm_bindgen(js_name = "lensHeld", skip_typescript)]
+    pub fn lens_held(&self) -> bool {
+        self.doc.lens_held(&self.name)
+    }
+
+    /// The lens IDENTITY generation for this branch, bumped on every rebind (copy-on-open
+    /// privatize, branch delete, backward advance). The consumer's identity cache keys a minted
+    /// lens handle by this and re-mints only when it moves (proposal Resolved Question 3).
+    #[wasm_bindgen(js_name = "lensGeneration", skip_typescript)]
+    pub fn lens_generation(&self) -> f64 {
+        self.doc.lens_generation(&self.name) as f64
     }
 }
 
@@ -3316,6 +3355,16 @@ interface Branch {
      * Branch-scoped root subscription. Returns a `() => void` unsubscribe.
      */
     subscribeRoot(f: (event: LoroEventBatch) => void): () => void;
+    /**
+     * Whether this branch's lens is currently BEHIND its recorded content (the head-lag
+     * signal to render as a read-only affordance): `guard_held || dropped_unheld`.
+     */
+    lensHeld(): boolean;
+    /**
+     * The lens identity generation for this branch, bumped on every rebind. Key an
+     * identity cache by this and re-mint the lens handle only when it moves.
+     */
+    lensGeneration(): number;
 }
 "#;
 
