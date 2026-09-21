@@ -304,7 +304,20 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             "eager policies must use their own branch creation (e.g. create_index_branch)"
         );
         let (from_head, _) = self.resolve(from, Intent::Read)?;
-        self.with_reg(|this, reg| this.rebind(reg, new, from_head));
+        self.with_reg(|this, reg| {
+            // Confinement (fork-review finding 3): sharing a lensed (copy-on-open, `unshared`)
+            // head into a second branch would flip it shared and break invariant 6 (a lens head is
+            // refs == 1 for its whole life). This is UNREACHABLE in the content flow -- the repo
+            // creates content branches lazily via the index (`create_index_branch` + materialize),
+            // never through this `OnDivergence` share-a-live-head path from a lensed `from` -- so
+            // this asserts the edge rather than handling it.
+            debug_assert!(
+                !reg.heads.get(&from_head).map(|h| h.unshared).unwrap_or(false),
+                "create_branch from a lensed head would share the pin (invariant 6); \
+                 content branches must materialize lazily instead"
+            );
+            this.rebind(reg, new, from_head)
+        });
         Ok(())
     }
 

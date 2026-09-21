@@ -3255,3 +3255,82 @@ fn lens_generation_stable_then_bumps_on_rebind() {
     let g3 = doc.lens_generation(&b("draft"));
     assert!(g3 > g2, "generation bumped on the delete/unbind rebind");
 }
+
+/// B.4 parity (fork-review finding 1): after the lens-observer delivery switch, a CONTAINER-scoped
+/// `Branch.subscribe` still receives ONLY its container's deltas -- a forward advance that touches
+/// container "t" fires the "t" subscriber but NOT a subscriber scoped to an untouched container "u".
+/// This is the root/ancestor-match filtering `dispatch_to_branch` provided, preserved by emitting
+/// through the lens head's own observer.
+#[test]
+fn lens_container_scoped_subscribe_parity_after_observer_switch() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    // Producer: main has text "t"="hi" and a separate map "u"; snapshot base, then advance ONLY "t".
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| {
+            h.get_text("t").insert_unicode(0, "hi").unwrap();
+            h.get_map("u").insert("k", "v").unwrap();
+        })
+        .unwrap();
+    let idx_base = a.index().export(ExportMode::all_updates()).unwrap();
+    let c_base = ga.export(ExportMode::all_updates()).unwrap();
+    let vv = ga.oplog_vv();
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(2, "!").unwrap())
+        .unwrap();
+    let idx_ahead = a.index().export(ExportMode::all_updates()).unwrap();
+    let c_fwd = ga.export(ExportMode::updates_owned(vv)).unwrap();
+
+    // Consumer: open the lens at base; container-subscribe to "t" and to "u".
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    bb.index().import(&idx_base).unwrap();
+    gb.import(&c_base).unwrap();
+    let lens = gb.branch(GENESIS_BRANCH).lens().unwrap();
+    let cid_t = gb.branch(GENESIS_BRANCH).read(|h| h.get_text("t").id()).unwrap();
+    let cid_u = gb.branch(GENESIS_BRANCH).read(|h| h.get_map("u").id()).unwrap();
+
+    let t_fires = Arc::new(AtomicUsize::new(0));
+    let tf = t_fires.clone();
+    let _t_sub = gb
+        .subscribe_branch(
+            &b(GENESIS_BRANCH),
+            Some(cid_t),
+            Arc::new(move |_ev: crate::event::DiffEvent| {
+                tf.fetch_add(1, SeqCst);
+            }),
+        )
+        .unwrap();
+    let u_fires = Arc::new(AtomicUsize::new(0));
+    let uf = u_fires.clone();
+    let _u_sub = gb
+        .subscribe_branch(
+            &b(GENESIS_BRANCH),
+            Some(cid_u),
+            Arc::new(move |_ev: crate::event::DiffEvent| {
+                uf.fetch_add(1, SeqCst);
+            }),
+        )
+        .unwrap();
+
+    // Forward import touching ONLY "t".
+    gb.import(&c_fwd).unwrap();
+    bb.import_index(&idx_ahead).unwrap();
+
+    assert_eq!(
+        lens.get_text("t").to_string(),
+        "hi!",
+        "the lens advanced forward on the 't' edit"
+    );
+    assert!(
+        t_fires.load(SeqCst) >= 1,
+        "the 't' container subscriber fired for the advance touching 't'"
+    );
+    assert_eq!(
+        u_fires.load(SeqCst),
+        0,
+        "the 'u' container subscriber did NOT fire (container filtering preserved through the head observer)"
+    );
+}
