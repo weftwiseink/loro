@@ -174,10 +174,7 @@ pub struct DocState {
 
     dead_containers_cache: DeadContainersCache,
     alive_containers_cache: Option<AliveContainersCache>,
-    /// Copy-on-divergence sink guard, shared (same `Arc`) with the owning
-    /// `LoroDocInner.head_mode`. When `HEAD_MODE_SHARED`, the two mutation sinks
-    /// (`apply_local_op`, `apply_diff`) refuse with `LoroError::HeadShared`.
-    /// See `MultiHeadDoc`. Held here so the check needs no `Weak` upgrade.
+    /// Copy-on-divergence sink guard, shared with `LoroDocInner.head_mode` (no `Weak` upgrade needed).
     head_mode: Arc<AtomicU8>,
 }
 
@@ -517,20 +514,11 @@ impl DocState {
         }))
     }
 
-    /// Lock-group-aware fork: the same body as [`fork_with_new_peer_id`], but
-    /// the forked state is installed as a `LoroMutex` in the SHARED
-    /// [`LoroLockGroup`] with `LockKind::DocState`, rather than a bare
-    /// `std::sync::Mutex` outside any group.
+    /// Like [`fork_with_new_peer_id`], but the state's lock joins the SHARED [`LoroLockGroup`]
+    /// (`LockKind::DocState`). Heads over one `OpLog` must share its group, or the debug
+    /// lock-order checker cannot see cross-head inversions; the bare-`Mutex` fork must not build a head.
     ///
-    /// This is the copy primitive of copy-on-divergence: every head over one
-    /// `OpLog` must have its `DocState`/`DiffCalculator`/`Txn` locks in the one
-    /// group the `OpLog` lock belongs to, or the `Txn -> OpLog -> DocState ->
-    /// DiffCalculator` order is unenforced across heads and the debug order
-    /// checker cannot see a cross-head inversion. `fork_with_new_peer_id`'s bare
-    /// `Mutex` sits outside that domain and must not be used to build a head.
-    ///
-    /// `head_mode` is the fresh (private) mode handle for the new head; the
-    /// caller stores the same `Arc` on the new `LoroDocInner`.
+    /// `head_mode` is the new head's fresh handle; the caller stores the same `Arc` on its `LoroDocInner`.
     pub fn fork_in_group(
         &mut self,
         doc: Weak<LoroDocInner>,
@@ -560,13 +548,8 @@ impl DocState {
         ))
     }
 
-    /// The head-mode half of the copy-on-divergence sink guard.
-    ///
-    /// Returns `Err(LoroError::HeadShared)` when this state's head is bound to
-    /// more than one branch (immutable). Called at the head of both mutation
-    /// sinks so no path (handler op, import-apply, checkout, undo/redo, a
-    /// mutation inside a `read` closure, or a nested mutation from an event
-    /// callback) can mutate a shared head and corrupt a co-owning branch.
+    /// `Err(HeadShared)` when this head is bound to several branches. Called first in
+    /// both mutation sinks so no path can mutate a shared head.
     #[inline]
     pub(crate) fn ensure_private(&self) -> LoroResult<()> {
         if self.head_mode.load(Ordering::Acquire) == crate::HEAD_MODE_SHARED {
@@ -691,7 +674,6 @@ impl DocState {
         mut diff: InternalDocDiff<'static>,
         diff_mode: DiffMode,
     ) -> LoroResult<()> {
-        // Copy-on-divergence guard: a shared head is immutable. See `MultiHeadDoc`.
         self.ensure_private()?;
         if self.in_txn {
             return Err(LoroError::TransactionError(
@@ -1007,7 +989,6 @@ impl DocState {
     }
 
     pub fn apply_local_op(&mut self, raw_op: &RawOp, op: &Op) -> LoroResult<()> {
-        // Copy-on-divergence guard: a shared head is immutable. See `MultiHeadDoc`.
         self.ensure_private()?;
         // set parent first, `MapContainer` will only be created for TreeID that does not contain
         self.set_container_parent_by_raw_op(raw_op);

@@ -90,19 +90,15 @@ pub struct LoroLockGroup {
 /// a consistent global ordering.
 pub enum LockKind {
     None = 0,
-    /// The head registry of a `MultiHeadDoc`. Acquired before any head lock so
-    /// `resolve` can copy/rebind a head (taking its `Txn`/`DocState` locks)
-    /// while holding the registry.
+    /// Head registry of a `MultiHeadDoc`; taken before any head lock, since `resolve`
+    /// locks heads while holding it.
     BranchRegistry = 1,
     Txn = 2,
     OpLog = 3,
     DocState = 4,
     DiffCalculator = 5,
-    /// The self-rooted index's causal attribution projection (`tips` / `runs`).
-    /// A leaf acquired alone or while the `OpLog` lock is
-    /// already held (`OpLog -> Attribution`), never with a registry or
-    /// `DocState` lock. Ordered after `DiffCalculator` so the debug order
-    /// checker covers it. (Consumed by `MultiHeadDoc<SelfRooted>`.)
+    /// Causal attribution projection (`tips` / `runs`). Leaf: taken alone or under
+    /// `OpLog`, never with a registry or `DocState` lock.
     Attribution = 6,
 }
 

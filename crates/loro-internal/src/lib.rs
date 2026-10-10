@@ -19,11 +19,9 @@ pub use state::container_tree;
 use crate::sync::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::Arc;
 
-/// `head_mode` value: the head is owned by exactly one branch and may be
-/// mutated in place.
+/// `head_mode`: owned by one branch; mutable in place.
 pub(crate) const HEAD_MODE_PRIVATE: u8 = 0;
-/// `head_mode` value: the head is bound to more than one branch and is
-/// immutable. Any mutation reaching a `DocState` sink is refused with
+/// `head_mode`: bound to several branches; immutable. Sinks refuse with
 /// [`loro_common::LoroError::HeadShared`]; the writer must copy first.
 pub(crate) const HEAD_MODE_SHARED: u8 = 1;
 mod change_meta;
@@ -180,43 +178,25 @@ pub struct LoroDocInner {
     first_commit_from_peer_subs:
         SubscriberSetWithQueue<(), FirstCommitFromPeerCallback, FirstCommitFromPeerPayload>,
     pre_commit_subs: SubscriberSetWithQueue<(), PreCommitCallback, PreCommitCallbackPayload>,
-    /// Copy-on-divergence sink guard (see `MultiHeadDoc`). `HEAD_MODE_PRIVATE`
-    /// or `HEAD_MODE_SHARED`. The same `Arc` is held by this inner's `DocState`,
-    /// so the two mutation sinks (`apply_local_op`, `apply_diff`) can check it
-    /// without upgrading the `Weak<LoroDocInner>` back-pointer on the hot path.
-    /// A plain `LoroDoc` (unbranched) is always `HEAD_MODE_PRIVATE`.
+    /// Copy-on-divergence sink guard: `HEAD_MODE_PRIVATE` or `HEAD_MODE_SHARED`.
+    /// Same `Arc` as `DocState`'s, so the sinks check it without a `Weak` upgrade.
     head_mode: Arc<AtomicU8>,
-    /// Registry back-pointer, present exactly when this doc is a head owned by a
-    /// `MultiHeadDoc`. Set once at construction (`None` for a plain
-    /// `LoroDoc`), never mutated. When present it (1) receives the on-commit
-    /// tip-mirror callback from the txn commit path, (2) suppresses peer renewal
-    /// on `checkout` so a head keeps its E2 write-slot peer, and (3) gates
-    /// direct `import` / `set_peer_id` (a head is mutated only through its
-    /// registry: history via `import_to_history`, peer fixed at fork). See
-    /// `MultiHeadDoc`.
+    /// Registry back-pointer; `Some` iff this doc is a `MultiHeadDoc` head. Set once.
+    /// Supplies the on-commit hook, keeps the head's peer across `checkout`, and gates
+    /// direct `import` / `set_peer_id`.
     owner: Option<Arc<dyn DocOwner>>,
 }
 
-/// The registry back-pointer a `MultiHeadDoc` installs on each of its heads.
-///
-/// Object-safe so `LoroDocInner` can hold it type-erased (the registry is
-/// generic over a `HeadPolicy`, which must not leak into `loro-internal`'s
-/// core doc type). The txn commit path invokes [`on_head_commit`] after the
-/// head's locks drop; the registry re-keys its tip index and notifies its
-/// policy there.
-///
-/// [`on_head_commit`]: DocOwner::on_head_commit
+/// Registry back-pointer installed on each head of a `MultiHeadDoc`.
+/// Type-erased so the registry's `HeadPolicy` generic stays out of the core doc type.
 pub trait DocOwner: Send + Sync {
-    /// Called once per non-empty commit on this head, with the committed op
-    /// span, after the head's `Txn`/`OpLog`/`DocState` locks have been
-    /// released (so the callback may take the registry lock).
+    /// Called once per non-empty commit with the committed span, after the head's
+    /// `Txn`/`OpLog`/`DocState` locks are released (so it may take the registry lock).
     fn on_head_commit(&self, id_span: loro_common::IdSpan);
 }
 
 impl LoroDocInner {
-    /// Flip this head between private (writable) and shared (immutable). Called
-    /// by the `MultiHeadDoc` registry inside `rebind`; never on an unbranched
-    /// doc.
+    /// Flip between private (writable) and shared (immutable). Called by registry `rebind`.
     pub(crate) fn set_head_shared(&self, shared: bool) {
         self.head_mode.store(
             if shared {
@@ -232,7 +212,6 @@ impl LoroDocInner {
         self.head_mode.load(std::sync::atomic::Ordering::Acquire) == HEAD_MODE_SHARED
     }
 
-    /// Whether this doc is a registry-owned head (see [`DocOwner`]).
     pub(crate) fn is_owned(&self) -> bool {
         self.owner.is_some()
     }

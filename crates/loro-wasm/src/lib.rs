@@ -566,9 +566,8 @@ fn frontiers_to_ids(frontiers: &Frontiers) -> JsResult<JsIDs> {
     Ok(value.into())
 }
 
-/// The JS string for a `BranchSourceKind`. A single variant under the current
-/// index recovery (`runs` discards a marker's kind), so always `"create"`; the
-/// `BranchSourceKind` TS type keeps the contract's `"create" | "merge"` union.
+/// The JS string for a `BranchSourceKind`; always `"create"` since index recovery discards a
+/// marker's kind.
 fn branch_source_kind_str(kind: BranchSourceKind) -> &'static str {
     match kind {
         BranchSourceKind::Create => "create",
@@ -592,8 +591,7 @@ fn branch_source_to_js(src: &BranchSource) -> JsResult<JsValue> {
     Ok(obj.into())
 }
 
-/// A `DiffBatch` as the `[ContainerID, Diff][]` array `doc.diff` produces (real
-/// `Diff`, not the `for_json` `JsonDiff` variant).
+/// A `DiffBatch` as the `[ContainerID, Diff][]` array `doc.diff` produces.
 fn diff_batch_to_js_array(batch: &DiffBatch) -> JsResult<Array> {
     let arr = Array::new();
     for (id, d) in batch.iter() {
@@ -2533,31 +2531,20 @@ impl LoroDoc {
     }
 }
 
-/// A materialized, head-safe view of a branching document's head.
+/// A head-safe view of a branching document's head: current-state reads, forward local edits and
+/// commits. The history surface (`import*`, `export*`, `checkout`, `detach`/`attach`, `fork`,
+/// oplog/version-travel, doc-wide config) is absent because the branching engine owns the head.
 ///
-/// `BranchingDocHead` exposes only the head-safe subset of `LoroDoc`: reads of the
-/// current state, forward local edits, and commits. The history-bearing surface
-/// (`import*`, `export*`, `checkout`, `detach`/`attach`, `fork`, oplog/version-travel,
-/// and doc-wide config) is intentionally absent, because a head is a shared, live
-/// materialization owned by the branching engine.
+/// The partition is drift-guarded at compile time in `index.ts`.
 ///
-/// The head-safe/history partition is drift-guarded at compile time in `index.ts`
-/// (`Equals<keyof Omit<LoroDoc, HistoryKeys>, keyof BranchingDocHead>` plus a
-/// mutual-assignability check): adding a history method here, or dropping a head-safe
-/// one, trips `tsc`.
-///
-/// > NOTE(claude-opus-4-8/branchingdocrepo): this wraps the wasm `LoroDoc` and delegates,
-/// > rather than the loro-crate `loro::BranchingDocHead`. Wrapping the latter would force a
-/// > public full-`LoroDoc` accessor on it, which would punch a head-safety hole in slice-1's
-/// > compile-time guarantee; delegating to the wasm `LoroDoc` reuses the exact method bodies
-/// > (identical `js_name`s and signatures) and leaves the drift guard as the wasm-layer
-/// > enforcement, which is its designed purpose.
+/// > NOTE(claude-opus-4-8/branchingdocrepo): wraps the wasm `LoroDoc` and delegates, rather than
+/// wrapping `loro::BranchingDocHead`, which would need a public full-`LoroDoc` accessor and punch a
+/// head-safety hole.
 #[wasm_bindgen]
 pub struct BranchingDocHead(LoroDoc);
 
 impl BranchingDocHead {
-    /// Wrap a materialized head. Internal plumbing: `Branch::{read,write}` build one per
-    /// closure invocation over the head `LoroDoc` the repo resolves, and hand it to JS.
+    /// Wrap a materialized head; `Branch::{read,write}` build one per closure invocation.
     pub(crate) fn from_loro_doc(doc: LoroDoc) -> Self {
         Self(doc)
     }
@@ -2726,10 +2713,8 @@ impl BranchingDocHead {
     }
 }
 
-/// Hand-written TypeScript for `BranchingDocHead`'s `skip_typescript` methods, mirroring
-/// the corresponding `LoroDoc` interface-merge blocks (minus the history surface) so the
-/// generic container getters, `getContainerById`, `subscribePreCommit`, and the
-/// prototype-patched `toJsonWithReplacer` are usable and typed from TS.
+/// TypeScript for `BranchingDocHead`'s `skip_typescript` methods, mirroring `LoroDoc`'s minus the
+/// history surface.
 #[wasm_bindgen(typescript_custom_section)]
 const BRANCHING_DOC_HEAD_TYPES: &str = r#"
 interface BranchingDocHead {
@@ -2748,28 +2733,20 @@ interface BranchingDocHead<T extends Record<string, Container> = Record<string, 
 }
 "#;
 
-/// Hand-written TypeScript for the branch-diff producer surface's named types.
-/// The bound methods (`branchSources` / `diffFromFork` / `mergePreview` /
-/// `diffBranches`) are typed by wasm-bindgen from their `typescript_type` extern
-/// returns, which reference these named types; only the types are hand-authored.
+/// TypeScript for the branch-diff named types. The bound methods (`branchSources` / `diffFromFork`
+/// / `mergePreview` / `diffBranches`) reference them via `typescript_type` returns.
 ///
-/// The raw two-frontier `BranchingDocHead.diff` (the Rust delegate the
-/// conveniences' isolation is built beside) is deliberately NOT bound to wasm:
-/// no consumer datum calls it directly, so the conveniences are the only exposed
-/// content-diff entry points. Re-add a `BranchingDocHead.diff` binding only if a
-/// raw branch-inspection view later wants it.
+/// The raw two-frontier `BranchingDocHead.diff` is deliberately not bound to wasm; the conveniences
+/// are the only content-diff entry points.
 #[wasm_bindgen(typescript_custom_section)]
 const BRANCH_DIFF_TYPES: &str = r#"
 /**
- * How a branch came into being. Always "create" in practice: the index
- * attribution runs discard a marker's kind, so `branchSources()` reports every
- * branch's CREATION marker. Kept as the contract's union for forward-compat.
+ * How a branch came into being. Always "create": the index attribution discards a marker's kind.
  */
 export type BranchSourceKind = "create" | "merge";
 /**
- * Where a branch came from: the op-id of its creation marker plus the parent
- * branch NAME (null for genesis). `op` is the marker op itself, distinct from
- * `tips[b]` (the drifted current frontier) and `forkPoint(b)` (the parent frontier).
+ * Where a branch came from: the op-id of its creation marker plus the parent branch NAME
+ * (null for genesis). `op` is the marker op itself, distinct from `tips[b]` and `forkPoint(b)`.
  */
 export type BranchSource = {
     readonly op: OpId;
@@ -2777,9 +2754,8 @@ export type BranchSource = {
     readonly parent: string | null;
 };
 /**
- * The branch-vs-fork-base content diff plus the base doc's shallow TEXT length,
- * both from one `diffFromFork()` call (so the consumer's edited-weight needs no
- * second round-trip). `diff` is the `[ContainerID, Diff][]` `doc.diff` produces.
+ * The branch-vs-fork-base content diff plus the base doc's shallow TEXT length, from one
+ * `diffFromFork()` call. `diff` is the `[ContainerID, Diff][]` `doc.diff` produces.
  */
 export type ForkDiff = {
     readonly diff: [ContainerID, Diff][];
@@ -2787,39 +2763,30 @@ export type ForkDiff = {
 };
 "#;
 
-/// Hand-written TypeScript for the `skip_typescript` `subscribeLocalUpdates` on the
-/// branching doc/index (a `js_sys::Function` argument cannot generate a good
-/// signature), mirroring `LoroDoc.subscribeLocalUpdates`. `version()` /
-/// `oplogVersion()` are NOT skip_typescript, so wasm-bindgen generates them.
+/// TypeScript for the `skip_typescript` `subscribeLocalUpdates` on the branching doc/index (a
+/// `js_sys::Function` argument can't generate a good signature), mirroring
+/// `LoroDoc.subscribeLocalUpdates`.
 #[wasm_bindgen(typescript_custom_section)]
 const BRANCHING_LOCAL_UPDATES_TYPES: &str = r#"
 interface BranchingDoc {
     /**
-     * Subscribe to this content doc's local updates (this peer's commits to the shared op
-     * log, across all branches), mirroring `LoroDoc.subscribeLocalUpdates`. Fires with the
-     * update bytes on a local edit only, never on `import`. Returns an unsubscribe.
+     * Subscribe to this content doc's local updates across all branches. Fires with the update
+     * bytes on a local edit only, never on `import`. Returns an unsubscribe.
      */
     subscribeLocalUpdates(f: (bytes: Uint8Array) => void): () => void;
 }
 interface BranchingIndex {
     /**
-     * Subscribe to this index's local updates (this peer's commits to the shared index op
-     * log), mirroring `LoroDoc.subscribeLocalUpdates`. Fires with the update bytes on a
-     * local edit only, never on `import`. Returns an unsubscribe.
+     * Subscribe to this index's local updates. Fires with the update bytes on a local edit only,
+     * never on `import`. Returns an unsubscribe.
      */
     subscribeLocalUpdates(f: (bytes: Uint8Array) => void): () => void;
 }
 "#;
 
 // ======================================================================
-// BranchingDocRepo wasm surface.
-//
-// Exposes `loro_internal::multi_head::{BranchingDocRepo, BranchingDoc, Branch}` to JS. The
-// load-bearing invariant: `Branch::{read,write}` hand JS a head-safe `BranchingDocHead`
-// (drift-guarded in `index.ts`), NEVER a raw `LoroDoc`. The crossing wraps the head `LoroDoc`
-// the repo resolves in a wasm `LoroDoc` and immediately in a `BranchingDocHead`, mirroring the
-// Rust `Branch::read`'s `BranchingDocHead::from_head(d.clone())`; only the `BranchingDocHead`
-// escapes to JS.
+// Invariant: `Branch::{read,write}` hand JS a head-safe `BranchingDocHead` (drift-guarded in
+// `index.ts`), never a raw `LoroDoc`.
 // ======================================================================
 
 fn merge_outcome_to_str(outcome: MergeOutcome) -> &'static str {
@@ -2830,9 +2797,8 @@ fn merge_outcome_to_str(outcome: MergeOutcome) -> &'static str {
     }
 }
 
-/// Wrap a resolved head `LoroDoc` as a head-safe wasm `BranchingDocHead` for a `read`/`write`
-/// closure. The wasm `LoroDoc` aliases the same underlying head (a cheap `Arc` clone), so edits
-/// through the head's containers land on the head the repo committed on closure exit.
+/// Wrap a resolved head `LoroDoc` as a head-safe `BranchingDocHead`. It aliases the same head
+/// (cheap `Arc` clone), so edits land on the head the repo commits on closure exit.
 fn head_for_js(head: &LoroDocInner) -> JsValue {
     let doc = LoroDoc {
         doc: head.clone(),
@@ -2841,8 +2807,8 @@ fn head_for_js(head: &LoroDocInner) -> JsValue {
     JsValue::from(BranchingDocHead::from_loro_doc(doc))
 }
 
-/// Turn a registry-owned `BranchSubscription` into a JS `() => void` unsubscribe closure.
-/// Dropping the subscription removes it from the registry (following the branch across rebinds).
+/// A `BranchSubscription` as a JS `() => void` unsubscribe; dropping it unregisters it from the
+/// registry.
 fn branch_subscription_to_js(sub: BranchSubscription) -> JsValue {
     let mut holder = Some(sub);
     let closure = Closure::wrap(Box::new(move || {
@@ -2904,13 +2870,9 @@ impl BranchingDocRepo {
         BranchingIndex(self.0.index().clone())
     }
 
-    /// Import LINEAGE/index bytes AND advance every open content doc's lens forward to any
-    /// branch frontier the import just recorded (guarded fast-forward-only). This is Trigger 2
-    /// of the bidirectional lens: use it (not `index().import`) as the lineage sink on a repo
-    /// with open content docs, so a lens bound on a branch whose recorded frontier moved follows
-    /// the import without a manual re-resolve, closing the content-first ordering gap. Mirrors
-    /// `mergeBranch`'s open-docs catch-up. See
-    /// `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
+    /// Import LINEAGE/index bytes and advance every open content doc's lens forward to any branch
+    /// frontier the import recorded (fast-forward only). Use this, not `index().import`, as the
+    /// lineage sink on a repo with open content docs.
     #[wasm_bindgen(js_name = "importIndex")]
     pub fn import_index(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
         let status = self.0.import_index(bytes)?;
@@ -2918,16 +2880,12 @@ impl BranchingDocRepo {
     }
 }
 
-/// A byte-sync + read view of the repo's index doc (frontiers only). Branch existence and
-/// per-doc frontier records travel between peers through the DOC-LEVEL `import`/`export`
-/// here, NOT through any head handle: the index heads carry frontier records, so no head is
-/// ever handed out from this type. `import`/`export` operate on the shared op log through the
-/// engine's root head (never materializing a live head), exactly as `MultiHeadDoc::import`/
-/// `export` do; that is why they are head-safe.
+/// Byte-sync and read view of the repo's index doc. Branch existence and per-doc frontier records
+/// travel between peers via doc-level `import`/`export` here; no head is handed out. Both operate
+/// on the shared op log without materializing a head, so they are head-safe.
 ///
-/// NOTE(claude-opus-4-8/branchingdocrepo-wasm-sync): the per-branch recorded-frontier
-/// READ surface (individual `docs[doc].heads` records) stays deferred; only the branch list
-/// and whole-index byte sync are exposed. Byte sync needs no per-record accessor.
+/// NOTE(claude-opus-4-8/branchingdocrepo-wasm-sync): the per-branch recorded-frontier read surface
+/// (`docs[doc].heads`) is not exposed; byte sync needs no per-record accessor.
 #[wasm_bindgen]
 pub struct BranchingIndex(IndexDoc);
 
@@ -2938,31 +2896,26 @@ impl BranchingIndex {
         self.0.branches().iter().map(|b| b.to_string()).collect()
     }
 
-    /// Export the index's shared history for cross-peer sync (byte-level). Mirrors
-    /// `LoroDoc::export`: `{ mode: "update" }` yields the update bytes a peer imports to
-    /// learn which branches exist and where each is recorded. History/ops export is
-    /// head-independent (the op log is shared).
+    /// Export the index's shared history for cross-peer sync. Mirrors `LoroDoc::export`: `{ mode:
+    /// "update" }` yields bytes a peer imports to learn which branches exist and where each is
+    /// recorded.
     pub fn export(&self, mode: JsExportMode) -> JsResult<Vec<u8>> {
         let export_mode = js_to_export_mode(mode)
             .map_err(|e| JsValue::from_str(&format!("Invalid export mode. Error: {:?}", e)))?;
         Ok(self.0.export(export_mode)?)
     }
 
-    /// Import index history from a peer (byte-level). History-only + all-heads-barriered:
-    /// ops land in the shared op log without moving any head's state, then the `SelfRooted`
-    /// policy's `after_import` discovers remote branches from the marker scan and advances
-    /// the affected index heads. This is how a peer LEARNS a remote branch and where it sits;
-    /// the content ops themselves arrive via [`BranchingDoc::import`].
+    /// Import index history from a peer. History-only and all-heads-barriered: ops land without
+    /// moving any head, then the `SelfRooted` policy's `after_import` discovers remote branches and
+    /// advances the affected index heads. Content ops arrive via [`BranchingDoc::import`].
     pub fn import(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
         let status = self.0.import(bytes)?;
         Ok(import_status_to_js_value(status)?.into())
     }
 
-    /// Subscribe to this index's LOCAL updates (this peer's commits to the shared
-    /// index op log, across all branches), mirroring `LoroDoc::subscribeLocalUpdates`.
-    /// Fires with the local update bytes on a local edit ONLY, NEVER on `import`, so a
-    /// wire adaptor driven off it does not echo imported ops back out. Returns a
-    /// `() => void` unsubscribe.
+    /// Subscribe to this index's LOCAL updates across all branches, mirroring
+    /// `LoroDoc::subscribeLocalUpdates`. Fires on local edits only, never on `import`, so a wire
+    /// adaptor does not echo imports. Returns a `() => void` unsubscribe.
     #[wasm_bindgen(js_name = "subscribeLocalUpdates", skip_typescript)]
     pub fn subscribe_local_updates(&self, f: js_sys::Function) -> JsValue {
         let observer = observer::Observer::new(f);
@@ -2976,25 +2929,21 @@ impl BranchingIndex {
         subscription_to_js_function_callback(sub)
     }
 
-    /// The version vector of the shared index op log (everything this peer holds
-    /// across all branches). Mirrors `LoroDoc::version`. The op log is the sync unit
-    /// (`export({ mode: "update", from })` reads it), so this is the version a wire
-    /// adaptor compares against a peer's and exports the delta from.
+    /// Version vector of the shared index op log (everything this peer holds). Mirrors
+    /// `LoroDoc::version`; a wire adaptor compares it against a peer's to export the delta.
     pub fn version(&self) -> VersionVector {
         VersionVector(self.0.oplog_vv())
     }
 
-    /// The version vector of the shared index op log. For a branching doc this is
-    /// identical to [`version`](Self::version): a `MultiHeadDoc` has no single
-    /// materialized state, so both collapse to the shared-oplog vv. Mirrors
-    /// `LoroDoc::oplogVersion`.
+    /// Same as [`version`](Self::version): a `MultiHeadDoc` has no single materialized state.
+    /// Mirrors `LoroDoc::oplogVersion`.
     #[wasm_bindgen(js_name = "oplogVersion")]
     pub fn oplog_version(&self) -> VersionVector {
         VersionVector(self.0.oplog_vv())
     }
 
-    /// Every branch's index frontier as `{ [branch]: OpId[] }` -- the derived,
-    /// read-only `active_branches` projection (each value is `target(branch)`).
+    /// Every branch's index frontier as `{ [branch]: OpId[] }` (the derived `active_branches`
+    /// projection).
     pub fn tips(&self) -> JsResult<JsBranchTips> {
         let obj = Object::new();
         for (branch, frontier) in self.0.tips() {
@@ -3007,18 +2956,16 @@ impl BranchingIndex {
         Ok(JsValue::from(obj).into())
     }
 
-    /// The index frontier branch `b` was forked from: the deps of `b`'s creation
-    /// marker (the cross-doc fork point, which lives only in the index). Empty
-    /// for the genesis branch and for an unknown branch.
+    /// The index frontier branch `b` was forked from (deps of its creation marker). Empty for
+    /// genesis or an unknown branch.
     #[wasm_bindgen(js_name = "forkPoint")]
     pub fn fork_point(&self, b: &str) -> JsResult<JsIDs> {
         frontiers_to_ids(&self.0.fork_point(&b.into()))
     }
 
-    /// The document ids branch `b` ITSELF modified since it forked (a fork-point
-    /// diff: docs whose recorded frontier at `tips[b]` differs from their state
-    /// at `fork_point(b)`). Docs inherited unchanged from the fork parent are
-    /// excluded. Empty for an unknown branch.
+    /// Doc ids branch `b` itself modified since it forked (docs whose frontier at `tips[b]` differs
+    /// from their state at `fork_point(b)`). Docs inherited unchanged are excluded. Empty for an
+    /// unknown branch.
     #[wasm_bindgen(js_name = "docsModifiedOnBranch")]
     pub fn docs_modified_on_branch(&self, b: &str) -> JsResult<Vec<String>> {
         Ok(self
@@ -3029,11 +2976,8 @@ impl BranchingIndex {
             .collect())
     }
 
-    /// Every branch's SOURCE as `{ [branch]: BranchSource }` -- the creation
-    /// marker's op-id, its kind (always `"create"` under the current recovery),
-    /// and the parent branch name (`null` for genesis). The holistic sibling of
-    /// `tips()` (where each branch IS) and `forkPoint()` (a branch's parent
-    /// FRONTIER): this surfaces the creation-marker op itself.
+    /// Every branch's SOURCE as `{ [branch]: BranchSource }`: creation-marker op-id, kind (always
+    /// `"create"`), and parent branch name (`null` for genesis).
     #[wasm_bindgen(js_name = "branchSources")]
     pub fn branch_sources(&self) -> JsResult<JsBranchSources> {
         let obj = Object::new();
@@ -3047,10 +2991,9 @@ impl BranchingIndex {
         Ok(JsValue::from(obj).into())
     }
 
-    /// The doc-ids whose recorded head DIFFERS between branches `a` and `b`: a
-    /// SYMMETRIC head-vs-head doc-set diff over the UNION of both branches' keys
-    /// (captures a doc changed on either side, unlike the asymmetric
-    /// `docsModifiedOnBranch`). Empty when `a == b` or their heads match.
+    /// Doc ids whose recorded head differs between branches `a` and `b`: a symmetric diff over the
+    /// union of both key sets (unlike the asymmetric `docsModifiedOnBranch`). Empty when `a == b`
+    /// or heads match.
     #[wasm_bindgen(js_name = "diffDocs")]
     pub fn diff_docs(&self, a: &str, b: &str) -> JsResult<Vec<String>> {
         Ok(self
@@ -3109,11 +3052,10 @@ impl BranchingDoc {
         frontiers_to_ids(&self.0.frontier_of(&b.into())?)
     }
 
-    /// What `branch` changed since it forked from `against`: `{ diff, mergeBaseLength }`.
-    /// The diff's baseline is the DYNAMIC merge-base (git-style GCA over the two
-    /// content frontiers), NOT the static `forkPoint`, so it stays correct after a
-    /// cross-merge. `mergeBaseLength` is the base doc's shallow TEXT length. Backs
-    /// the consumer's divergence weight AND per-doc line +/- from one call.
+    /// What `branch` changed since it forked from `against`: `{ diff, mergeBaseLength }`. The
+    /// baseline is the DYNAMIC merge-base (git-style GCA of the two content frontiers), not the
+    /// static `forkPoint`, so it stays correct after a cross-merge. `mergeBaseLength` is the base
+    /// doc's shallow TEXT length.
     #[wasm_bindgen(js_name = "diffFromFork")]
     pub fn diff_from_fork(&self, branch: &str, against: &str) -> JsResult<JsForkDiff> {
         let fork: ForkDiff = self.0.diff_from_fork(&branch.into(), &against.into())?;
@@ -3128,11 +3070,9 @@ impl BranchingDoc {
         Ok(JsValue::from(obj).into())
     }
 
-    /// What merging `source` into `target` would ADD to `target`: the additive
-    /// VV-union effect `diff(targetHead, union(target, source))`. EMPTY when
-    /// `source` is already contained in `target`, and free of spurious deletions
-    /// of `target`'s own edits (the union is a superset of `target`). NOT
-    /// head-vs-head. An unresolvable frontier throws (never a silent empty preview).
+    /// What merging `source` into `target` would ADD: `diff(targetHead, union(target, source))`.
+    /// Empty when `source` is already contained, and free of spurious deletions of `target`'s
+    /// edits. Not head-vs-head. An unresolvable frontier throws.
     #[wasm_bindgen(js_name = "mergePreview")]
     pub fn merge_preview(&self, target: &str, source: &str) -> JsResult<JsContainerDiffBatch> {
         let batch = self.0.merge_preview(&target.into(), &source.into())?;
@@ -3141,10 +3081,9 @@ impl BranchingDoc {
         Ok(v.into())
     }
 
-    /// A raw head-vs-head content diff between two branches
-    /// (`diff(frontierOf(a), frontierOf(b))`). For a "compare two branches"
-    /// inspection view ONLY -- never a merge-base or merge-preview backing, which
-    /// it would mis-serve by double-counting each side's concurrent changes.
+    /// A raw head-vs-head content diff (`diff(frontierOf(a), frontierOf(b))`) for branch-comparison
+    /// views ONLY; it double-counts concurrent changes, so never back a merge-base or merge-preview
+    /// with it.
     #[wasm_bindgen(js_name = "diffBranches")]
     pub fn diff_branches(&self, a: &str, b: &str) -> JsResult<JsContainerDiffBatch> {
         let batch = self.0.diff_branches(&a.into(), &b.into())?;
@@ -3166,32 +3105,26 @@ impl BranchingDoc {
         Ok(self.0.export_oplog_slice(&from, to.as_ref())?)
     }
 
-    /// Export this content doc's shared history for cross-peer sync (byte-level). Mirrors
-    /// `LoroDoc::export`. Pair with an index export ([`BranchingIndex::export`]): a peer
-    /// imports the index first (to learn the branches) and then this doc's content bytes.
+    /// Export this content doc's shared history for cross-peer sync. Mirrors `LoroDoc::export`; a
+    /// peer imports the paired index ([`BranchingIndex::export`]) first, then these bytes.
     pub fn export(&self, mode: JsExportMode) -> JsResult<Vec<u8>> {
         let export_mode = js_to_export_mode(mode)
             .map_err(|e| JsValue::from_str(&format!("Invalid export mode. Error: {:?}", e)))?;
         Ok(self.0.export(export_mode)?)
     }
 
-    /// Import content history from a peer (byte-level). History-only + all-heads-barriered:
-    /// ops land in the shared op log without corrupting any shared head, then the `Delegated`
-    /// policy's `after_import` EAGERLY re-resolves every branch the index knows -- a branch
-    /// whose recorded ids for this doc just became held advances to them (the ingest); ids
-    /// still unheld are dropped by `target` and picked up on the next import. Import the
-    /// paired index bytes ([`BranchingIndex::import`]) FIRST so the branch is already known.
+    /// Import content history from a peer. History-only and all-heads-barriered: the `Delegated`
+    /// policy's `after_import` re-resolves every branch the index knows, advancing those whose
+    /// recorded ids for this doc are now held; unheld ids are dropped and picked up on a later
+    /// import. Import the paired index bytes ([`BranchingIndex::import`]) FIRST.
     pub fn import(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
         let status = self.0.import(bytes)?;
         Ok(import_status_to_js_value(status)?.into())
     }
 
-    /// Subscribe to this content doc's LOCAL updates (this peer's commits to the
-    /// shared op log, across ALL branches -- forwarders are installed on every head,
-    /// including a non-main branch's copy-on-divergence head), mirroring
-    /// `LoroDoc::subscribeLocalUpdates`. Fires with the local update bytes on a local
-    /// edit ONLY, NEVER on `import`, so a wire adaptor driven off it does not echo
-    /// imported ops back out. Returns a `() => void` unsubscribe.
+    /// Subscribe to this doc's LOCAL updates across ALL branches, mirroring
+    /// `LoroDoc::subscribeLocalUpdates`. Fires on local edits only, never on `import`. Returns a
+    /// `() => void` unsubscribe.
     #[wasm_bindgen(js_name = "subscribeLocalUpdates", skip_typescript)]
     pub fn subscribe_local_updates(&self, f: js_sys::Function) -> JsValue {
         let observer = observer::Observer::new(f);
@@ -3205,17 +3138,14 @@ impl BranchingDoc {
         subscription_to_js_function_callback(sub)
     }
 
-    /// The version vector of the shared op log (everything this peer holds across all
-    /// branches). Mirrors `LoroDoc::version`. The op log is the sync unit
-    /// (`export({ mode: "update", from })` reads it), so this is the version a wire
-    /// adaptor compares against a peer's and exports the delta from.
+    /// Version vector of the shared op log (everything this peer holds). Mirrors
+    /// `LoroDoc::version`; a wire adaptor compares it against a peer's to export the delta.
     pub fn version(&self) -> VersionVector {
         VersionVector(self.0.oplog_vv())
     }
 
-    /// The version vector of the shared op log. For a branching doc this is identical
-    /// to [`version`](Self::version): a `MultiHeadDoc` has no single materialized
-    /// state, so both collapse to the shared-oplog vv. Mirrors `LoroDoc::oplogVersion`.
+    /// Same as [`version`](Self::version): a `MultiHeadDoc` has no single materialized state.
+    /// Mirrors `LoroDoc::oplogVersion`.
     #[wasm_bindgen(js_name = "oplogVersion")]
     pub fn oplog_version(&self) -> VersionVector {
         VersionVector(self.0.oplog_vv())
@@ -3276,29 +3206,19 @@ impl Branch {
         })
     }
 
-    /// The LENS: the branch head's OWN aliased `LoroDoc` -- the single bidirectional handle the
-    /// editor, `UndoManager`, presence, and canvas all bind to. COPY-ON-OPEN: the head is
-    /// privatized once and PINNED as the branch's unique, unshared head for the life of the
-    /// binding, so no converging sibling can flip it shared or retire it out from under an open
-    /// editor. Unlike `fork` (which EJECTS a dead standalone snapshot), an edit + `commit`
-    /// advances THIS branch's head and fires its `subscribeRoot`; an import that extends the
-    /// branch FORWARD advances this same head in place (guarded fast-forward-only) and fires it
-    /// too; `new UndoManager(lens)` succeeds because the lens is a real `LoroDoc`. Supersedes the
-    /// earlier `window()`; see `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
+    /// The LENS: the branch head's own aliased `LoroDoc`, the single bidirectional handle the
+    /// editor, `UndoManager`, presence and canvas bind to. COPY-ON-OPEN: the head is privatized
+    /// once and PINNED as the branch's unshared head for the binding's life. Unlike `fork`, an edit
+    /// + `commit` advances THIS branch's head and fires its `subscribeRoot`, and a forward import
+    /// advances it in place (fast-forward only); `new UndoManager(lens)` works.
     ///
-    /// This hands out the FULL wasm `LoroDoc`, re-exposing the history surface
-    /// (`import`/`export`/`checkout`/`detach`/`fork`/version-travel) that `BranchingDocHead`
-    /// withholds. Per a loro maintainer the `MultiHeadDoc` shared oplog is always append-only,
-    /// so that containment is LIKELY OVER-CAUTIOUS; the DEEPER containment removal is DEFERRED
-    /// pending triplicate review, and this accessor is the MINIMAL enablement only (see
-    /// `loro_internal::multi_head::Branch::lens`). The discipline that consumers issue only local
-    /// read/subscribe/edit/commit/undo/cursor on the lens is by convention, not by type;
-    /// `checkout` on it is incoherent while the head is behind the shared union.
+    /// This hands out the FULL wasm `LoroDoc`, re-exposing the history surface that
+    /// `BranchingDocHead` withholds. Consumers should only read/subscribe/edit/commit/undo/cursor
+    /// on the lens, by convention not by type; `checkout` is incoherent while the head is behind
+    /// the shared union. See `loro_internal::multi_head::Branch::lens`.
     ///
-    /// Identity: `lens()` mints a fresh JS `LoroDoc` wrapper per call at the wasm layer. The
-    /// consumer keys an identity cache by [`lensGeneration`](Self::lensGeneration) (a TS memo in
-    /// `EngineContentDoc`, re-minting only when the generation moved), which is the chosen cache
-    /// placement (proposal Resolved Question 3).
+    /// Identity: each call mints a fresh JS `LoroDoc` wrapper; key an identity cache by
+    /// [`lensGeneration`](Self::lensGeneration).
     pub fn lens(&self) -> JsResult<LoroDoc> {
         let head = self.doc.branch(self.name.clone()).lens()?;
         Ok(LoroDoc {
@@ -3307,26 +3227,22 @@ impl Branch {
         })
     }
 
-    /// Whether this branch's lens is currently BEHIND its recorded content (the head-lag signal a
-    /// consumer renders as a read-only affordance): `guard_held || dropped_unheld`. The
-    /// checkable, DAG-keyed replacement for the refuted `isHeadCurrent`-via-`frontierOf`
-    /// derivation. See `MultiHeadDoc<Delegated>::lens_held`.
+    /// Whether this branch's lens is BEHIND its recorded content (head-lag signal for a read-only
+    /// affordance): `guard_held || dropped_unheld`. See `MultiHeadDoc<Delegated>::lens_held`.
     #[wasm_bindgen(js_name = "lensHeld", skip_typescript)]
     pub fn lens_held(&self) -> bool {
         self.doc.lens_held(&self.name)
     }
 
-    /// The lens IDENTITY generation for this branch, bumped on every rebind (copy-on-open
-    /// privatize, branch delete, backward advance). The consumer's identity cache keys a minted
-    /// lens handle by this and re-mints only when it moves (proposal Resolved Question 3).
+    /// The lens identity generation, bumped on every rebind (copy-on-open privatize, branch delete,
+    /// backward advance). Re-mint the cached lens only when it moves.
     #[wasm_bindgen(js_name = "lensGeneration", skip_typescript)]
     pub fn lens_generation(&self) -> f64 {
         self.doc.lens_generation(&self.name) as f64
     }
 }
 
-/// Bridge a JS callback to a `Subscriber`, routing events through the pending-event queue (the
-/// same discipline as `LoroDoc::subscribe`).
+/// Bridge a JS callback to a `Subscriber`, routing events through the pending-event queue.
 fn js_function_to_subscriber(f: js_sys::Function) -> Subscriber {
     let observer = observer::Observer::new(f);
     Arc::new(move |e: DiffEvent| {
@@ -3334,8 +3250,7 @@ fn js_function_to_subscriber(f: js_sys::Function) -> Subscriber {
     })
 }
 
-/// Hand-written TypeScript for the `skip_typescript` methods on `Branch`: typed callbacks so the
-/// head-safe `BranchingDocHead` surface is visible to consumers and the round-trip stays typed.
+/// TypeScript for the `skip_typescript` methods on `Branch`, with typed callbacks.
 #[wasm_bindgen(typescript_custom_section)]
 const BRANCHING_REPO_TYPES: &str = r#"
 interface Branch {

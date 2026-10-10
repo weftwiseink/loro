@@ -1680,17 +1680,10 @@ impl LoroDoc {
     }
 }
 
-/// The public, head-safe branch-facing surface: a pass-through newtype over
-/// [`LoroDoc`] that exposes ONLY the methods that read or write a resolved
-/// branch head's materialized state or transaction, and deliberately OMITS
-/// every history / position / attachment / identity / config op
-/// (`import*`, `export*`, `checkout`, `attach`, `detach`, `checkout_to_latest`,
-/// `fork*`, `oplog_*`, `frontiers`, `set_peer_id`, `config*`, `diff`, ...).
-///
-/// This is the public `loro`-crate mirror of `loro_internal::multi_head::
-/// BranchingDocHead`; the wasm class and the `Equals<Omit<LoroDoc, HistoryKeys>>`
-/// `.d.ts` drift guard build on it. The absence is a type-level guarantee: the
-/// omitted ops do not exist on this type and do not compile, e.g.:
+/// Head-safe view of a resolved branch head: a newtype over [`LoroDoc`] exposing only methods
+/// that read or write the head's state or transaction. History, position, attachment, identity
+/// and config ops (`import*`, `export*`, `checkout`, `attach`, `detach`, `fork*`, `oplog_*`,
+/// `frontiers`, `set_peer_id`, `config*`, `diff`, ...) are absent, so they fail to compile:
 ///
 /// ```compile_fail
 /// # use loro::BranchingDocHead;
@@ -1712,20 +1705,15 @@ impl LoroDoc {
 #[derive(Debug, Clone)]
 pub struct BranchingDocHead(LoroDoc);
 
-// Every method here forwards verbatim to the identically-named `LoroDoc` method
-// (see its docs); the head-safe SURFACE is documented on the type above.
-// `from_doc`/`from_inner` are the (not-yet-wired) constructors the public branch
-// read/write closures will use once that surface lands.
+// Each method forwards to the same-named `LoroDoc` method.
 #[allow(missing_docs, dead_code)]
 impl BranchingDocHead {
-    /// Wrap a resolved branch head. Crate-internal: consumers receive a
-    /// `&BranchingDocHead` from a branch read/write closure, never construct one.
+    /// Wrap a resolved branch head (crate-internal).
     pub(crate) fn from_doc(doc: LoroDoc) -> Self {
         Self(doc)
     }
 
-    /// Wrap a raw internal head doc (a `MultiHeadDoc` head) as the public
-    /// head-safe surface.
+    /// Wrap a raw internal head doc.
     pub(crate) fn from_inner(inner: InnerLoroDoc) -> Self {
         Self(LoroDoc::_new(inner))
     }

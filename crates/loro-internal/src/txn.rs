@@ -68,10 +68,7 @@ impl crate::LoroDoc {
 
         let obs = self.observer.clone();
         let local_update_subs_weak = self.local_update_subs.downgrade();
-        // The registry back-pointer's on-commit tip-mirror hook (see `DocOwner`
-        // / `MultiHeadDoc`). `None` for a plain doc, so unbranched behaviour is
-        // unchanged. Runs after the head's locks drop, so it may take the
-        // registry lock to re-key its tip index and notify its policy.
+        // Fires after the head's locks drop, so it may take the registry lock.
         let owner = self.owner.clone();
         txn.set_on_commit(Box::new(move |state, oplog, id_span| {
             let mut state = state.lock();
@@ -528,13 +525,8 @@ impl Transaction {
                         })
                         .collect(),
                 ),
-                // E1 site B: a registry-owned head's commit event must carry
-                // THIS head's new frontier (branch-scoped), not the shared
-                // union `oplog.frontiers()`. `last_id` is this head's last
-                // committed op, so `Frontiers::from_id(last_id)` is the branch's
-                // frontier. A branch-scoped subscriber (`Branch::subscribe`)
-                // would otherwise see a `to` version polluted by other branches'
-                // concurrent ops. Unbranched docs keep the union (unchanged).
+                // Owned head: report THIS head's new frontier, not the shared union,
+                // so branch subscribers don't see other branches' ops.
                 new_version: if doc.is_owned() {
                     Cow::Owned(Frontiers::from_id(last_id))
                 } else {

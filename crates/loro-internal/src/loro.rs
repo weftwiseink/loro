@@ -172,15 +172,9 @@ impl LoroDoc {
         LoroDoc { inner }
     }
 
-    /// Build a `LoroDoc` head that shares an existing `OpLog`, arena, config,
-    /// and `LoroLockGroup` with its sibling heads of a `MultiHeadDoc`.
-    ///
-    /// Each head gets its OWN `DocState` (built by `make_state`, so the caller
-    /// picks `DocState::new_arc` for the root head or `DocState::fork_in_group`
-    /// for a copy), its own `DiffCalculator`, `Txn` lock, observer, and
-    /// `head_mode`, all created in the shared `lock_group`. This is the one
-    /// construction site for a head over a shared op log; the fields mirror
-    /// `LoroDoc::new` exactly except for the shared vs. fresh oplog.
+    /// Build a head sharing an existing `OpLog`, arena, config and `LoroLockGroup` with its
+    /// siblings in a `MultiHeadDoc`. Each head gets its own `DocState` (from `make_state`),
+    /// `DiffCalculator`, `Txn` lock, observer and `head_mode`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_head(
         oplog: Arc<LoroMutex<OpLog>>,
@@ -264,14 +258,9 @@ impl LoroDoc {
     ///   It also doesn't change the version of the [DocState]. The changes will be
     ///   recorded into [OpLog] only. You need to call `checkout` to make it take effect.
     pub fn set_detached_editing(&self, enable: bool) {
-        // SEAM NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `config` is
-        // Arc-SHARED across every head of a MultiHeadDoc, so this flips detached
-        // editing for ALL heads at once and is not branch-scoped. It is absent
-        // from `BranchingDocHead` (a config/attachment op) and reachable only via
-        // the raw `doc()` seam; the registry never calls it. Left ungated for
-        // now (it does not by itself move a head to the union — the checkout /
-        // attach / import gates cover the actual corruption vectors). Flagged for
-        // the checkout-affordances RFP with the rest of the detached surface.
+        // NOTE: `config` is Arc-shared across all heads of a MultiHeadDoc, so this flips detached
+        // editing for every head and is not branch-scoped. Not exposed on `BranchingDocHead`;
+        // the registry never calls it.
         self.config.set_detached_editing(enable);
         if enable && self.is_detached() {
             self.with_barrier(|| {
@@ -290,7 +279,7 @@ impl LoroDoc {
 
     #[inline(always)]
     pub fn set_peer_id(&self, peer: PeerID) -> LoroResult<()> {
-        // A registry-owned head's peer is its E2 write slot, fixed at fork.
+        // A registry-owned head's peer is fixed at fork.
         if self.is_owned() {
             return Err(LoroError::OwnedHeadOp("set_peer_id"));
         }
@@ -332,7 +321,6 @@ impl LoroDoc {
 
     /// Renews the PeerID for the document.
     pub(crate) fn renew_peer_id(&self) {
-        // Registry-owned heads keep their peer; never renew it internally.
         if self.is_owned() {
             return;
         }
@@ -648,9 +636,7 @@ impl LoroDoc {
 
     #[inline(always)]
     pub fn detach(&self) {
-        // Part of the deferred checkout/attach/detach trio: prevented on a
-        // registry-owned head (a branch has no free-standing detach; the
-        // registry owns head attachment). No-op with an observable warning.
+        // Owned heads have no free-standing detach; the registry owns attachment. No-op with a warning.
         if self.is_owned() {
             warn!("detach() ignored on a registry-owned head (deferred to the branching RFP)");
             return;
@@ -699,32 +685,19 @@ impl LoroDoc {
         bytes: &[u8],
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
-        // A registry-owned head is never import-merged directly: doing so would
-        // apply a diff to that head's state from the shared oplog's union head
-        // (the E1 hazard). History enters through `import_to_history` under the
-        // registry's all-heads barrier, and heads advance via the registry.
+        // Direct import on an owned head would apply a diff from the shared union head (E1 hazard);
+        // history enters via `import_to_history`.
         if self.is_owned() {
             return Err(LoroError::OwnedHeadOp("import"));
         }
         self.with_barrier(|| self._import_with(bytes, origin))
     }
 
-    /// Record changes into the (possibly shared) history WITHOUT moving this
-    /// handle's state or tip: today's detached-import behaviour, made explicit
-    /// and available on an attached handle.
-    ///
-    /// This is the history-only import path a `MultiHeadDoc` uses: ops enter the
-    /// shared `OpLog` but no head's materialized `DocState` is touched, so no
-    /// co-owner of a shared head can be corrupted. Heads observe the new ops
-    /// only when the registry advances them (a guarded `apply_diff` on a
-    /// `refs == 1` head). Unlike `import`, this is allowed on an owned head.
+    /// Record changes into the (possibly shared) history WITHOUT moving this handle's state or tip.
+    /// Unlike `import`, allowed on an owned head; heads advance only via the registry.
     pub fn import_to_history(&self, bytes: &[u8]) -> Result<ImportStatus, LoroError> {
         self.with_barrier(|| {
-            // Force the insert-only path (see
-            // `update_oplog_and_apply_delta_to_state_if_needed` /
-            // `import_changes_and_apply_delta_to_state_if_needed`, which skip the
-            // state diff-apply when detached), regardless of the handle's own
-            // attached state, then restore it.
+            // Force the insert-only path (state diff-apply is skipped when detached), then restore.
             let was_detached = self.is_detached();
             self.set_detached(true);
             let r = self._import_with(bytes, "import_to_history".into());
@@ -1026,16 +999,9 @@ impl LoroDoc {
         state.take_events()
     }
 
-    /// Emit already-collected `DocDiff`s through THIS doc's own observer.
-    ///
-    /// The `MultiHeadDoc` registry uses this to deliver a LENS head's forward
-    /// advance (collected under the registry lock via `checkout_collecting_events`)
-    /// through the head's own observer AFTER the lock drops: the branch's
-    /// subscriptions are installed there, and so is any `UndoManager` / raw
-    /// `subscribe` bound to the lens, so this is the "everything applies naturally"
-    /// delivery. It does the same root/ancestor-match filtering as any observer
-    /// emit. Contrast `dispatch_to_branch`, which emits through a scratch observer
-    /// for a SHARED head (whose own observer must not fire for one branch's move).
+    /// Emit already-collected `DocDiff`s through THIS doc's own observer, with the usual root/ancestor
+    /// filtering. The registry uses it to deliver a lens head's advance after dropping its lock;
+    /// contrast `dispatch_to_branch`, which uses a scratch observer for shared heads.
     pub(crate) fn emit_collected_diffs(&self, events: Vec<DocDiff>) {
         for event in events {
             self.observer.emit(event);
@@ -1047,10 +1013,7 @@ impl LoroDoc {
     /// only supports backward compatibility but not forward compatibility.
     #[tracing::instrument(skip_all)]
     pub fn import_json_updates<T: TryInto<JsonSchema>>(&self, json: T) -> LoroResult<ImportStatus> {
-        // Gated on a registry-owned head like `import`/`import_batch`: this is a
-        // history-merging import that would apply a diff to this head's state
-        // from the shared union (E1). History enters a registry doc through the
-        // repo's `import_to_history` under the all-heads barrier, never on a head.
+        // Owned heads cannot import directly (E1 hazard); see `import_with`.
         if self.is_owned() {
             return Err(LoroError::OwnedHeadOp("import"));
         }
@@ -1768,17 +1731,9 @@ impl LoroDoc {
     }
 
     pub fn checkout_to_latest(&self) {
-        // E1 site A gate: a registry-owned head must never be moved to the
-        // shared union frontier. `oplog.frontiers()` is the union of every
-        // branch's tip, not this head's, so attaching an owned head would apply
-        // a diff from the wrong base and corrupt it (the sink guard does NOT
-        // fire here because an owned head is Private). An owned head advances
-        // only through its registry (internal `advance_in_place`); this is
-        // the runtime backstop for the `ContainerTrait::doc()` re-entry path
-        // (`BranchingDocHead` omits `attach`/`checkout_to_latest` at the type
-        // level). No-op rather than error to keep the `()` signature the
-        // `loro`/wasm wrappers depend on (see the unit report). Part of the
-        // deferred checkout/attach/checkout_to_latest trio.
+        // E1 site A: an owned head must never move to the shared union frontier (a diff from the
+        // wrong base would corrupt it, and the sink guard does not fire on a Private head). Owned
+        // heads advance only via the registry. No-op, not an error, to keep the `()` signature.
         if self.is_owned() {
             warn!(
                 "attach()/checkout_to_latest() ignored on a registry-owned head \
@@ -1843,8 +1798,7 @@ impl LoroDoc {
             )?;
             // We don't need to shrink frontiers because oplog's frontiers are already shrinked.
             this.emit_events();
-            // Registry-owned heads keep their peer (their E2 write slot) across
-            // a checkout; only standalone detached-editing docs renew it.
+            // Owned heads keep their peer across checkout.
             if this.config.detached_editing() && !this.is_owned() {
                 this.renew_peer_id();
             }
@@ -1859,12 +1813,8 @@ impl LoroDoc {
     /// This will make the current [DocState] detached from the latest version of [OpLog].
     /// Any further import will not be reflected on the [DocState], until user call [LoroDoc::attach()]
     pub fn checkout(&self, frontiers: &Frontiers) -> LoroResult<()> {
-        // Gate the raw `doc()`-seam: an external checkout of a registry-owned
-        // head would move its state WITHOUT re-keying the registry's `tip` /
-        // `by_tip`, desyncing it (a sibling bound to the head would then read
-        // the wrong state). The registry's OWN advance runs inside a registry op
-        // (`in_registry_op`) and is allowed. `Branch::checkout` is deferred to an
-        // RFP and not exposed, so this only fires on the raw-seam re-entry.
+        // E1 gate: an external checkout of an owned head would move its state without re-keying the
+        // registry's `tip`/`by_tip`. The registry's own advance runs in `in_registry_op` and is allowed.
         if self.is_owned() && !crate::multi_head::in_registry_op() {
             return Err(LoroError::OwnedHeadOp("checkout"));
         }
@@ -1876,7 +1826,6 @@ impl LoroDoc {
         }
         drop(guard);
         if self.config.detached_editing() {
-            // Registry-owned heads keep their peer across a checkout (see above).
             if result.is_ok() && !self.is_owned() {
                 self.renew_peer_id();
             }
@@ -1892,21 +1841,12 @@ impl LoroDoc {
         result
     }
 
-    /// Checkout to `target` and RETURN the resulting `DocDiff`s WITHOUT emitting
-    /// them through this doc's observer. The registry (`MultiHeadDoc`) uses this
-    /// to move a head and then dispatch the diff to the branch's OWN subscribers
-    /// through a scratch observer (branch-scoped delivery, after the registry
-    /// lock drops), so a shared head's co-owner never receives another branch's
-    /// jump and no callback runs under the registry lock.
+    /// Checkout to `target` and RETURN the `DocDiff`s instead of emitting them, so the registry can
+    /// dispatch them to the branch's own subscribers after dropping its lock.
     ///
-    /// It is the `diff()` trick applied once: force recording so a never-
-    /// subscribed fresh copy still records the jump (with `diff_start_version`
-    /// stamped at the pre-checkout frontier), drain the events, and restore the
-    /// prior recording state. Recording is cleared ONLY when it was off before
-    /// the call (a never-subscribed scratch / `CopyOf` head); on an already-
-    /// subscribed head recording is LEFT ON, because `take_events` re-stamps
-    /// `diff_start_version` to the last diff's `new_version`, which is the
-    /// correct `from` for that head's next local write.
+    /// Recording is forced on for the call and cleared afterward only if it was off before. On an
+    /// already-subscribed head it stays on: `take_events` re-stamps `diff_start_version`, the correct
+    /// `from` for the next local write.
     pub(crate) fn checkout_collecting_events(
         &self,
         target: &Frontiers,
@@ -1941,8 +1881,7 @@ impl LoroDoc {
             Vec::new()
         };
         drop(guard);
-        // Post-checkout txn / detached handling, identical to `checkout` (minus
-        // the emit): a registry-owned head keeps its peer across a checkout.
+        // Same post-checkout handling as `checkout`, minus the emit.
         if self.config.detached_editing() {
             if result.is_ok() && !self.is_owned() {
                 self.renew_peer_id();

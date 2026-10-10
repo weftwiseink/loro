@@ -418,7 +418,6 @@ LoroDoc.prototype.toJsonWithReplacer = function (
   return run(layer);
 };
 
-// A head exposes the same head-safe `toJsonWithReplacer` as a doc; reuse the exact impl.
 BranchingDocHead.prototype.toJsonWithReplacer =
   LoroDoc.prototype.toJsonWithReplacer;
 
@@ -535,7 +534,6 @@ decorateMethods(EphemeralStoreWasm.prototype, [
 
 decorateMethods(UndoManager.prototype, ["undo", "redo"]);
 
-// A head shares LoroDoc's pending-event decoration for the head-safe mutating methods.
 decorateMethods(BranchingDocHead.prototype, [
   "commit",
   "getCursorPos",
@@ -543,58 +541,33 @@ decorateMethods(BranchingDocHead.prototype, [
   "applyDiff",
 ]);
 
-// `Branch` methods that can enqueue branch-subscriber events, auto-flushed here so a consumer
-// observes them with NO manual `callPendingEvents()`:
-//   - `write` commits its resolved content head, enqueuing the local-commit event.
-//   - `read`/`subscribe`/`subscribeRoot` each RESOLVE the branch first, and a resolve that
-//     MOVES the branch (a lazy realization on access -- the common content-then-lineage
-//     arrival order, where the move is realized on the next `read`) now dispatches its diff.
-//     Without this decoration that event would sit in the global pending queue and be flushed
-//     by an unrelated later decorated call (possibly on another repo), never inside the `read`.
+// Auto-flush branch-subscriber events so consumers need no manual `callPendingEvents()`:
+// `write` enqueues the local-commit event; `read`/`subscribe`/`subscribeRoot` resolve the branch
+// first, and a lazy move on resolve dispatches its diff, which would otherwise sit in the global
+// queue until an unrelated decorated call.
 decorateMethods(Branch.prototype, ["write", "read", "subscribe", "subscribeRoot"]);
 
-// `BranchingDoc` mutating methods that enqueue branch-subscriber events, auto-flushed here:
-//   - `import`: lands remote ops then EAGERLY re-resolves every known branch (the `Delegated`
-//     policy's `after_import`); same precedent as the decorated `LoroDoc.import`.
-//   - `merge` / `advance`: every advance arm (catch-up, copy+advance, and the fast-forward
-//     REBIND-to-existing arm) now synthesizes and dispatches the branch's `diff(X -> Y)`,
-//     tagged `by:"import"` with origin `"advance"`. Without this flush a subscriber goes STALE
-//     on a merge; a fast-forward is no longer silent (the rebind arm delivers a synthesized
-//     diff, so there IS an event to flush here).
+// `import` re-resolves every known branch (the `Delegated` policy's `after_import`);
+// `merge`/`advance` dispatch a synthesized `diff(X -> Y)` (`by:"import"`, origin `"advance"`)
+// on every arm, including fast-forward. Without the flush subscribers go stale.
 decorateMethods(BranchingDoc.prototype, ["import", "merge", "advance"]);
 
-// `BranchingIndex.import` lands lineage ops into the shared index op log. On a policy whose
-// `after_import` re-resolves content branches this can enqueue branch-subscriber events; flush
-// them at `import`'s exit so a lineage import delivers its consequences before returning to JS.
+// A lineage import can re-resolve content branches and enqueue subscriber events; flush at exit.
 decorateMethods(BranchingIndex.prototype, ["import"]);
 
-// `BranchingDocRepo.createBranch` commits a branch-marker op onto the shared INDEX op log (the
-// repo's `create_index_branch` sets the new branch's `branch.name` marker and `commit_then_renew`s).
-// That commit synchronously enqueues a `BranchingIndex.subscribeLocalUpdates` local-update
-// callback into the global pending-event queue, but the queue only flushes when a decorated
-// method runs `callPendingEvents()`. Without this decoration the enqueued frame is never
-// delivered (0 fires) and the scheduled microtask check logs `[LORO_INTERNAL_ERROR] Event not
-// called`, so a wire adaptor driven off the index stream never learns of a locally-created
-// branch. Auto-flushing here makes `createBranch(...)` deliver the index marker frame with NO
-// manual `callPendingEvents()`, mirroring the decorated content-mutating methods above.
-// `deleteBranch` is CURRENTLY local-only registry cleanup (`delete_index_branch` commits no op —
-// durable cross-peer deletion is a Phase-5 wrapper-lifecycle follow-up), so its decoration flushes
-// an empty queue today; it is included to future-proof the method for when a durable delete op lands.
+// `createBranch` commits a branch-marker op to the index op log, enqueuing a
+// `BranchingIndex.subscribeLocalUpdates` callback; without a flush it never fires and logs
+// `[LORO_INTERNAL_ERROR] Event not called`. `deleteBranch` is local-only today (commits no op),
+// so its flush is a no-op for now.
 decorateMethods(BranchingDocRepo.prototype, ["createBranch", "deleteBranch"]);
 
 // ---------------------------------------------------------------------------
 // Head-safety drift guard (compile-time).
 //
-// `BranchingDocHead` must expose exactly LoroDoc's surface MINUS the history-bearing
-// methods (`HistoryKeys`). Two checks enforce this at `tsc` time:
-//   1. name-set exactness: every history method is absent from the head and every
-//      head-safe method is present (adding/removing either flips the keyof set);
-//   2. signature-shape compatibility of the head-safe surface.
-// This is the wasm-layer enforcement of the head-safe/history partition. It deliberately
-// does NOT use an exact `Equals<Omit<LoroDoc, HistoryKeys>, BranchingDocHead>`: LoroDoc's
-// published type is a class+generic-interface declaration-merge that only type-checks
-// under `skipLibCheck`, so an independently-generated `BranchingDocHead` cannot reach
-// exact structural identity with an `Omit` of it. See the branchingdocrepo devlog.
+// `BranchingDocHead` must expose exactly LoroDoc's surface MINUS `HistoryKeys`, checked at
+// `tsc` time by (1) name-set exactness and (2) signature-shape compatibility. Not an exact
+// `Equals<Omit<LoroDoc, HistoryKeys>, BranchingDocHead>`: LoroDoc's published type is a
+// class+interface declaration-merge that only type-checks under `skipLibCheck`.
 type _Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B
   ? 1
   : 2)
@@ -606,9 +579,8 @@ type _MutualExtends<A, B> = [A] extends [B]
     : false
   : false;
 
-// The exact excluded set: every LoroDoc instance method that is NOT head-safe.
-// A LoroDoc method that is neither forwarded onto the head nor listed here trips the
-// name-set check below — that is the drift signal.
+// LoroDoc methods that are not head-safe. One neither forwarded onto the head nor listed here
+// trips the name-set check.
 type HistoryKeys =
   | "setDetachedEditing"
   | "isDetachedEditingEnabled"
@@ -657,12 +629,10 @@ type HistoryKeys =
   | "setHideEmptyRootContainers"
   | "toContainerTree";
 
-// (C.1) name-set exactness.
 const _headKeysMatchOmit: _Equals<
   keyof Omit<LoroDoc, HistoryKeys>,
   keyof BranchingDocHead
 > = true;
-// (C.2) signature-shape compatibility of the head-safe surface.
 const _headShapeMatchesOmit: _MutualExtends<
   Omit<LoroDoc, HistoryKeys>,
   BranchingDocHead
