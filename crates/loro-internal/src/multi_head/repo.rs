@@ -66,39 +66,27 @@ impl BranchingDocRepo {
         self.index.create_index_branch(new, from)
     }
 
-    /// Repo-wide merge of `from` into `into`: ONE index marker op (the union of
-    /// both branches' recorded doc frontiers falls out of the index checkout, no
-    /// per-doc record), then re-resolve every OPEN content doc so its branch
-    /// subscribers receive their catch-up event. A content doc not currently open
-    /// picks up the merged frontier lazily on reopen (the index carries it).
-    ///
-    /// Returns the index-level `MergeOutcome` (`AlreadyContained` when `into`
-    /// already contains `from`).
+    /// Repo-wide merge of `from` into `into`: one index marker op (no per-doc
+    /// record), then re-resolve every open content doc so its branch subscribers
+    /// get their catch-up event. Unopened docs pick up the merged frontier on
+    /// reopen.
     pub fn merge_branch(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
         let outcome = self.index.merge(into, from)?;
-        // Catch every open content doc up to the merged index frontier. A resolve
-        // that cannot yet advance (ids not held) is non-fatal, exactly as the
-        // import ingest path treats it.
+        // A resolve that cannot yet advance (ids not held) is non-fatal.
         for doc in self.docs.lock().unwrap().values() {
             let _ = doc.resolve_with(into, Intent::Read, ResolveCause::Advance);
         }
         Ok(outcome)
     }
 
-    /// Import LINEAGE/index bytes (Trigger 2 of the bidirectional lens), then
-    /// re-resolve every index-known branch of every OPEN content doc so a lens
-    /// bound on a branch whose recorded frontier just moved advances FORWARD to it
-    /// (guarded fast-forward-only). This closes the content-first ordering gap: a
-    /// content op that arrived before its lineage record becomes a held descendant
-    /// the moment the record lands, and the re-resolve advances the lens then. A
-    /// resolve that cannot yet advance (ids not held) is a non-fatal no-op, exactly
-    /// as the content-import ingest treats it; nothing touches an unopened doc (the
-    /// loop is over `self.docs`, the docs already hydrated). Mirrors `merge_branch`,
-    /// with the imported-frontier `Import` cause rather than a local `Advance`.
+    /// Import lineage/index bytes, then re-resolve every index-known branch of
+    /// every open content doc so branches whose recorded frontier moved advance
+    /// forward (fast-forward-only). This closes the content-first ordering gap:
+    /// a content op that arrived before its lineage record becomes a held
+    /// descendant once the record lands. Unresolvable ids are a non-fatal no-op.
     ///
-    /// The index import itself is history-only + all-heads-barriered (it lands
-    /// index ops without moving a head), so the content re-resolves are the only
-    /// state moves. See `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
+    /// The index import itself is history-only, so these re-resolves are the
+    /// only state moves.
     pub fn import_index(&self, bytes: &[u8]) -> LoroResult<ImportStatus> {
         let status = self.index.import(bytes)?;
         let branches = self.index.branches();
@@ -110,18 +98,13 @@ impl BranchingDocRepo {
         Ok(status)
     }
 
-    /// Repo-wide branch deletion: unbind the branch from every open content doc
-    /// AND the index, and drop its index lineage. `branches()` then excludes it
-    /// with no dangling `bound`/`by_tip` entry anywhere; the pinned root is never
-    /// removed. Its committed ops stay in each doc's history (unreferenced).
+    /// Unbind the branch from every open content doc and the index, and drop
+    /// its index lineage. Its committed ops stay in history (unreferenced).
     ///
-    /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): this is LOCAL-ONLY
-    /// registry cleanup. The branch's marker op (`branch.name = "<name>"`)
-    /// remains in the shared index history, so a later sync that re-imports it
-    /// re-discovers the branch (`SelfRooted::after_import`). Durable cross-peer
-    /// deletion /
-    /// tombstoning is the wrapper's lifecycle-log job and a Phase-5 follow-up;
-    /// this method does not attempt it.
+    /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): local-only. The
+    /// branch's marker op remains in the shared index history, so a later sync
+    /// that re-imports it re-discovers the branch (`SelfRooted::after_import`).
+    /// Durable cross-peer deletion is not attempted.
     pub fn delete_branch(&self, name: &BranchId) -> LoroResult<()> {
         for doc in self.docs.lock().unwrap().values() {
             doc.unbind(name);

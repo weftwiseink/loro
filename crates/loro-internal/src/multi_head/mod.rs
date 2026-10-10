@@ -1,32 +1,20 @@
 //! `MultiHeadDoc<P>`: the shared base of `BranchingDocRepo`.
 //!
-//! One `OpLog` backs N materialized HEADS (each a `LoroDoc` / `LoroDocInner`
-//! over that shared op log, with its own `DocState`, `DiffCalculator`, `Txn`
-//! lock, observer, and peer). Branches are BOUND to heads, not owners of them:
-//! a head bound to more than one branch is IMMUTABLE, and the first divergent
-//! write COPIES it (copy-on-divergence). The registry (`heads` / `by_tip` /
-//! `bound` / `refs`) and the copy/guard machinery are written ONCE here; the
-//! two variants (`SelfRooted` index, `Delegated` content) differ only in a
-//! [`HeadPolicy`], which is implemented in later phases. A test-only [`Manual`]
-//! policy exercises this base standalone.
+//! One `OpLog` backs N materialized heads (each a `LoroDoc` over that op log,
+//! with its own `DocState`, `DiffCalculator`, `Txn` lock, observer, and peer).
+//! Branches are bound to heads, not owners of them: a head bound to more than
+//! one branch is immutable, and the first divergent write copies it
+//! (copy-on-divergence). The two variants (`SelfRooted` index, `Delegated`
+//! content) differ only in their [`HeadPolicy`]; [`Manual`] is test-only.
 //!
-//! The immutability of a shared head is enforced at loro's two `DocState`
-//! mutation sinks (`apply_local_op`, `apply_diff`) via `head_mode` +
-//! `ensure_private`, NOT by the closure API, so a mutation reaching a shared
-//! head errors with [`LoroError::HeadShared`] instead of corrupting a
-//! co-owner. See `crates/loro-internal/src/state.rs`.
-//!
-//! # Phase 1 scope
-//!
-//! This module is the foundational unit. It deliberately does NOT implement
-//! the index (`SelfRooted`), content docs (`Delegated`), the
-//! `BranchingDoc`/`Branch` wrapper, `__fs__`, wasm, or persistent DocState.
-//! Branch-scoped subscription rebinding on `rebind` belongs to a later phase
-//! (the base aggregates history / first-commit at the doc level instead).
+//! Shared-head immutability is enforced at loro's two `DocState` mutation sinks
+//! (`apply_local_op`, `apply_diff`) via `head_mode` + `ensure_private`, so a
+//! mutation reaching a shared head errors with [`LoroError::HeadShared`]
+//! instead of corrupting a co-owner. See `crates/loro-internal/src/state.rs`.
 //!
 //! On-commit re-keying of `by_tip` and `HeadPolicy::after_commit` run through
-//! the INJECTED txn on-commit hook (see [`DocOwner`] / `on_head_committed`),
-//! not a synchronous call from `write`. `import` is history-only: ops enter the
+//! the injected txn on-commit hook (see [`DocOwner`] / `on_head_committed`),
+//! not synchronously from `write`. `import` is history-only: ops enter the
 //! shared op log via `LoroDoc::import_to_history` under the all-heads barrier,
 //! never materializing into a live head.
 
@@ -57,21 +45,16 @@ pub type HeadId = u64;
 
 /// How a branch came into being, as recovered from the index attribution runs.
 ///
-/// A single-variant enum today: the `runs` structure discards a marker's kind
-/// (it stores only `(start, BranchId)` per segment), so a run-based recovery
-/// classifies every branch's source as its CREATION marker and cannot
-/// distinguish merge markers. It is kept an enum so a future merge-source
-/// surface can add `Merge` without changing `BranchSource`'s shape.
+/// Single-variant: `runs` stores only `(start, BranchId)` per segment, so
+/// recovery cannot distinguish merge markers from creation markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchSourceKind {
     /// The branch's creation marker (`branch.name = "<b>"`).
     Create,
 }
 
-/// Where a branch came from: the op-id of its creation marker plus the branch
-/// it was forked from. The holistic sibling of `tips` (where each branch IS)
-/// and `fork_point` (a branch's parent FRONTIER): this surfaces the creation
-/// marker op ITSELF, which neither `tips` nor `fork_point` returns.
+/// Where a branch came from: its creation marker's op-id plus the branch it
+/// was forked from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchSource {
     /// The creation-marker op's own id (its `(peer, counter)`), not its deps.
@@ -83,17 +66,15 @@ pub struct BranchSource {
     pub parent: Option<BranchId>,
 }
 
-/// The pinned root head's id. Created at `refs == 0` and NEVER dropped: it is
-/// the anchor `import` / `export` / `materialize` lean on (they need at least
-/// one live head over the shared op log to operate through).
+/// The pinned root head's id. Created at `refs == 0` and never dropped:
+/// `import` / `export` / `materialize` need at least one live head.
 ///
-/// Refcount invariant for every OTHER head: a head is live while `refs >= 1`,
-/// and is retired (removed from `heads` and `by_tip`) the moment `refs` reaches
-/// `0`. There is no `refs == 0` resting/orphan state except the pinned root.
+/// Every other head is live while `refs >= 1` and retired the moment `refs`
+/// reaches `0`.
 const ROOT_HEAD_ID: HeadId = 0;
 
-/// One event per new change landing in the shared history (a head commit or an
-/// import), carrying that change's update bytes. Mirrors `LocalUpdateCallback`.
+/// Fires once per new change in the shared history (head commit or import),
+/// with that change's update bytes.
 pub type HistoryCallback = Box<dyn Fn(&Vec<u8>) -> bool + Send + Sync + 'static>;
 
 /// When a `MultiHeadDoc` copies a head.
@@ -113,13 +94,9 @@ pub enum Intent {
     Write,
 }
 
-/// Why a `resolve` moved a branch, which determines the `by`/`origin` of the
-/// event it delivers so a branch-surfaced doc tags a move exactly as a plain
-/// doc would. An import- or advance-driven move, and a lazy realization on
-/// access, all move the branch's LIVE state forward by ops that are not this
-/// head's local commits, which is what `Import` means to every consumer;
-/// `Checkout` (detached time-travel, filtered as non-content) is reserved for a
-/// future explicit history view.
+/// Why a `resolve` moved a branch; determines the `by`/`origin` of the emitted
+/// event. All causes move live state by ops that are not this head's local
+/// commits, so all map to `EventTriggerKind::Import`.
 #[derive(Debug, Clone)]
 pub enum ResolveCause {
     /// A move driven by imported (remote) ops; `origin` is the import's origin.

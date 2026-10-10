@@ -9,19 +9,14 @@ use super::policy::{BRANCH_MERGE_KEY, BRANCH_NAME_KEY, BRANCH_ROOT};
 use super::ROOT_HEAD_ID;
 use super::*;
 
-/// The repo's index doc. Its heads hold only frontiers: TWO root maps total, a
-/// `docs: LoroMap<DocId, LoroMap<"heads", LoroMap<PeerID, Counter>>>` and a
-/// `branch` map whose `name` key set (`branch.name = "<b>"`) is a branch's
-/// creation MARKER (see `SelfRooted`). No weft filesystem metadata (that is a
-/// TS-side content doc). The only types that appear are `ID`/`Frontiers`/
-/// `DocId`/`BranchId`.
+/// The repo's index doc. Two root maps: `docs: LoroMap<DocId, LoroMap<"heads",
+/// LoroMap<PeerID, Counter>>>`, and `branch`, whose `name` key set to `"<b>"`
+/// is a branch's creation marker (see `SelfRooted`).
 pub type IndexDoc = MultiHeadDoc<SelfRooted>;
 
 impl MultiHeadDoc<SelfRooted> {
-    /// Establish the first (genesis) branch, bound to the pinned root head, by
-    /// writing its creation marker as the root's first op: `branch.name =
-    /// "<genesis>"`. The commit hook's `after_commit` sets `tips[genesis]` to
-    /// that op. Must be called once before other branches are created.
+    /// Bind the genesis branch to the pinned root head by writing its creation
+    /// marker as the root's first op. Call once, before creating other branches.
     pub fn init_genesis(&self, genesis: &BranchId) -> LoroResult<()> {
         let root = self.head_doc(ROOT_HEAD_ID).expect("root head exists");
         self.with_reg(|this, reg| this.rebind(reg, genesis, ROOT_HEAD_ID));
@@ -31,19 +26,13 @@ impl MultiHeadDoc<SelfRooted> {
         Ok(())
     }
 
-    /// Create `new` from `from` by EAGER copy: fork `from`'s index head (a state
-    /// of a few map entries), then write the copy's first op -- the creation
-    /// marker, `branch.name = "<new>"` (overwriting the copied parent's name) --
-    /// directly on the copy. That op depends on `tips[from]` and names `new`, so
-    /// the commit hook's `after_commit` sets `tips[new]` to it. Every index head
-    /// is thus born `refs == 1`.
+    /// Create `new` from `from` by eager copy: fork `from`'s index head, then
+    /// write the creation marker `branch.name = "<new>"` on the copy. That op
+    /// depends on `tips[from]` and names `new`, so `after_commit` sets
+    /// `tips[new]` to it. Every index head is born `refs == 1`.
     ///
-    /// The name travels as a plain map value (a `LoroValue::String` in the op
-    /// log), so `new` may be any string -- no container-id charset constraint.
-    ///
-    /// Errors if `new` already exists (mirroring `create_branch_at`): re-forking
-    /// a live name would otherwise mint a second creation marker for it, and
-    /// `tips[new]` would become the join of two unrelated lineages.
+    /// Errors if `new` exists: re-forking would mint a second creation marker
+    /// and make `tips[new]` the join of two unrelated lineages.
     pub fn create_index_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
         if self.branches().contains(new) {
             return Err(LoroError::ArgErr(
@@ -64,24 +53,19 @@ impl MultiHeadDoc<SelfRooted> {
         Ok(())
     }
 
-    /// Merge branch `from` into `into` REPO-WIDE with a SINGLE index marker op.
+    /// Merge `from` into `into` repo-wide with a single index marker op.
     ///
-    /// Advance `into`'s index head to `join(tips[into], tips[from])`, whose CRDT
-    /// state IS the per-key union of every doc's `docs[D].heads` map (a mergeable
-    /// per-peer VV, so a concurrent same-branch writer on either side survives --
-    /// Spike S5), then commit ONE `branch.name = "<into>"` marker on it. The
-    /// per-doc `record_frontier` loop the content-level `BranchingDoc::merge`
-    /// walks is not needed here: the union of both branches' recorded frontiers
-    /// falls out of the checkout for free.
+    /// Advances `into`'s index head to `join(tips[into], tips[from])`, whose
+    /// CRDT state is the per-key union of every doc's `docs[D].heads` map (a
+    /// mergeable per-peer VV, so concurrent same-branch writers survive), then
+    /// commits one merge marker. No per-doc record loop is needed.
     ///
-    /// The marker's dependencies ARE the join (a frontier spanning both
-    /// branches), so on a remote import the causal fold attributes it to `into`
-    /// (a marker needs no dep agreement) and `tips[into]` becomes `[marker]`.
-    /// `from` is untouched: a merge never moves the source's head or tips, so a
-    /// source merged into two targets is simply two marker ops on two heads.
+    /// The marker's deps are the join, so on remote import the causal fold
+    /// attributes it to `into` (a marker needs no dep agreement). `from` is
+    /// untouched.
     ///
-    /// Returns `AlreadyContained` (nothing written) when `into` already contains
-    /// `from`, else `FastForward` / `Merged` (one marker written either way).
+    /// Returns `AlreadyContained` (nothing written) when `into` contains
+    /// `from`, else `FastForward` / `Merged`.
     pub fn merge(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
         let ti = self.policy().target(self, into)?;
         let tf = self.policy().target(self, from)?;
@@ -94,8 +78,6 @@ impl MultiHeadDoc<SelfRooted> {
                 Some(Ordering::Less) => MergeOutcome::FastForward,
                 None => MergeOutcome::Merged,
             };
-            // The join: shrink(union of both tips' ids). Every id of `from` is in
-            // the union, so no op is dropped.
             let mut u = ti.clone();
             for id in tf.iter() {
                 u.push(id);
@@ -105,16 +87,8 @@ impl MultiHeadDoc<SelfRooted> {
                 shrink_frontiers(&u, &ol.dag).map_err(LoroError::FrontiersNotFound)?,
             )
         };
-        // Bind `into` (at tips[into], refs == 1 eager), advance its head to the
-        // join, and commit the single merge marker. The commit hook's
-        // `after_commit` sets `tips[into]` to the marker.
-        //
-        // The marker goes on the `branch.merge` key as "<seq>:<into>", NOT on
-        // `branch.name`: at the join `branch.name` may already equal `into`, and
-        // a same-value map set emits NO op -- which would leave the merge with no
-        // op to carry it (dropping it locally and on every peer). The `<seq>`
-        // prefix, read-then-incremented from the current merge value, guarantees
-        // the set writes a fresh value and always emits. See `BRANCH_MERGE_KEY`.
+        // The marker goes on `branch.merge` as "<seq>:<into>", not
+        // `branch.name`, so the set always emits an op. See `BRANCH_MERGE_KEY`.
         self.resolve_with(into, Intent::Read, ResolveCause::Advance)?;
         let doc = self.advance_bound_writable(into, &join)?;
         let branch_map = doc.get_map(BRANCH_ROOT);
@@ -128,8 +102,7 @@ impl MultiHeadDoc<SelfRooted> {
         Ok(outcome)
     }
 
-    /// Record `docs[doc].heads[peer] = counter` on `b`'s index head: the
-    /// per-writer head record the frontier reduction reads back. One local op.
+    /// Record `docs[doc].heads[peer] = counter` on `b`'s index head.
     pub fn record_head(
         &self,
         b: &BranchId,
@@ -138,8 +111,7 @@ impl MultiHeadDoc<SelfRooted> {
         counter: Counter,
     ) -> LoroResult<()> {
         self.write(b, |d| {
-            // Mergeable (map-key) child containers so two sessions writing the
-            // same doc/heads path converge to one container across import.
+            // Mergeable containers: concurrent sessions converge to one.
             let docs = d.get_map("docs");
             let per_doc = docs.ensure_mergeable_map(doc.as_str())?;
             let heads = per_doc.ensure_mergeable_map("heads")?;
@@ -147,12 +119,9 @@ impl MultiHeadDoc<SelfRooted> {
         })?
     }
 
-    /// ADDITIVELY record every id of frontier `f` into `docs[doc].heads` on `b`'s
-    /// index head: `heads[peer] = counter` per id, MERGING into existing entries
-    /// (a per-writer max in effect). This is correct for forward accumulation --
-    /// `advance` / `merge` / ingest move a LIVE branch forward, and each keeps the
-    /// other peers' recorded positions. It is NOT correct for setting a branch to
-    /// an exact frontier that must EXCLUDE other peers -- see `set_frontier`.
+    /// Additively record every id of `f` into `docs[doc].heads`, keeping other
+    /// peers' entries. For forward moves (`advance` / `merge` / ingest); to set
+    /// an exact frontier excluding other peers, use `set_frontier`.
     pub fn record_frontier(&self, b: &BranchId, doc: &DocId, f: &Frontiers) -> LoroResult<()> {
         self.write(b, |d| {
             let docs = d.get_map("docs");
@@ -165,14 +134,10 @@ impl MultiHeadDoc<SelfRooted> {
         })?
     }
 
-    /// Set `docs[doc].heads` on `b`'s index head to EXACTLY frontier `f`: clear
-    /// every existing entry first, then record `f`'s ids. Unlike the additive
-    /// `record_frontier`, this OVERRIDES -- the recorded frontier becomes `f` and
-    /// nothing else. `create_branch_at` needs this: eager `create_index_branch`
-    /// seeds the fork with the parent's (possibly multi-peer) recorded frontier,
-    /// and forking at a single-peer historical `at` must not leave stale
-    /// other-peer entries (which would silently pull those peers' ops into the
-    /// fork).
+    /// Set `docs[doc].heads` to exactly `f`, clearing existing entries first.
+    /// `create_branch_at` needs this: `create_index_branch` seeds the parent's
+    /// possibly multi-peer record, and stale other-peer entries would pull those
+    /// peers' ops into the fork.
     pub fn set_frontier(&self, b: &BranchId, doc: &DocId, f: &Frontiers) -> LoroResult<()> {
         self.write(b, |d| {
             let docs = d.get_map("docs");
@@ -189,10 +154,8 @@ impl MultiHeadDoc<SelfRooted> {
         })?
     }
 
-    /// The raw `(peer, counter)` ids recorded in `docs[doc].heads` on `b`'s index
-    /// head (before any reduction against a content doc's history). Empty if the
-    /// branch or doc is unknown. `Delegated::target` reduces these against the
-    /// content doc's DAG.
+    /// The raw ids recorded in `docs[doc].heads` on `b`'s index head, before
+    /// `Delegated::target` reduces them. Empty if the branch or doc is unknown.
     pub fn recorded_ids(&self, b: &BranchId, doc: &DocId) -> LoroResult<Vec<ID>> {
         self.read(b, |d| {
             let mut ids = Vec::new();
@@ -227,40 +190,26 @@ impl MultiHeadDoc<SelfRooted> {
             .collect()
     }
 
-    /// Every branch's index frontier (`{b: target(b)}`), the derived read-only
-    /// `active_branches` projection.
+    /// Every branch's index frontier.
     pub fn tips(&self) -> FxHashMap<BranchId, Frontiers> {
         self.policy().attribution(self).lock().tips.clone()
     }
 
-    /// The index frontier branch `b` was forked from: the DEPENDENCIES of `b`'s
-    /// creation marker (the causally-earliest op attributed to `b`).
-    ///
-    /// Empty for the genesis branch (its creation marker is the root op, which
-    /// has no deps) and for an unknown branch. For a branch created from a
-    /// parent, this is the parent's index tips at the moment `b` was forked --
-    /// the cross-doc fork point, which lives ONLY in the index (a content doc's
-    /// own log cannot answer where `b` forked for a doc nobody has touched on `b`
-    /// yet).
+    /// The index frontier `b` was forked from: the deps of its creation marker,
+    /// i.e. the parent's tips at fork time. Empty for genesis and unknown
+    /// branches. Only the index can answer this cross-doc: a content doc's log
+    /// cannot for a doc nobody has touched on `b`.
     pub fn fork_point(&self, b: &BranchId) -> Frontiers {
         self.creation_marker_id(b)
             .and_then(|id| self.oplog.lock().get_deps_of(id))
             .unwrap_or_default()
     }
 
-    /// The op-id of branch `b`'s creation marker: the MIN-LAMPORT run-start
-    /// labelled `b` across all peers. The creation marker is `b`'s causal root,
-    /// so it uniquely minimizes lamport among `b`'s ops. `None` for an unknown
-    /// branch (no attribution run).
+    /// The op-id of `b`'s creation marker: the min-lamport run-start labelled
+    /// `b` across peers (the marker is `b`'s causal root). `None` for an unknown
+    /// branch. `fork_point(b)` is `get_deps_of` this id.
     ///
-    /// This is the shared recovery both `fork_point` (which then takes the id's
-    /// DEPS) and [`branch_sources`](Self::branch_sources) (which surfaces the id
-    /// ITSELF) build on, so the two never diverge: `fork_point(b)` is exactly
-    /// `get_deps_of(branch_sources()[b].op)`.
-    ///
-    /// Reads Attribution (the `runs`) then OpLog (each candidate's lamport) with
-    /// the two locks never nested (Attribution is released before OpLog is
-    /// taken), matching the original single-read `fork_point` behaviour.
+    /// Attribution and OpLog locks are never nested.
     fn creation_marker_id(&self, b: &BranchId) -> Option<ID> {
         let starts: Vec<ID> = {
             let attr = self.policy().attribution(self).lock();
@@ -281,23 +230,13 @@ impl MultiHeadDoc<SelfRooted> {
         })
     }
 
-    /// Every known branch's SOURCE: the op-id of its creation marker, its kind
-    /// (always [`BranchSourceKind::Create`]; see [`BranchSourceKind`]), and the
-    /// parent branch it forked from. The holistic sibling of [`tips`](Self::tips)
-    /// and [`fork_point`](Self::fork_point): where `tips[b]` is the (drifted)
-    /// current frontier and `fork_point(b)` is the parent FRONTIER, this surfaces
-    /// the creation-marker op itself and the parent branch NAME.
+    /// Every known branch's source: its creation marker's op-id, kind, and
+    /// parent branch name (`None` for genesis). Complements
+    /// [`tips`](Self::tips) and [`fork_point`](Self::fork_point).
     ///
-    /// `op` is the min-lamport run-start of `b` (the same id `fork_point`
-    /// selects then discards), so the recovery reuses the incrementally-maintained
-    /// `runs` structure rather than a raw op-log marker scan. `parent` is the
-    /// branch of the marker's deps ([`branch_of_deps`](super::Attribution)), and
-    /// `None` for genesis: `branch_of_deps` of EMPTY deps is a loud `Err`, not
-    /// `None`, so empty deps short-circuit to `parent: None` here.
-    ///
-    /// Assumes the index oplog is not shallow-trimmed below a branch root; there
-    /// the existing causal fold already degrades loudly (`branch_of_deps` raises
-    /// `invalid_attribution`), so this is not a new failure mode.
+    /// `parent` is the branch of the marker's deps
+    /// ([`branch_of_deps`](super::Attribution)). Assumes the index oplog is not
+    /// shallow-trimmed below a branch root.
     pub fn branch_sources(&self) -> LoroResult<FxHashMap<BranchId, BranchSource>> {
         let mut out = FxHashMap::default();
         for b in self.branches() {
@@ -306,8 +245,7 @@ impl MultiHeadDoc<SelfRooted> {
             };
             let deps = self.oplog.lock().get_deps_of(op).unwrap_or_default();
             let parent = if deps.is_empty() {
-                // Genesis: `branch_of_deps(empty)` is an Err, not None -- short
-                // circuit to a genuine `None` parent.
+                // Genesis: `branch_of_deps(empty)` is an Err.
                 None
             } else {
                 Some(
@@ -329,9 +267,7 @@ impl MultiHeadDoc<SelfRooted> {
         Ok(out)
     }
 
-    /// The `docs` map (each `DocId` -> its `heads` value) as it stood at frontier
-    /// `f`, materialized on a throwaway scratch head. The comparison substrate
-    /// for the fork-point diffs below.
+    /// The `docs` map (`DocId` -> `heads`) at frontier `f`, read on a scratch head.
     fn docs_map_at(&self, f: &Frontiers) -> LoroResult<FxHashMap<DocId, LoroValue>> {
         self.read_at(f, |d| {
             d.get_deep_value()
@@ -347,20 +283,15 @@ impl MultiHeadDoc<SelfRooted> {
         })
     }
 
-    /// The docs branch `b` ITSELF modified: those whose recorded frontier at
-    /// `tips[b]` DIFFERS from their state at `fork_point(b)` (a fork-point diff).
-    /// Docs inherited unchanged from `b`'s parent are excluded (their value is
-    /// identical at both frontiers), unlike the raw `docs` key set at `tips[b]`
-    /// (which is nearly every doc, since a fork eager-copies the parent's record).
+    /// The docs `b` itself modified: those whose recorded frontier at `tips[b]`
+    /// differs from `fork_point(b)`. Docs inherited unchanged from the parent
+    /// are excluded (a fork eager-copies the parent's record, so the raw key set
+    /// is nearly every doc). Empty for an unknown branch.
     ///
-    /// This is computed ON DEMAND, not from an incremental per-branch stack: the
-    /// incremental "copy the parent's set at fork" step is not correct under a
-    /// concurrent fork (a parent op concurrent with the fork, folded first by
-    /// lamport order, would leak into the child's inherited set), so it
-    /// degenerates to this same fork-point recompute. The recompute is also
-    /// exactly what a MERGE needs (a merged branch's own set is recomputed from
-    /// its branchpoint), so one fork-point diff is uniformly correct for forks,
-    /// merges, and concurrent forks. Empty for an unknown branch.
+    /// Computed on demand: an incremental per-branch set copied at fork is wrong
+    /// under a concurrent fork (a parent op concurrent with the fork would leak
+    /// into the child's set), while a fork-point diff is right for forks, merges,
+    /// and concurrent forks alike.
     pub fn docs_modified_on_branch(&self, b: &BranchId) -> LoroResult<Vec<DocId>> {
         let tip = self.policy().target(self, b)?;
         let fork = self.fork_point(b);
@@ -375,15 +306,10 @@ impl MultiHeadDoc<SelfRooted> {
         Ok(out)
     }
 
-    /// The doc-ids whose recorded head DIFFERS between branches `a` and `b`: a
-    /// SYMMETRIC head-vs-head diff over the UNION of both branches' doc-id keys.
-    /// A doc present on only one side (or with a differing `heads` value on the
-    /// two sides) is included; a doc identical at `tips[a]` and `tips[b]` is not.
-    ///
-    /// Unlike the asymmetric [`docs_modified_on_branch`](Self::docs_modified_on_branch)
-    /// (a fork-point diff that returns only what `b` ITSELF changed), this
-    /// captures divergence on BOTH sides -- a doc `a` moved that `b` never
-    /// touched is reported. Empty when `a == b` or their recorded heads match.
+    /// The docs whose recorded head differs between `a` and `b`, including docs
+    /// present on one side only. Symmetric, unlike
+    /// [`docs_modified_on_branch`](Self::docs_modified_on_branch), which reports
+    /// only what `b` itself changed.
     pub fn diff_docs(&self, a: &BranchId, b: &BranchId) -> LoroResult<Vec<DocId>> {
         let ta = self.policy().target(self, a)?;
         let tb = self.policy().target(self, b)?;
@@ -399,18 +325,13 @@ impl MultiHeadDoc<SelfRooted> {
         Ok(out)
     }
 
-    /// The docs modified anywhere on `b`'s lineage since it diverged from the
-    /// genesis branch (the union of the per-branch stack "changed since main").
-    /// Rust-only accessor for future logic; no wasm surface yet. Empty for the
-    /// genesis branch.
-    ///
-    /// Computed as a fork-point diff from the frontier where `b`'s lineage left
-    /// genesis (found by walking parent fork-points up to genesis) to `tips[b]`.
+    /// The docs modified anywhere on `b`'s lineage since it diverged from
+    /// genesis: a diff from where the lineage left genesis to `tips[b]`. Empty
+    /// for genesis.
     pub fn docs_changed_since_main(&self, b: &BranchId) -> LoroResult<Vec<DocId>> {
         let departure = self.departure_from_main(b);
         if departure == Frontiers::default() {
-            // `b` is the genesis branch (never diverged from main): the baseline
-            // has nothing "changed since main".
+            // Genesis never diverged from main.
             return Ok(Vec::new());
         }
         let tip = self.policy().target(self, b)?;
@@ -425,16 +346,13 @@ impl MultiHeadDoc<SelfRooted> {
         Ok(out)
     }
 
-    /// The frontier at which `b`'s lineage left the genesis branch: walk parent
-    /// fork-points (`fork_point` -> the branch it attributes to -> its
-    /// `fork_point`) until the parent is genesis (an empty fork point). The
-    /// returned frontier is the fork point of the topmost non-genesis ancestor.
-    /// Empty for the genesis branch itself.
+    /// The fork point of `b`'s topmost non-genesis ancestor, found by walking
+    /// parent fork-points up to genesis. Empty for genesis itself.
     fn departure_from_main(&self, b: &BranchId) -> Frontiers {
         let mut fork = self.fork_point(b);
         loop {
             if fork == Frontiers::default() {
-                return Frontiers::default(); // `b` (or the current ancestor) is genesis
+                return Frontiers::default();
             }
             let parent = {
                 let attr = self.policy().attribution(self).lock();
@@ -445,33 +363,25 @@ impl MultiHeadDoc<SelfRooted> {
             };
             let parent_fork = self.fork_point(&parent);
             if parent_fork == Frontiers::default() {
-                return fork; // parent is genesis; `b`'s lineage left main here
+                return fork;
             }
             fork = parent_fork;
         }
     }
 
-    /// Remove a branch from the index: unbind its index head (retiring it) and
-    /// drop its `tips` entry, so `branches()` no longer lists it and no
-    /// `bound`/`by_tip` entry dangles. Its attribution runs are kept, so a
-    /// later-imported change that depends on its history still attributes (and
-    /// re-lists the branch, exactly as a re-imported marker did before). The
-    /// durable cross-peer "discard" is the wrapper's lifecycle log; this is the
-    /// local registry cleanup.
+    /// Unbind `name`'s index head and drop its `tips` entry. Attribution runs
+    /// are kept, so a later-imported change depending on its history still
+    /// attributes (and re-lists the branch). Local cleanup only.
     pub fn delete_index_branch(&self, name: &BranchId) {
         self.unbind(name);
         self.policy().attribution(self).lock().tips.remove(name);
     }
 
-    /// The registry HeadId of branch `b`'s (self-rooted) index head, resolving
-    /// it from lineage if not yet bound. (`Head` itself is registry-internal, so
-    /// this hands back the id rather than the proposal's `Arc<Head>`.)
+    /// The `HeadId` of `b`'s index head, resolving it if not yet bound.
     ///
-    /// CAVEATS: this calls `resolve` (a Read), so it has the same side effects
-    /// (it may bind/advance/materialize `b`'s head). The returned `HeadId` is
-    /// SESSION-LOCAL and rebind-mutable: a later copy-on-divergence / merge
-    /// rebinds `b` to a DIFFERENT head, so a caller MUST NOT cache the id across
-    /// any operation that could rebind `b` -- re-resolve instead.
+    /// Has `resolve`'s side effects (may bind/advance/materialize). The id is
+    /// session-local and changes on rebind: do not cache it across operations
+    /// that could rebind `b`.
     pub fn head_of(&self, b: &BranchId) -> LoroResult<HeadId> {
         Ok(self.resolve(b, Intent::Read)?.0)
     }

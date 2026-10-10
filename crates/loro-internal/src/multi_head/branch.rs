@@ -19,35 +19,18 @@ use loro_common::{ContainerID, LoroResult, LoroValue, PeerID};
 
 use super::*;
 
-// ======================================================================
-// The consumer surface: BranchingDocHead + Branch.
-// ======================================================================
-
-/// The head-safe, branch-facing surface handed to a `Branch::read` / `write`
-/// closure: a pass-through newtype over a resolved head's `LoroDoc` exposing
-/// ONLY the methods that read or write THIS head's materialized state or
-/// transaction and leave the registry's view consistent.
+/// The head-safe surface handed to a `Branch::read` / `write` closure: a
+/// pass-through newtype over a resolved head's `LoroDoc` exposing only methods
+/// that read or write this head's state or transaction.
 ///
-/// It deliberately has NO `Deref`, NO `From`/inner accessor, and does NOT
-/// forward the history / attachment / identity ops (`import*`, `export*`,
-/// `checkout`, `attach`, `checkout_to_latest`, `detach`, `oplog_*`, `fork`,
-/// `set_peer_id`, config setters, ...). Those touch the shared op log or
-/// the head's attachment and are incoherent on a registry head, so they are
-/// ABSENT AT THE TYPE LEVEL: `head.import(..)` / `head.checkout(..)` /
-/// `head.attach()` do not compile. `diff` is the exception among the
-/// history-adjacent ops: it is an intentional read passthrough (parallel to
-/// `state_frontiers`), because `LoroDoc::diff` self-restores the head's
-/// attach-state and frontier on exit, leaving the head exactly as before. `subscribe*` and `checkout` are head-safe but
-/// NOT branch-correct (they must re-key/re-install on rebind) and so live on
-/// `Branch`, not here.
-///
-/// > NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): This is the RUST
-/// > overlay over `loro_internal::LoroDoc`. The API-shape report recommends a
-/// > sibling `loro`-crate `BranchingDocHead(loro::LoroDoc)` with the wasm class
-/// > + `.d.ts` `Equals<Omit<LoroDoc, HistoryKeys>>` drift check; that public
-/// > mirror is a Phase-4 artifact and can wrap or forward to this one. Placement
-/// > here is what lets `Branch::read`/`write` be generic over
-/// > `MultiHeadDoc<P>` and tested now against `Manual`/`SelfRooted`.
+/// There is no `Deref` or inner accessor, and history / attachment / identity
+/// ops (`import*`, `export*`, `checkout`, `attach`, `checkout_to_latest`,
+/// `detach`, `oplog_*`, `fork`, `set_peer_id`, config setters) are absent from
+/// the type: they touch the shared op log or the head's attachment and are
+/// incoherent on a registry head. `diff` is an intentional read passthrough
+/// since `LoroDoc::diff` restores the head's attach-state and frontier on exit.
+/// `subscribe*` and `checkout` are not branch-correct here (they must
+/// re-install on rebind) and live on `Branch`.
 ///
 /// A head-safe method is present and works:
 ///
@@ -65,7 +48,7 @@ use super::*;
 /// assert_eq!(text, "hi");
 /// ```
 ///
-/// A history / attachment op is ABSENT at the type level (does not compile):
+/// History / attachment ops do not compile:
 ///
 /// ```compile_fail
 /// use loro_internal::multi_head::{Manual, MultiHeadDoc};
@@ -86,7 +69,6 @@ impl BranchingDocHead {
         Self(doc)
     }
 
-    // --- container access ---
     pub fn get_text<I: IntoContainerId>(&self, id: I) -> TextHandler {
         self.0.get_text(id)
     }
@@ -135,7 +117,6 @@ impl BranchingDocHead {
         self.0.has_container(id)
     }
 
-    // --- state reads ---
     pub fn get_value(&self) -> LoroValue {
         self.0.get_value()
     }
@@ -148,12 +129,8 @@ impl BranchingDocHead {
     pub fn state_frontiers(&self) -> Frontiers {
         self.0.state_frontiers()
     }
-    /// The content delta between two frontiers, `apply_diff`-able onto `a` to
-    /// reach `b`. A read-only passthrough to the inner `LoroDoc::diff`, which
-    /// self-restores this head's attach-state and frontier on exit (it checks
-    /// out to `a`, records, checks out to `b`, then restores `old_frontiers`),
-    /// so the head is undisturbed. Consistent with the `state_frontiers` read
-    /// passthrough and the `apply_diff` / `revert_to` write passthroughs.
+    /// The content delta from `a` to `b`, `apply_diff`-able onto `a`. The head's
+    /// attach-state and frontier are restored on exit.
     pub fn diff(&self, a: &Frontiers, b: &Frontiers) -> LoroResult<DiffBatch> {
         self.0.diff(a, b)
     }
@@ -179,9 +156,8 @@ impl BranchingDocHead {
         self.0.len_changes()
     }
 
-    // --- local write ---
-    /// Commit this head's pending transaction and start the next (the head-safe
-    /// commit; `commit_with`'s internal form leaks a lock guard and is omitted).
+    /// Commit this head's pending transaction and start the next. `commit_with`
+    /// is omitted: its internal form leaks a lock guard.
     pub fn commit(&self) -> Option<CommitOptions> {
         self.0.commit_then_renew()
     }
@@ -207,7 +183,6 @@ impl BranchingDocHead {
         self.0.revert_to(target)
     }
 
-    // --- per-head hooks ---
     pub fn subscribe_pre_commit(&self, callback: PreCommitCallback) -> Subscription {
         self.0.subscribe_pre_commit(callback)
     }
@@ -216,11 +191,9 @@ impl BranchingDocHead {
     }
 }
 
-/// Handle for a registry-owned branch subscription (from `Branch::subscribe` /
-/// `subscribe_root`). Unlike a raw `Subscription` on one head, this one follows
-/// the branch across rebinds (copy-on-divergence / merge). Dropping it removes
-/// the subscription from the registry (and unsubscribes its current head
-/// handle).
+/// Handle for a branch subscription (`Branch::subscribe` / `subscribe_root`).
+/// Unlike a raw `Subscription` on one head, it follows the branch across
+/// rebinds. Dropping it unsubscribes.
 #[allow(missing_debug_implementations)]
 pub struct BranchSubscription {
     pub(super) remove: Option<Box<dyn FnOnce() + Send + Sync>>,
@@ -241,10 +214,9 @@ impl Drop for BranchSubscription {
     }
 }
 
-/// A branch handle: a NAME plus its `MultiHeadDoc`. Every operation re-resolves
-/// the branch's head at call time. Two public signatures name `LoroDoc`: `fork`
-/// (the eject escape hatch) and `live_window` (the live head projection); every
-/// other signature stays on the head-safe `BranchingDocHead`.
+/// A branch handle: a name plus its `MultiHeadDoc`. Every operation
+/// re-resolves the branch's head at call time. Only `fork` and `lens` name
+/// `LoroDoc`; everything else stays on the head-safe `BranchingDocHead`.
 #[allow(missing_debug_implementations)]
 pub struct Branch<'a, P: HeadPolicy> {
     doc: &'a MultiHeadDoc<P>,
@@ -252,38 +224,27 @@ pub struct Branch<'a, P: HeadPolicy> {
 }
 
 impl<P: HeadPolicy> Branch<'_, P> {
-    /// Resolve the branch's head for read and run `f` on its `BranchingDocHead`.
-    /// A mutation inside `f` on a Private head is committed on exit (see
-    /// `MultiHeadDoc::read`); on a shared head it errors at the sink.
+    /// Resolve the branch's head for read and run `f` on it. A mutation on a
+    /// Private head is committed on exit; on a shared head it errors at the sink.
     pub fn read<R>(&self, f: impl FnOnce(&BranchingDocHead) -> R) -> LoroResult<R> {
         self.doc
             .read(&self.name, |d| f(&BranchingDocHead::from_head(d.clone())))
     }
 
-    /// Resolve the branch's head for write (copy-on-divergence if shared), run
-    /// `f`, then commit.
+    /// Resolve the branch's head for write (copy-on-divergence), run `f`, commit.
     pub fn write<R>(&self, f: impl FnOnce(&BranchingDocHead) -> R) -> LoroResult<R> {
         self.doc
             .write(&self.name, |d| f(&BranchingDocHead::from_head(d.clone())))
     }
 
-    // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `Branch::checkout`
-    // (and `attach`/`checkout_to_latest`) are DEFERRED to an RFP and NOT exposed
-    // here. They are a bundled "move the head, then reset from the oplog" surface
-    // that does not map to branch scope: a branch has no single "latest", and
-    // loro's `attach` snaps to the shared UNION, which corrupts an owned head.
-    // The whole trio is prevented for now (the raw `LoroDoc` seam gates them);
-    // the writable-after-checkout contract is the RFP's to define, so there is
-    // nothing to freeze on `Branch`. `fork` / `fork_at` (eject) stay as the
-    // history-adjacent affordance we keep.
+    // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `checkout` /
+    // `attach` / `checkout_to_latest` are deliberately not exposed: a branch has
+    // no single "latest", and loro's `attach` snaps to the shared union, which
+    // corrupts an owned head. The raw `LoroDoc` seam gates them.
 
-    /// Branch-scoped container subscription. Parity contract: it delivers the
-    /// same events for every update as a subscription on a plain `LoroDoc` would.
-    /// It fires on the branch's current head (local commits) AND, because the
-    /// registry re-installs it across a rebind and every head transition
-    /// synthesizes and dispatches its diff, on every advance / merge / import-
-    /// driven move of the branch. A move is tagged `Import` (live content), never
-    /// `Checkout`.
+    /// Branch-scoped container subscription, delivering the same events a plain
+    /// `LoroDoc` subscription would: local commits, plus every advance / merge /
+    /// import-driven move of the branch, tagged `Import` (never `Checkout`).
     pub fn subscribe(&self, cid: &ContainerID, cb: Subscriber) -> LoroResult<BranchSubscription> {
         self.doc.subscribe_branch(&self.name, Some(cid.clone()), cb)
     }
@@ -293,54 +254,39 @@ impl<P: HeadPolicy> Branch<'_, P> {
         self.doc.subscribe_branch(&self.name, None, cb)
     }
 
-    /// The gated escape hatch: EJECT a standalone `LoroDoc` (independent op log,
-    /// full surface) that aliases no registry head. This is the only `Branch`
-    /// signature that names `LoroDoc`.
+    /// Eject a standalone `LoroDoc` (independent op log, full surface) that
+    /// aliases no registry head.
     ///
-    /// Ejects via `fork_at(&head.state_frontiers())`, NOT `LoroDoc::fork()`:
-    /// `fork()` assumes `!is_detached()` implies `state == oplog.frontiers()`,
-    /// but a registry head is behind the shared union while attached, so `fork()`
-    /// would label the ejected snapshot with the union frontier while its state
-    /// is only this head's -- an incoherent doc that panics on first `checkout`
-    /// (`richtext_state.rs`). `fork_at` snapshots AT the head's own frontier, so
-    /// the ejected doc's state matches its frontier label and is checkout-able.
+    /// Uses `fork_at(&head.state_frontiers())`, not `LoroDoc::fork()`: `fork()`
+    /// assumes an attached doc's state equals `oplog.frontiers()`, but a
+    /// registry head is behind the shared union, so the ejected doc would carry
+    /// the union frontier label over this head's state and panic on first
+    /// `checkout` (`richtext_state.rs`).
     pub fn fork(&self) -> LoroResult<LoroDoc> {
         let (_, head) = self.doc.resolve(&self.name, Intent::Read)?;
         head.fork_at(&head.state_frontiers())
     }
 
-    /// The LENS: the branch head's OWN aliased `LoroDoc`, the single bidirectional
-    /// handle editor / undo / presence / canvas all bind to. COPY-ON-OPEN: the head is
-    /// resolved with write intent (copy-on-divergence up front) and then PINNED as the
-    /// branch's unique, unshared head for the life of the binding, so no converging
-    /// sibling can flip it shared or retire it out from under an open editor
-    /// (`open_lens`). Unlike `fork` (which EJECTS a dead standalone snapshot), this
-    /// returns the registry head itself: an edit + `commit` advances THIS branch's head
-    /// and fires the branch's subscription; an import that extends the branch FORWARD
-    /// advances this same head in place (guarded fast-forward-only) and fires it too; an
-    /// `UndoManager` binds to it because it is a real `LoroDoc`. Supersedes the earlier
-    /// `window()`; see `cdocs/proposals/2026-09-20-branch-bidirectional-lens.md`.
+    /// The branch head's own aliased `LoroDoc`, which editor / undo / presence /
+    /// canvas bind to. The head is resolved for write, then pinned as the
+    /// branch's unique unshared head (`open_lens`), so no sibling can flip it
+    /// shared or retire it. Unlike `fork`, an edit + `commit` advances this
+    /// branch's head and fires its subscriptions, and a forward-extending import
+    /// advances it in place (fast-forward-only).
     ///
-    /// NOTE(claude-opus-4-8/unified-branching-content/P1): the `BranchingDocHead`
-    /// containment (the head-safe wrapper that withholds `import`/`export`/`checkout`/
-    /// `fork`) is LIKELY OVER-CAUTIOUS: per a loro maintainer the `MultiHeadDoc` shared
-    /// oplog is always append-only, so wrapping a head to withhold history-bearing ops is
-    /// probably unnecessary. The DEEPER containment removal is DEFERRED pending triplicate
-    /// review; this accessor is the MINIMAL enablement that hands the live head out, and
-    /// nothing more. The window re-exposes the full `LoroDoc` history surface as a
-    /// deliberate, maintainer-accepted tradeoff on the append-only oplog; the discipline
-    /// that consumers issue ONLY local read/subscribe/edit/commit/undo/cursor on it is by
-    /// convention, not by type. In particular `checkout` on the window is incoherent while
-    /// the head is behind the shared union (see `fork`'s note) and must not be called.
+    /// NOTE(claude-opus-4-8/unified-branching-content/P1): this exposes the full
+    /// `LoroDoc` history surface; the `BranchingDocHead` containment is likely
+    /// over-cautious since the shared oplog is append-only. By convention, not
+    /// type, consumers only read/subscribe/edit/commit/undo/cursor. `checkout`
+    /// is incoherent while the head is behind the shared union (see `fork`).
     pub fn lens(&self) -> LoroResult<LoroDoc> {
         self.doc.open_lens(&self.name)
     }
 }
 
 impl<P: HeadPolicy> MultiHeadDoc<P> {
-    /// A handle to branch `name`: a NAME, resolved per operation. This is the
-    /// consumer surface; every op re-resolves because the head a branch uses
-    /// can change underneath the handle (a copy, a rebind).
+    /// A handle to branch `name`, re-resolved per operation since its head can
+    /// change underneath (a copy, a rebind). This is the consumer surface.
     pub fn branch(&self, name: impl Into<BranchId>) -> Branch<'_, P> {
         Branch {
             doc: self,

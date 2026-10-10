@@ -17,10 +17,6 @@ use loro_common::{
 use super::*;
 
 /// The only axis on which the two `MultiHeadDoc` variants differ.
-///
-/// `target` says where a branch should be, `after_commit` publishes a new tip,
-/// and `after_import` says which branches to rebind after history lands. The
-/// base calls these; it never branches on which policy it holds.
 pub trait HeadPolicy: Send + Sync + 'static + Sized {
     /// Copy discipline for this variant.
     const COPY: CopyMode;
@@ -29,14 +25,13 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
     /// registry lock is held, so it MUST NOT lock the registry.
     fn target(&self, this: &MultiHeadDoc<Self>, b: &BranchId) -> LoroResult<Frontiers>;
 
-    /// Publish the new tip after `b`'s head commits the ops in `committed` (the
-    /// change's full id span; its last id is the head's new single tip). May be
-    /// a no-op. Runs OUTSIDE the registry lock.
+    /// Publish the new tip after `b`'s head commits `committed` (the change's
+    /// full id span; its last id is the head's new single tip). Runs outside
+    /// the registry lock.
     fn after_commit(&self, this: &MultiHeadDoc<Self>, b: &BranchId, committed: IdSpan);
 
-    /// Given the spans that just landed on import, return the branches whose
-    /// binding should be re-resolved. Errs if the import is malformed (an op the
-    /// index policy cannot attribute to any branch); the caller propagates it.
+    /// The branches to re-resolve after `status`'s spans landed. Errs on a
+    /// malformed import (an op the index policy cannot attribute).
     fn after_import(
         &self,
         this: &MultiHeadDoc<Self>,
@@ -44,42 +39,27 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
     ) -> LoroResult<Vec<BranchId>>;
 }
 
-/// Root map that carries every branch's creation MARKER as a plain map value:
-/// `branch.name = "<b>"` (`Root{name: "branch"}`, key `"name"`).
+/// Root map carrying every branch's creation marker: `branch.name = "<b>"`.
 ///
-/// The first op of a fresh index peer sets this key to the branch it was created
-/// for. Because the name travels as a `LoroValue::String` in the op log (a
-/// `MapSet` op, op-log-resident and readable by `after_import` with no
-/// materialized state), the whole index needs ONE marker root container rather
-/// than one per branch, and a branch name is any string (no container-id charset
-/// constraint).
+/// The first op of a fresh index peer sets this key. The name is a plain
+/// `LoroValue::String` readable from the op log alone, so one root container
+/// serves all branches and names are unconstrained by container-id charset.
 pub(super) const BRANCH_ROOT: &str = "branch";
 pub(super) const BRANCH_NAME_KEY: &str = "name";
 
-/// Key on the `branch` root map for a MERGE marker: `branch.merge = "<seq>:<b>"`
+/// Key on the `branch` root map for a merge marker: `branch.merge = "<seq>:<b>"`
 /// where `<seq>` is a monotonic integer.
 ///
-/// A repo-wide merge advances `into`'s index head to the join and needs ONE op
-/// naming `into`. It cannot reuse the `name` key: at the join `branch.name` may
-/// ALREADY equal `into` (the winner of the concurrent creation-marker LWW, or
-/// `into`'s own set causally dominating the source's), and a same-value map set
-/// emits NO op -- so `after_commit` never fires and the whole merge is silently
-/// dropped, on this peer AND on every peer that would fold the op stream. The
-/// `<seq>` prefix (read-then-increment of the current merge value) guarantees the
-/// value DIFFERS from whatever the last merge into `into` wrote, so the op always
-/// emits. The branch name is everything after the FIRST `:`, so a name that
-/// itself contains `:` is recovered intact (the seq is a decimal integer, no
-/// `:`). It stays a KEY on the existing `branch` map, so the root-container count
-/// is unchanged (still 2).
+/// A merge needs one op naming `into`, but cannot reuse the `name` key:
+/// `branch.name` may already equal `into`, and a same-value map set emits no
+/// op, so the merge would be silently dropped on every peer. The `<seq>`
+/// prefix (read-then-increment) guarantees the value differs from the last
+/// merge's. The branch name is everything after the first `:`, so names
+/// containing `:` survive.
 pub(super) const BRANCH_MERGE_KEY: &str = "merge";
 
-/// The branch a marker op on the `branch` root map names, or `None` for a
-/// non-marker op. Pure op-log discovery: attribution never needs a materialized
-/// state to identify the branch. Two marker kinds:
-/// - `branch.name = "<b>"` (creation): the value IS the branch name;
-/// - `branch.merge = "<seq>:<b>"` (merge): the name is everything after the
-///   first `:` (the `<seq>` prefix keeps the map set from being a same-value
-///   no-op; see [`BRANCH_MERGE_KEY`]).
+/// The branch a marker op names, or `None` for a non-marker op. Reads the op
+/// log only, no materialized state. See [`BRANCH_MERGE_KEY`] for the merge form.
 fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
     let InnerContent::Map(MapSet {
         key,
@@ -108,30 +88,24 @@ fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
     }
 }
 
-/// Build the loud error for an imported op the fold cannot attribute to a
-/// branch. This is UNREACHABLE in well-formed operation: every index op
-/// descends from genesis, a normal record resolves to exactly one nearest
-/// marker, and a merge is itself a marker. An unattributable op is therefore
-/// malformed input, and the fold refuses it (advancing no branch) and returns
-/// this error, the way Loro rejects an invalid import -- NEVER silently
-/// attributing it to some default branch (that is the S0 silent-data-loss
-/// class).
+/// Loud error for an imported op the fold cannot attribute to a branch.
+/// Unreachable for well-formed input (every index op descends from genesis and
+/// resolves to exactly one nearest marker), so the fold rejects the import
+/// rather than silently attributing the op to a default branch (data loss).
 fn invalid_attribution(msg: impl std::fmt::Display) -> LoroError {
     tracing::error!("index attribution: invalid import: {msg}");
     LoroError::Unknown(format!("index attribution: invalid import: {msg}").into_boxed_str())
 }
 
-/// The index's derived branch projection (the maintainer's `active_branches`),
-/// folded from the op log by causal attribution: an op belongs to the branch
-/// named by the nearest marker in its causal past.
+/// The index's derived branch projection, folded from the op log by causal
+/// attribution: an op belongs to the branch named by the nearest marker in its
+/// causal past.
 #[derive(Debug, Default)]
 pub struct Attribution {
     /// Branch -> its index frontier. `target(b)` is exactly `tips[b]`.
     pub tips: FxHashMap<BranchId, Frontiers>,
-    /// Per-peer attribution runs, sorted by start counter: the op `(peer, c)`
-    /// belongs to the run with the greatest start `<= c`. A fresh index peer
-    /// has one run (its creation marker at counter 0); a peer whose head is
-    /// later rebound, or a peer that writes a marker mid-history, gains more.
+    /// Per-peer runs sorted by start counter: op `(peer, c)` belongs to the run
+    /// with the greatest start `<= c`.
     pub runs: FxHashMap<PeerID, SmallVec<[(Counter, BranchId); 1]>>,
 }
 
@@ -146,10 +120,8 @@ impl Attribution {
             .map(|(_, b)| b)
     }
 
-    /// Make the run covering `(peer, start)` name `b`: a no-op if it already
-    /// does, else a new run starting at `start` (or a re-labelling of a run
-    /// that starts exactly there, for an idempotent re-fold of a stored change
-    /// that merged with an earlier one).
+    /// Make the run covering `(peer, start)` name `b`. Idempotent; relabels a
+    /// run starting exactly at `start` (re-fold of a stored, merged change).
     fn ensure_run(&mut self, peer: PeerID, start: Counter, b: &BranchId) {
         let runs = self.runs.entry(peer).or_default();
         match runs.iter().rposition(|(s, _)| *s <= start) {
@@ -182,31 +154,24 @@ impl Attribution {
     }
 }
 
-/// The index's resolution policy: its OWN op log is the root of truth for where
-/// each branch is, so it consults no other index -- this breaks the
-/// `BranchingDoc`-depends-on-index circularity. Eager copy at branch creation
-/// means every index head is born `refs == 1` (never shared), so the sink guard
-/// never fires on an index head.
+/// The index's resolution policy: its own op log is the source of truth for
+/// where each branch is. Eager copy means every index head is born `refs == 1`,
+/// so the sink guard never fires on one.
 ///
-/// Attribution is CAUSAL, not by peer identity: a change belongs to the branch
-/// named by its own marker if it carries one, else to the branch of its
-/// dependencies (which must agree, or the import is rejected as malformed). A
-/// head's state is always at `tips[b]` when it commits (`resolve` guarantees it),
-/// so
-/// every local change depends on `b`'s tips and inherits `b` with no
-/// declaration -- which is why a head minted by the resolve materialize arm
-/// needs no marker of its own: its first change's deps already attribute it.
+/// Attribution is causal, not by peer identity: a change belongs to the branch
+/// of its own marker if it carries one, else to the branch of its dependencies
+/// (which must agree, or the import is rejected). A head always sits at
+/// `tips[b]` when it commits (`resolve` guarantees it), so a head minted by
+/// `resolve` needs no marker: its first change's deps already attribute it.
 ///
-/// Consistency of the derived `tips`: every mutation of `(tips, runs)` happens
-/// under the `Attribution` leaf lock as one critical section (a whole fold, or
-/// a whole `after_commit`), so a reader holding that lock sees all of a fold or
-/// none of it. `after_commit` publishes AFTER the commit returns; a session is
-/// single-writer, so its own next `resolve` runs after that publish.
+/// `(tips, runs)` only mutate under the `Attribution` leaf lock, one whole fold
+/// or `after_commit` per critical section, so readers see all of a fold or none.
+/// `after_commit` publishes after the commit returns; a session is
+/// single-writer, so its next `resolve` runs after the publish.
 #[allow(missing_debug_implementations)]
 pub struct SelfRooted {
-    // Created lazily in the doc's lock group (`LockKind::Attribution`, the leaf
-    // acquired alone or after `OpLog`) on first use, since the group exists
-    // only once `MultiHeadDoc::new` has run.
+    // Lazy: the lock group exists only once `MultiHeadDoc::new` has run.
+    // `LockKind::Attribution` is the leaf, acquired alone or after `OpLog`.
     attr: OnceLock<LoroMutex<Attribution>>,
 }
 
@@ -231,17 +196,15 @@ impl SelfRooted {
     }
 }
 
-/// One imported change, as the fold sees it: its position in the DAG plus the
-/// counters of its marker ops.
+/// One imported change, as the fold sees it.
 struct Imported {
     lamport: Lamport,
     peer: PeerID,
     start: Counter,
     last: Counter,
     deps: Frontiers,
-    /// `(op counter, branch)` per marker op, in counter order. A stored change
-    /// may merge several consecutive commits of one peer, so a marker can sit
-    /// past the first op; each marker starts a new attribution segment.
+    /// `(op counter, branch)` per marker op. A stored change may merge several
+    /// commits, so a marker can sit past the first op; each starts a segment.
     markers: SmallVec<[(Counter, BranchId); 1]>,
 }
 
@@ -259,8 +222,8 @@ impl HeadPolicy for SelfRooted {
             .unwrap_or_default())
     }
 
-    /// The head that committed sat at `tips[b]`, so its new single tip IS the
-    /// branch's frontier; its peer's run covers the committed counters as `b`.
+    /// The committing head sat at `tips[b]`, so its new single tip is the
+    /// branch's frontier.
     fn after_commit(&self, this: &MultiHeadDoc<Self>, b: &BranchId, committed: IdSpan) {
         let mut attr = self.attribution(this).lock();
         attr.ensure_run(committed.peer, committed.counter.start, b);
@@ -268,13 +231,11 @@ impl HeadPolicy for SelfRooted {
             .insert(b.clone(), Frontiers::from_id(committed.id_last()));
     }
 
-    /// The causal fold. Collect the just-imported changes, sort them by
-    /// `(lamport, peer, counter)` (a topological order: a change's lamport
-    /// exceeds every dependency's), then attribute each in that order, so every
-    /// dependency of a successful change is in `runs` before it is looked up
-    /// (Loro holds a change back in `pending` until its deps are present).
-    /// Returns the branches whose `tips` moved, or an error if any op cannot be
-    /// attributed (malformed import; no branch advances for it).
+    /// The causal fold. Sorts imported changes by `(lamport, peer, counter)`
+    /// (topological: a change's lamport exceeds its deps'), so every dependency
+    /// is in `runs` before lookup (Loro holds changes in `pending` until deps
+    /// arrive). Returns the branches whose `tips` moved, or an error if any op
+    /// cannot be attributed.
     fn after_import(
         &self,
         this: &MultiHeadDoc<Self>,
@@ -305,15 +266,12 @@ impl HeadPolicy for SelfRooted {
         let mut touched: FxHashSet<BranchId> = FxHashSet::default();
         let mut attr = self.attribution(this).lock();
         for c in batch {
-            // Segments `(first counter, last counter, branch)`: the prefix
-            // before the first marker is attributed by deps; each marker
-            // attributes the ops from itself up to the next marker.
+            // Segments `(first, last, branch)`: the prefix before the first
+            // marker is attributed by deps; each marker covers up to the next.
             let mut segments: SmallVec<[(Counter, Counter, BranchId); 2]> = SmallVec::new();
             let first_marker = c.markers.first().map(|(k, _)| *k);
             if first_marker != Some(c.start) {
                 let seg_last = first_marker.map_or(c.last, |k| k - 1);
-                // A non-marker prefix inherits its deps' branch; deps that are
-                // unknown or disagree mean a malformed op -> reject the import.
                 segments.push((c.start, seg_last, attr.branch_of_deps(&c.deps)?));
             }
             for (i, (k, b)) in c.markers.iter().enumerate() {
@@ -341,15 +299,11 @@ impl HeadPolicy for SelfRooted {
     }
 }
 
-/// A content doc's resolution policy: DELEGATE to the repo's index for "where is
-/// branch `b` for this doc", copying lazily on divergence. The index is the
-/// source of truth; a content head materializes at the recorded frontier.
+/// A content doc's resolution policy: delegates to the repo's index for where
+/// branch `b` is for this doc, copying lazily on divergence.
 ///
-/// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): the proposal's
-/// `frontier_cache` (a per-branch mirror of the index frontier refreshed by the
-/// index's history subscription) is a HOT-PATH OPTIMIZATION and is deferred:
-/// `target` reads the index directly each call (the source of truth), which is
-/// correct, just not cached. The cache is Phase-3 follow-up scope.
+/// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `target` reads the
+/// index on every call; no frontier cache.
 #[allow(missing_debug_implementations)]
 pub struct Delegated {
     pub(super) id: DocId,
@@ -365,10 +319,8 @@ impl Delegated {
 impl HeadPolicy for Delegated {
     const COPY: CopyMode = CopyMode::OnDivergence;
 
-    /// Where branch `b` is for this doc: the index's recorded ids reduced against
-    /// THIS doc's history -- drop ids the content history does not yet hold
-    /// ("skipped until held"), then shrink. Reads the index first (its locks
-    /// released), then the content DAG; the two docs' locks never nest.
+    /// The index's recorded ids for `b`, minus ids this doc does not yet hold
+    /// ("skipped until held"), shrunk. The index and content locks never nest.
     fn target(&self, this: &MultiHeadDoc<Self>, b: &BranchId) -> LoroResult<Frontiers> {
         let raw = self.index.recorded_ids(b, &self.id)?;
         let ol = this.oplog.lock();
@@ -385,9 +337,8 @@ impl HeadPolicy for Delegated {
         let _ = self.index.record_head(b, &self.id, last.peer, last.counter);
     }
 
-    /// After a content import, re-resolve every branch the index knows: a branch
-    /// whose recorded ids for this doc just became held advances to them (the
-    /// ingest); ids still unheld are dropped by `target` and picked up next time.
+    /// Re-resolve every branch the index knows: ids that just became held are
+    /// picked up; still-unheld ids are dropped by `target` until next time.
     fn after_import(
         &self,
         _this: &MultiHeadDoc<Self>,
@@ -397,10 +348,9 @@ impl HeadPolicy for Delegated {
     }
 }
 
-/// A test-only policy that exercises the base's registry/copy/guard mechanics
-/// without the real index or content policies. `target` is whatever the test
-/// last recorded (default: the empty root frontier); `after_commit` advances a
-/// branch's recorded target to its head's new tip so resolution stays stable.
+/// Test-only policy for exercising the base without the real policies.
+/// `target` is whatever the test last recorded (default: empty frontier);
+/// `after_commit` moves it to the head's new tip.
 #[allow(missing_debug_implementations)]
 pub struct Manual {
     targets: std::sync::Mutex<FxHashMap<BranchId, Frontiers>>,
