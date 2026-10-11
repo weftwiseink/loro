@@ -41,8 +41,7 @@ pub trait HeadPolicy: Send + Sync + 'static + Sized {
 
 /// Root map carrying every branch's creation marker: `branch.name = "<b>"`.
 ///
-/// The first op of a fresh index peer sets this key. The name is a plain
-/// `LoroValue::String` readable from the op log alone, so one root container
+/// The name is a plain string readable from the op log alone, so one root container
 /// serves all branches and names are unconstrained by container-id charset.
 pub(super) const BRANCH_ROOT: &str = "branch";
 pub(super) const BRANCH_NAME_KEY: &str = "name";
@@ -50,12 +49,10 @@ pub(super) const BRANCH_NAME_KEY: &str = "name";
 /// Key on the `branch` root map for a merge marker: `branch.merge = "<seq>:<b>"`
 /// where `<seq>` is a monotonic integer.
 ///
-/// A merge needs one op naming `into`, but cannot reuse the `name` key:
-/// `branch.name` may already equal `into`, and a same-value map set emits no
-/// op, so the merge would be silently dropped on every peer. The `<seq>`
-/// prefix (read-then-increment) guarantees the value differs from the last
-/// merge's. The branch name is everything after the first `:`, so names
-/// containing `:` survive.
+/// Cannot reuse the `name` key: `branch.name` may already equal `into`, and a
+/// same-value map set emits no op, so the merge would be silently dropped on every
+/// peer. The `<seq>` prefix guarantees the value differs from the last merge's. The
+/// branch name is everything after the first `:`, so names containing `:` survive.
 pub(super) const BRANCH_MERGE_KEY: &str = "merge";
 
 /// The branch a marker op names, or `None` for a non-marker op. Reads the op
@@ -88,10 +85,9 @@ fn marker_branch_of(ol: &OpLog, op: &crate::op::Op) -> Option<BranchId> {
     }
 }
 
-/// Loud error for an imported op the fold cannot attribute to a branch.
-/// Unreachable for well-formed input (every index op descends from genesis and
-/// resolves to exactly one nearest marker), so the fold rejects the import
-/// rather than silently attributing the op to a default branch (data loss).
+/// Loud error for an imported op the fold cannot attribute to a branch. Unreachable
+/// for well-formed input, so the import is rejected rather than silently attributed
+/// to a default branch (data loss).
 fn invalid_attribution(msg: impl std::fmt::Display) -> LoroError {
     tracing::error!("index attribution: invalid import: {msg}");
     LoroError::Unknown(format!("index attribution: invalid import: {msg}").into_boxed_str())
@@ -155,9 +151,8 @@ impl Attribution {
 }
 
 /// The index's resolution policy: its own op log is the source of truth for
-/// where each branch is. Eager copy means every index head is born `refs == 1`,
-/// so the sink guard never fires on one. Self-rooting also breaks the
-/// `BranchingDoc`-depends-on-index circularity: the index consults no other index.
+/// where each branch is. Self-rooting breaks the `BranchingDoc`-depends-on-index
+/// circularity: the index consults no other index.
 ///
 /// Attribution is causal, not by peer identity: a change belongs to the branch
 /// of its own marker if it carries one, else to the branch of its dependencies
@@ -302,9 +297,6 @@ impl HeadPolicy for SelfRooted {
 
 /// A content doc's resolution policy: delegates to the repo's index for where
 /// branch `b` is for this doc, copying lazily on divergence.
-///
-/// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `target` reads the
-/// index on every call; no frontier cache.
 #[allow(missing_debug_implementations)]
 pub struct Delegated {
     pub(super) id: DocId,

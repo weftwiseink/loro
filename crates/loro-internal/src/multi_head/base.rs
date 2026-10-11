@@ -23,7 +23,7 @@ use super::*;
 
 /// The shared innards of a `MultiHeadDoc`, behind an `Arc` so a head's on-commit
 /// hook can hold a `Weak` back to it (see `HeadOwner`).
-#[allow(missing_debug_implementations)] // holds LoroMutex<OpLog>/live heads; no useful Debug
+#[allow(missing_debug_implementations)]
 pub struct MultiHeadInner<P: HeadPolicy> {
     pub(super) oplog: Arc<LoroMutex<OpLog>>,
     pub(super) arena: SharedArena,
@@ -32,14 +32,9 @@ pub struct MultiHeadInner<P: HeadPolicy> {
     pub(super) visible_op_count: Arc<AtomicUsize>,
     pub(super) reg: LoroMutex<Registry>,
     pub(super) policy: P,
-    /// Head whose state a `Snapshot` export carries (default: root).
     pub(super) snapshot_head: AtomicU64,
-    /// Fires per new change, aggregated over heads and imports.
     pub(super) history_subs: SubscriberSetWithQueue<(), HistoryCallback, Vec<u8>>,
-    /// Fires per local change, aggregated over heads. Unlike `history_subs`,
-    /// never on `import`, so a wire adaptor never re-broadcasts remote ops.
     pub(super) local_update_subs: SubscriberSetWithQueue<(), HistoryCallback, Vec<u8>>,
-    /// Fires per first commit from a peer, aggregated over heads.
     pub(super) first_commit_subs:
         SubscriberSetWithQueue<(), FirstCommitFromPeerCallback, FirstCommitFromPeerPayload>,
 }
@@ -66,8 +61,7 @@ impl<P: HeadPolicy> Deref for MultiHeadDoc<P> {
     }
 }
 
-/// The registry back-pointer installed on each head. `on_head_commit` runs
-/// after the head's locks drop and re-keys the tip index and notifies the policy.
+/// Registry back-pointer installed on each head.
 pub(super) struct HeadOwner<P: HeadPolicy> {
     pub(super) inner: Weak<MultiHeadInner<P>>,
     pub(super) head_id: HeadId,
@@ -272,11 +266,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         })
     }
 
-    /// Create branch `new` sharing `from`'s head: O(1).
-    ///
-    /// `OnDivergence` (content-doc) policies only. `Eager` policies (the index)
-    /// use their own creation, which also writes the marker (see
-    /// `MultiHeadDoc<SelfRooted>::create_index_branch`).
+    /// Create branch `new` sharing `from`'s head (O(1)). `OnDivergence` policies only.
     pub fn create_branch(&self, new: &BranchId, from: &BranchId) -> LoroResult<()> {
         debug_assert!(
             P::COPY == CopyMode::OnDivergence,
@@ -284,9 +274,6 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         );
         let (from_head, _) = self.resolve(from, Intent::Read)?;
         self.with_reg(|this, reg| {
-            // Sharing a lens (`unshared`) head would flip it shared, breaking
-            // its `refs == 1` invariant. Unreachable in the content flow, which
-            // creates branches lazily via the index.
             debug_assert!(
                 !reg.heads.get(&from_head).map(|h| h.unshared).unwrap_or(false),
                 "create_branch from a lensed head would share the pin (invariant 6); \
@@ -297,10 +284,8 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         Ok(())
     }
 
-    /// Resolve `b` for read (never copies) and run `f` on the head. A mutation
-    /// on a shared head errors from the sink; on a Private head it is a normal
-    /// local edit, committed on exit so no uncommitted op survives to a `retire`.
-    ///
+    /// Resolve `b` for read (never copies) and run `f` on the head. A Private head's
+    /// edits are committed on exit so no uncommitted op survives to a `retire`.
     /// Low-level; the consumer surface is `Branch::read`.
     #[doc(hidden)]
     pub fn read<R>(&self, b: &BranchId, f: impl FnOnce(&LoroDoc) -> R) -> LoroResult<R> {
@@ -312,9 +297,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         Ok(r)
     }
 
-    /// Resolve `b` for write (copies if shared), run `f`, then commit. The
-    /// commit hook (`on_head_committed`) re-keys `by_tip` and notifies the policy.
-    ///
+    /// Resolve `b` for write (copies if shared), run `f`, then commit.
     /// Low-level; the consumer surface is `Branch::write`.
     #[doc(hidden)]
     pub fn write<R>(&self, b: &BranchId, f: impl FnOnce(&LoroDoc) -> R) -> LoroResult<R> {
@@ -346,7 +329,6 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 if reg.by_tip.get(&old_tip) == Some(&id) {
                     reg.by_tip.remove(&old_tip);
                 }
-                // A lens head is never a `by_tip` resting owner.
                 if !unshared {
                     reg.by_tip.insert(new_tip.clone(), id);
                 }
@@ -369,11 +351,8 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         }
     }
 
-    /// Run `f` with every head's transaction committed and stopped, then renew
-    /// each head's auto-commit txn.
-    ///
-    /// All `Txn` locks share one `LockKind`, so the order checker forbids
-    /// holding two; heads are commit-stopped sequentially.
+    /// Run `f` with every head's transaction committed and stopped, then renew them.
+    /// All `Txn` locks share one `LockKind`, so heads are stopped sequentially.
     pub fn with_all_heads_barrier<R>(&self, f: impl FnOnce() -> R) -> R {
         let docs: Vec<LoroDoc> = {
             let reg = self.reg.lock();
@@ -405,9 +384,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 .expect("the root head always exists")
         };
         let status = self.with_all_heads_barrier(|| head.import_to_history(bytes))?;
-        // Policy-directed rebinding. For `SelfRooted` this discovers remote
-        // branches from the marker scan. Branches whose ids are not yet fully
-        // held are skipped (resolve errors are non-fatal) until the next import.
+        // Resolve errors are non-fatal: unheld ids are picked up on a later import.
         let touched = self.inner.policy.after_import(self, &status)?;
         for b in touched {
             // `MultiHeadDoc::import` carries no origin, so it is empty.
@@ -443,17 +420,15 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         sub
     }
 
-    /// Fires per local change on any branch. Mirrors
-    /// `LoroDoc::subscribe_local_update`: never on `import`, so a sync adaptor
-    /// does not echo imported ops.
+    /// Fires per local change on any branch, never on `import` (so a sync adaptor
+    /// does not echo imported ops).
     pub fn subscribe_local_update(&self, callback: HistoryCallback) -> Subscription {
         let (sub, enable) = self.local_update_subs.inner().insert((), callback);
         enable();
         sub
     }
 
-    /// The version vector of the shared op log: everything this peer holds
-    /// across all branches, and the version a wire adaptor diffs against.
+    /// The shared op log's version vector: what this peer holds across all branches.
     /// There is no single state version (each head has its own frontier).
     pub fn oplog_vv(&self) -> VersionVector {
         self.oplog.lock().vv().clone()

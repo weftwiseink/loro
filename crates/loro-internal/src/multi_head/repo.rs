@@ -66,10 +66,8 @@ impl BranchingDocRepo {
         self.index.create_index_branch(new, from)
     }
 
-    /// Repo-wide merge of `from` into `into`: one index marker op (no per-doc
-    /// record), then re-resolve every open content doc so its branch subscribers
-    /// get their catch-up event. Unopened docs pick up the merged frontier on
-    /// reopen.
+    /// Repo-wide merge of `from` into `into`: one index marker op, then re-resolve
+    /// every open content doc so its subscribers get their catch-up event.
     pub fn merge_branch(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
         let outcome = self.index.merge(into, from)?;
         // A resolve that cannot yet advance (ids not held) is non-fatal.
@@ -79,14 +77,9 @@ impl BranchingDocRepo {
         Ok(outcome)
     }
 
-    /// Import lineage/index bytes, then re-resolve every index-known branch of
-    /// every open content doc so branches whose recorded frontier moved advance
-    /// forward (fast-forward-only). This closes the content-first ordering gap:
-    /// a content op that arrived before its lineage record becomes a held
-    /// descendant once the record lands. Unresolvable ids are a non-fatal no-op.
-    ///
-    /// The index import itself is history-only, so these re-resolves are the
-    /// only state moves.
+    /// Import lineage bytes, then re-resolve every open content doc's index-known
+    /// branches (fast-forward-only). Closes the content-before-lineage gap;
+    /// unresolvable ids are a no-op.
     pub fn import_index(&self, bytes: &[u8]) -> LoroResult<ImportStatus> {
         let status = self.index.import(bytes)?;
         let branches = self.index.branches();
@@ -98,13 +91,9 @@ impl BranchingDocRepo {
         Ok(status)
     }
 
-    /// Unbind the branch from every open content doc and the index, and drop
-    /// its index lineage. Its committed ops stay in history (unreferenced).
-    ///
-    /// NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): local-only. The
-    /// branch's marker op remains in the shared index history, so a later sync
-    /// that re-imports it re-discovers the branch (`SelfRooted::after_import`).
-    /// Durable cross-peer deletion is not attempted.
+    /// Unbind the branch from every open content doc and the index, and drop its
+    /// index lineage. Local-only: a later sync re-discovers the branch from its marker
+    /// (`SelfRooted::after_import`).
     pub fn delete_branch(&self, name: &BranchId) -> LoroResult<()> {
         for doc in self.docs.lock().unwrap().values() {
             doc.unbind(name);

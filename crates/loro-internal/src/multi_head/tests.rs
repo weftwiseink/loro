@@ -54,7 +54,6 @@ fn on_commit_rekeys_by_tip_and_shares_via_lookup() {
     let md = MultiHeadDoc::new(Manual::new());
     let (main, other) = (b("main"), b("other"));
     md.bind(&main, 0);
-    // In-place write on a uniquely-owned head; on_commit must re-key by_tip.
     md.write(&main, |d| d.get_text("t").insert_unicode(0, "A").unwrap())
         .unwrap();
     let t = md.head_tip(0).unwrap();
@@ -107,9 +106,8 @@ fn lock_group_shared_docstate_before_oplog_panics() {
 
 #[test]
 fn lock_group_fresh_group_docstate_before_oplog_does_not_panic() {
-    // CONTRAST: a DocState lock built in a fresh group (as a bare per-handle mutex would be) is a
-    // different ordering domain, so the inversion goes unseen. This is why a head must join the
-    // shared group.
+    // CONTRAST: a lock in a fresh group is a different ordering domain, so the inversion goes
+    // unseen; this is why a head must join the shared group.
     let md = MultiHeadDoc::new(Manual::new());
     md.bind(&b("main"), 0);
     let root = md.head_doc(0).unwrap();
@@ -168,8 +166,7 @@ fn sink_guard_leaked_handle_refused_after_flip() {
         matches!(r_op, Err(LoroError::HeadShared)),
         "leaked local op after flip refused, got {r_op:?}"
     );
-    // A leaked raw checkout is refused earlier by the owned-head checkout gate (`OwnedHeadOp`, not
-    // `HeadShared`).
+    // Refused earlier by the owned-head checkout gate (`OwnedHeadOp`), not `HeadShared`.
     let r_checkout = leaked.checkout(&Frontiers::default());
     assert!(
         matches!(r_checkout, Err(LoroError::OwnedHeadOp("checkout"))),
@@ -356,8 +353,7 @@ fn import_is_history_only_and_coowner_safe() {
 
 #[test]
 fn import_path_sink_guard_backstops_shared_head() {
-    // Backstop: even a direct checkout -> apply_diff of imported ops onto a shared head is refused
-    // by the sink guard.
+    // Backstop: a direct checkout -> apply_diff onto a shared head is refused.
     let md = MultiHeadDoc::new(Manual::new());
     let (main, review) = (b("main"), b("review"));
     md.bind(&main, 0);
@@ -371,8 +367,7 @@ fn import_path_sink_guard_backstops_shared_head() {
         "history-only import left the shared head empty"
     );
 
-    // A direct checkout of the shared head to the imported frontier is refused by the owned-head
-    // checkout gate.
+    // Refused by the owned-head checkout gate.
     let shared = md.head_doc(0).unwrap();
     let r = shared.checkout(&f);
     assert!(
@@ -727,8 +722,7 @@ fn index_import_then_record_converges() {
 
 #[test]
 fn branching_doc_head_surface_read_write() {
-    // read/write hand the closure a head-safe `&BranchingDocHead`; history/attachment methods are
-    // absent at the type level (see the `compile_fail` doctest on `BranchingDocHead`).
+    // History/attachment methods are absent from `BranchingDocHead` at the type level.
     let md = MultiHeadDoc::new(Manual::new());
     md.bind(&b("main"), 0);
     let br = md.branch("main");
@@ -802,9 +796,7 @@ fn e1_raw_checkout_seam_refused_on_owned_head() {
 
 #[test]
 fn e1_detach_noop_on_owned_head() {
-    // `detach()` is a no-op on a registry-owned head: attachment is the registry's to change. (The
-    // attach/checkout_to_latest gates are defense-in-depth: no reachable owned head is left
-    // detached to observe them.)
+    // `detach()` is a no-op on a registry-owned head: attachment is the registry's to change.
     let md = MultiHeadDoc::new(Manual::new());
     md.bind(&b("main"), 0);
     md.write(&b("main"), |d| {
@@ -845,7 +837,6 @@ fn e1_site_b_branch_scoped_new_version() {
         d.get_text("t").insert_unicode(1, "2").unwrap()
     })
     .unwrap();
-    // main commits -> its subscriber fires with a BRANCH-SCOPED new_version.
     md.write(&b("main"), |d| {
         d.get_text("t").insert_unicode(1, "2").unwrap()
     })
@@ -868,9 +859,7 @@ fn e1_site_b_branch_scoped_new_version() {
 
 #[test]
 fn branch_fork_ejects_coherent_checkout_able_doc() {
-    // main's head is behind the shared union yet "attached"; `Branch::fork` must use
-    // `fork_at(&state_frontiers())` so the ejected state matches its frontier label
-    // (`LoroDoc::fork()` would label it with the union frontier and panic on checkout).
+    // main's head is behind the union; see `Branch::fork`.
     let md = MultiHeadDoc::new(Manual::new());
     md.bind(&b("main"), 0);
     md.bind(&b("feat"), 0);
@@ -902,11 +891,9 @@ fn branch_fork_ejects_coherent_checkout_able_doc() {
 
 #[test]
 fn refs_gt1_copy_advance_clears_detached() {
-    // refs>1 copy+advance arm: a shared head whose target moved off the shared tip is copied and
-    // advanced (checkout -> detached); the detached-clear lets a subsequent write succeed.
+    // Copy+advance arm: the detached-clear lets a subsequent write succeed.
     let md = MultiHeadDoc::new(Manual::new());
-    // x diverges off the shared root onto its own head and builds "AB"; main + feat stay on the
-    // root (refs 2).
+    // x diverges onto its own head building "AB"; main + feat stay on the root (refs 2).
     md.bind(&b("main"), 0);
     md.bind(&b("feat"), 0);
     md.bind(&b("x"), 0);
@@ -917,8 +904,7 @@ fn refs_gt1_copy_advance_clears_detached() {
         .unwrap();
     assert_eq!(md.refs_of(&b("main")), Some(2));
 
-    // main's target -> the intermediate frontier: resolve(Write) hits the
-    // refs>1 copy+advance arm.
+    // main's target -> the intermediate frontier: resolve(Write) hits that arm.
     md.policy().set_target(&b("main"), t_a.clone());
     let inner = md
         .write(&b("main"), |d| d.get_text("t").insert_unicode(0, "M"))
@@ -1220,7 +1206,6 @@ fn create_branch_at_multi_peer_parent_excludes_other_peers() {
         "parent is multi-peer: {main_content:?}"
     );
 
-    // Fork at A's single-peer frontier must yield A's op only, not the parent's multi-peer content.
     gb.create_branch_at(&b("hist"), &at_a).unwrap();
     assert_eq!(
         gb.branch("hist")
@@ -1230,9 +1215,6 @@ fn create_branch_at_multi_peer_parent_excludes_other_peers() {
         "fork at [A] excludes peer B's op"
     );
 }
-
-// Causal attribution keys on branch markers, not peer identity; re-creating an existing branch
-// errors.
 
 #[test]
 fn index_create_existing_branch_errors_and_no_peer_serves_two_branches() {
@@ -1326,8 +1308,7 @@ fn index_crafted_shared_peer_across_two_markers_attributes_causally() {
 
 #[test]
 fn spike_scenario2_diamond_topology_forks_merges_are_stable() {
-    // A forks B and C; write on each; merge both into A; fork D from A. D must inherit both
-    // contributions (none dropped or duplicated) and B/C stay unchanged.
+    // A forks B and C; merge both into A; fork D from A: D inherits both, B/C unchanged.
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
     g.branch(GENESIS_BRANCH)
@@ -1405,8 +1386,7 @@ fn spike_scenario2_diamond_topology_forks_merges_are_stable() {
 
 #[test]
 fn spike_scenario3_repeated_merge_into_same_target_no_drop_no_dup() {
-    // Fork b, write, merge into main, keep writing on b, merge again: main reflects both merges
-    // (merge must not assume b is merged once).
+    // Fork b, merge into main, keep writing on b, merge again: main reflects both merges.
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
     g.branch(GENESIS_BRANCH)
@@ -1486,10 +1466,8 @@ fn create_branch_at_existing_name_errors() {
 
 #[test]
 fn index_snapshot_restore_preserves_tips_for_every_branch() {
-    // `SelfRooted`'s derived `tips` (folded by `after_import` over `ImportStatus::success`) must
-    // survive a Snapshot export/import into a fresh `IndexDoc`. Build a multi-branch history
-    // (nested fork, divergent merge, a branch created by two sessions), then compare
-    // `branches()`/`target(b)` before and after.
+    // Derived `tips` must survive a Snapshot export/import into a fresh `IndexDoc`, over a
+    // nested fork, a divergent merge, and a branch created by two sessions.
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
 
@@ -1552,12 +1530,9 @@ fn index_snapshot_restore_preserves_tips_for_every_branch() {
         assert!(t.is_ok(), "pre-snapshot target({br}) must resolve");
     }
 
-    // Export a SNAPSHOT and import it into a doc that has never seen an incremental update.
     let snap = idx.export(ExportMode::Snapshot).unwrap();
     let restored = IndexDoc::new(SelfRooted::new());
     let status = restored.import(&snap).unwrap();
-    // Does the snapshot import's `ImportStatus::success` cover the full history, so the attribution
-    // walk sees every marker op?
     assert!(
         !status.success.is_empty(),
         "snapshot import's ImportStatus::success must be non-empty for after_import \
@@ -1583,8 +1558,7 @@ fn index_snapshot_restore_preserves_tips_for_every_branch() {
     }
 }
 
-// A local record on a remotely-discovered branch must survive the next resolve and reach the peer.
-// Control: `index_import_then_record_converges` (B creates `feat` locally).
+// Control: `index_import_then_record_converges`.
 
 #[test]
 fn index_remote_discovered_branch_local_record_survives() {
@@ -1625,9 +1599,6 @@ fn index_remote_discovered_branch_local_record_survives() {
         "B's record never reached A: {on_a:?}"
     );
 }
-
-// The single-pass lamport-ordered fold attributes every change of a multi-peer, multi-branch
-// history on a cold import (no rejection), with tips equal to the source's.
 
 /// Build the diamond + repeated-merge + two-session history on a fresh repo and return its index.
 fn s4_history() -> BranchingDocRepo {
@@ -1730,9 +1701,6 @@ fn index_cold_import_of_diamond_repeated_merge_two_session_history_attributes_al
     assert_eq!(ids, vec![ID::new(500, 3), ID::new(600, 2)]);
 }
 
-// An unattributable op (a non-marker change whose deps span two branches' frontiers) is a loud
-// invalid-import error, not a silent attribute-to-main; no branch's tips move.
-
 #[test]
 fn index_change_spanning_two_branches_is_rejected_without_moving_tips() {
     let idx = IndexDoc::new(SelfRooted::new());
@@ -1760,14 +1728,12 @@ fn index_change_spanning_two_branches_is_rejected_without_moving_tips() {
     let poison = ext.state_frontiers().as_single().unwrap();
     let ext_bytes = ext.export(ExportMode::updates(&idx.oplog_vv())).unwrap();
 
-    // Rejected loudly rather than attributed to a default branch.
     let result = idx.import(&ext_bytes);
     assert!(
         result.is_err(),
         "an op spanning two branches must reject the import, not attribute silently"
     );
 
-    // No tips moved; the op stays in the op log, unreferenced.
     assert_eq!(idx.tips(), tips_before, "no branch's tips moved");
     assert!(
         idx.oplog_vv().get_last(poison.peer) == Some(poison.counter),
@@ -1780,8 +1746,7 @@ fn index_change_spanning_two_branches_is_rejected_without_moving_tips() {
     assert!(idx.recorded_ids(&b("alpha"), &d("B")).unwrap().is_empty());
 }
 
-// `branch.name` root-map marker: two root containers total (`branch`, `docs`) and no branch-name
-// charset constraint.
+// `branch.name` marker: two root containers total, no branch-name charset constraint.
 
 #[test]
 fn index_arbitrary_branch_names_round_trip() {
@@ -1832,7 +1797,6 @@ fn index_arbitrary_branch_names_round_trip() {
 
 #[test]
 fn index_root_container_count_is_two_regardless_of_branch_count() {
-    // Exactly two root containers (`branch` + `docs`), independent of branch count.
     use crate::arena::LoadAllFlag;
     let idx = IndexDoc::new(SelfRooted::new());
     idx.init_genesis(&b("main")).unwrap();
@@ -1851,8 +1815,7 @@ fn index_root_container_count_is_two_regardless_of_branch_count() {
     );
 }
 
-// Repo-wide `IndexDoc::merge` is a single marker op (checkout + join), not a per-doc
-// `record_frontier` loop; relies on the per-key union of `docs[D].heads`.
+// Repo-wide `IndexDoc::merge` is a single marker op.
 
 /// Total ops in the shared index op log (sum of the per-peer VV counters).
 fn total_ops(idx: &IndexDoc) -> i64 {
@@ -1875,14 +1838,12 @@ fn index_merge_one_marker_unions_docs_per_key() {
     let outcome = idx.merge(&b("into"), &b("from")).unwrap();
     assert_eq!(outcome, MergeOutcome::Merged, "into and from diverged");
 
-    // Exactly one op (the marker), not one per doc.
     assert_eq!(
         total_ops(&idx) - ops_before,
         1,
         "merge writes a single index marker op, not one per merged doc"
     );
 
-    // Per-key union of docs[D].heads: both concurrent writers' entries survive on `into`.
     let mut d_ids = idx.recorded_ids(&b("into"), &d("D")).unwrap();
     d_ids.sort();
     assert_eq!(
@@ -1911,7 +1872,6 @@ fn index_merge_one_marker_unions_docs_per_key() {
     branches.sort();
     assert_eq!(branches, vec![b("from"), b("into"), b("main")]);
 
-    // The marker is a new key on the `branch` map, not a new container.
     assert_eq!(
         idx.arena
             .top_level_root_containers(crate::arena::LoadAllFlag)
@@ -1949,7 +1909,6 @@ fn index_merge_fast_forward_and_already_contained() {
         "main fast-forwarded to feat's record"
     );
 
-    // A redundant merge is AlreadyContained and writes nothing.
     let ops_now = total_ops(&idx);
     assert_eq!(
         idx.merge(&b("main"), &b("feat")).unwrap(),
@@ -1995,15 +1954,10 @@ fn repo_merge_branch_content_catches_up() {
     assert!(repo.branches().contains(&b("feat")));
 }
 
-// The merge marker must always emit an op, even when `into` already won the branch.name LWW at the
-// join: a same-value map set is a no-op, which would silently lose the whole merge (docs union +
-// from-only docs), locally and on cold import.
-
 #[test]
 fn index_merge_into_lww_winner_still_emits_and_propagates() {
-    // merge(feat, main) with into = feat: feat's branch.name is causally after main's, so it
-    // already equals "feat" at the join and re-setting it would be a no-op. The marker must still
-    // emit so main's record reaches feat and propagates.
+    // merge(feat, main): feat's branch.name already equals "feat" at the join, so re-setting it
+    // would be a no-op; the marker must still emit so main's record reaches feat.
     let idx = IndexDoc::new(SelfRooted::new());
     idx.init_genesis(&b("main")).unwrap();
     idx.create_index_branch(&b("feat"), &b("main")).unwrap();
@@ -2122,8 +2076,7 @@ fn index_repeated_merge_into_same_target_each_emits() {
     assert_eq!(cold.recorded_ids(&b("into"), &d("E")).unwrap(), vec![ID::new(222, 2)]);
 }
 
-// Derived reads: fork_point, docs_modified_on_branch (fork-point diff, excludes inherited docs),
-// docs_changed_since_main (stack union), tips replace-vs-join.
+// Derived reads: fork_point, docs_modified_on_branch, docs_changed_since_main.
 
 #[test]
 fn index_fork_point_and_docs_modified() {
@@ -2175,7 +2128,6 @@ fn index_docs_modified_stack_a_b_c() {
 
 #[test]
 fn index_docs_modified_recomputes_across_a_merge() {
-    // docs_modified_on_branch is a fork-point recompute, so it picks up docs brought in by a merge.
     let idx = IndexDoc::new(SelfRooted::new());
     idx.init_genesis(&b("main")).unwrap();
     idx.create_index_branch(&b("into"), &b("main")).unwrap();
@@ -2213,7 +2165,6 @@ fn index_docs_modified_excludes_concurrent_parent_op() {
     bb.import(&a.export(ExportMode::all_updates()).unwrap())
         .unwrap();
 
-    // child modified only its own doc; parent's concurrent post-fork doc is not attributed to it.
     assert_eq!(
         bb.docs_modified_on_branch(&b("child")).unwrap(),
         vec![d("CH")],
@@ -2248,14 +2199,12 @@ fn index_local_commit_after_import_preserves_both_lineages() {
     both.sort();
     assert_eq!(both, vec![ID::new(111, 1), ID::new(222, 2)]);
 
-    // The write resolved shared to the joined tips first, so the new op dominates the join.
     bb.record_head(&b("shared"), &d("E"), 222, 3).unwrap();
     assert_eq!(
         bb.tips()[&b("shared")].len(),
         1,
         "after_commit replaced the joined tips with one id"
     );
-    // Both prior lineages' records still resolve (causal dominance).
     let mut still = bb.recorded_ids(&b("shared"), &d("D")).unwrap();
     still.sort();
     assert_eq!(
@@ -2313,8 +2262,7 @@ fn resolve_with_advance_tags_import_advance() {
     assert_eq!(seen[0].1, "advance", "advance origin");
 }
 
-// Branch-diff producer surface: branch_sources, diff_docs, BranchingDocHead::diff, and the
-// diff_from_fork / merge_preview / diff_branches / export_oplog_slice conveniences.
+// Branch-diff producer surface.
 
 use crate::event::Diff as EvDiff;
 use crate::handler::TextDelta;
@@ -2444,7 +2392,6 @@ fn diff_docs_symmetric_over_key_union() {
         .write(|h| h.get_text("t").insert_unicode(0, "z").unwrap())
         .unwrap();
 
-    // Symmetric: both sides, including main-only D3.
     assert_eq!(
         repo.index().diff_docs(&b(GENESIS_BRANCH), &b("feat")).unwrap(),
         vec![doc_id("D1"), doc_id("D2"), doc_id("D3")],
@@ -2512,10 +2459,8 @@ fn diff_from_fork_dynamic_gca_baseline() {
 
 #[test]
 fn diff_from_fork_dynamic_gca_moves_after_ff_merge() {
-    // The baseline is the dynamic merge-base (GCA), which moves as branches merge, not the static
-    // fork_point. feat forks, main advances, main fast-forwards into feat, then feat edits: the GCA
-    // is main's head ("base-main"); a static fork_point baseline would wrongly report "-main-feat"
-    // (merge_base_length == 4).
+    // The baseline is the dynamic GCA, not the static fork_point: after main fast-forwards into
+    // feat the GCA is main's head ("base-main"); a static baseline would report "-main-feat".
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
     g.branch(GENESIS_BRANCH)
@@ -2688,11 +2633,9 @@ fn conveniences_leave_head_frontiers_unchanged() {
     );
 }
 
-// Branch.lens(): copy-on-open pin, fast-forward-only guard, lineage trigger, lens-observer
-// delivery.
+// Branch.lens(): copy-on-open pin, fast-forward-only guard, lens-observer delivery.
 
-/// A forward content import advances a bound lens head in place and fires the lens's own observer
-/// and the branch subscription exactly once each.
+/// A forward import advances a bound lens in place; lens and branch subscribers fire.
 #[test]
 fn lens_forward_import_advances_and_fires() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -2738,7 +2681,6 @@ fn lens_forward_import_advances_and_fires() {
     gb.import(&content_fwd).unwrap();
     bb.import_index(&idx_ahead).unwrap();
 
-    // The same lens handle reads the forward content; its head never rebound (copy-on-open pin).
     assert_eq!(
         lens.get_text("t").to_string(),
         "hello world",
@@ -2761,8 +2703,7 @@ fn lens_forward_import_advances_and_fires() {
     assert!(!gb.lens_held(&b(GENESIS_BRANCH)), "caught up: lensHeld is false");
 }
 
-/// A lineage-ahead import (the record moves past held content) HOLDS the bound
-/// lens: no regress, no event, `lensHeld` true; content catch-up then fills it.
+/// A lineage-ahead import HOLDS the bound lens (no regress, no event); content catch-up fills it.
 #[test]
 fn lens_lineage_ahead_holds_then_fills() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -2814,7 +2755,6 @@ fn lens_lineage_ahead_holds_then_fills() {
     );
 
     gb.import(&content_fwd).unwrap();
-    // A content import re-resolves via after_import; drive it explicitly too.
     let _ = gb
         .branch(GENESIS_BRANCH)
         .read(|h| h.get_text("t").to_string());
@@ -2829,8 +2769,7 @@ fn lens_lineage_ahead_holds_then_fills() {
     );
 }
 
-/// Copy-on-open: a sibling converging on an open lens head's frontier neither shares into it nor
-/// retires it; a write through the lens afterwards succeeds.
+/// A sibling converging on an open lens head's frontier neither shares into nor retires it.
 #[test]
 fn lens_sibling_convergence_does_not_break_open_head() {
     let repo = BranchingDocRepo::open().unwrap();
@@ -2843,7 +2782,6 @@ fn lens_sibling_convergence_does_not_break_open_head() {
     let main_head = doc.bound_head(&b(GENESIS_BRANCH)).unwrap();
     assert_eq!(doc.refs_of(&b(GENESIS_BRANCH)), Some(1));
 
-    // The sibling must materialize its own head (the lens head is out of `by_tip`).
     repo.create_branch(&b("sib"), &b(GENESIS_BRANCH)).unwrap();
     let _ = doc.branch("sib").read(|h| h.get_text("t").to_string());
     assert_eq!(
@@ -2868,8 +2806,7 @@ fn lens_sibling_convergence_does_not_break_open_head() {
     assert_eq!(lens.get_text("t").to_string(), "base!", "lens write survived");
 }
 
-/// A backward `advance` still regresses (exempt from the fast-forward guard): it
-/// is the branch's one intentional backward path.
+/// A backward `advance` still regresses: it is exempt from the fast-forward guard.
 #[test]
 fn lens_backward_advance_is_guard_exempt() {
     let repo = BranchingDocRepo::open().unwrap();
@@ -2893,8 +2830,7 @@ fn lens_backward_advance_is_guard_exempt() {
     );
 }
 
-/// The lineage trigger (`import_index`) advances an OPEN doc's lens and does not
-/// open a doc that was never opened.
+/// `import_index` advances an OPEN doc's lens and does not open a never-opened doc.
 #[test]
 fn lens_import_index_advances_open_doc_only() {
     let a = BranchingDocRepo::open().unwrap();
@@ -2923,8 +2859,7 @@ fn lens_import_index_advances_open_doc_only() {
     assert!(bb.branches().contains(&b(GENESIS_BRANCH)));
 }
 
-/// `lens_generation` is stable across `lens()` calls that do not rebind, and
-/// moves after a rebind (branch delete unbinds + invalidates).
+/// `lens_generation` is stable across `lens()` calls and moves after a rebind.
 #[test]
 fn lens_generation_stable_then_bumps_on_rebind() {
     let repo = BranchingDocRepo::open().unwrap();
@@ -2943,8 +2878,7 @@ fn lens_generation_stable_then_bumps_on_rebind() {
     assert!(g3 > g2, "generation bumped on the delete/unbind rebind");
 }
 
-/// A container-scoped `Branch.subscribe` still receives only its container's deltas: advancing "t"
-/// fires the "t" subscriber but not one scoped to untouched "u".
+/// A container-scoped `Branch.subscribe` hears only its container: "t" fires, untouched "u" not.
 #[test]
 fn lens_container_scoped_subscribe_parity_after_observer_switch() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};

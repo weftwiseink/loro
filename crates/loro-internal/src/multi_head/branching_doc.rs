@@ -67,15 +67,10 @@ impl MultiHeadDoc<Delegated> {
         self.inner.policy.target(self, b)
     }
 
-    /// Whether branch `b` is behind its recorded content (head-lag signal):
-    /// - the fast-forward guard held it behind a non-forward (ancestor) target
-    ///   on its last resolve, or
-    /// - its recorded frontier references an op this oplog does not yet hold
-    ///   (filtered out by `Delegated::target`), as on a fresh open of a doc
-    ///   edited elsewhere, where the guard alone reads false.
-    ///
-    /// Deliberately avoids `frontier_of`, which collapses to the held frontier
-    /// on a regressed head.
+    /// Whether branch `b` is behind its recorded content (head-lag signal): the
+    /// fast-forward guard held it on its last resolve, or its recorded frontier names
+    /// ops this oplog does not yet hold (as on a fresh open of a doc edited elsewhere).
+    /// Deliberately avoids `frontier_of`, which collapses to the held frontier.
     pub fn lens_held(&self, b: &BranchId) -> bool {
         if self.guard_held_flag(b) {
             return true;
@@ -101,25 +96,17 @@ impl MultiHeadDoc<Delegated> {
         ))
     }
 
-    /// Move branch `b` to frontier `to`: record it in the index, then
-    /// re-resolve to advance this doc's head.
-    ///
-    /// Uses additive `record_frontier` (not `set_frontier`): a merge's join must
-    /// keep every peer's op.
+    /// Move branch `b` to frontier `to`: record it in the index, then re-resolve.
+    /// Additive `record_frontier`, not `set_frontier`: a merge's join keeps every peer's op.
     pub fn advance(&self, b: &BranchId, to: &Frontiers) -> LoroResult<()> {
         self.index().record_frontier(b, self.doc_id(), to)?;
         let _ = self.resolve_with(b, Intent::Read, ResolveCause::Advance)?;
         Ok(())
     }
 
-    /// Create branch `name` as a writable fork of this doc at historical
-    /// frontier `at`. It is cold until first access, then materializes to `at`
-    /// as a live writable head (not a read-only history view).
-    ///
-    /// Errors if `name` already exists. The recorded frontier is set to exactly
-    /// `at` via `set_frontier`, overriding the parent frontier seeded by
-    /// `create_index_branch`: an additive merge would leave stale other-peer
-    /// entries under a multi-peer parent, pulling those peers' ops into the fork.
+    /// Create branch `name` as a writable fork at historical frontier `at`, cold until
+    /// first access. Errors if `name` exists. Uses `set_frontier` (exact), not an
+    /// additive record: see `IndexDoc::set_frontier`.
     pub fn create_branch_at(&self, name: &BranchId, at: &Frontiers) -> LoroResult<()> {
         if self.index().branches().contains(name) {
             return Err(LoroError::ArgErr(
@@ -173,21 +160,17 @@ impl MultiHeadDoc<Delegated> {
         })
     }
 
-    /// The frontier of `vv(a) ∪ vv(b)`: where the merged doc would sit.
-    /// Unresolvable input is a loud error (see [`resolve_vv`](Self::resolve_vv)).
+    /// The frontier of `vv(a) ∪ vv(b)`; unresolvable input errors (see `resolve_vv`).
     pub(super) fn union_frontier(&self, a: &Frontiers, b: &Frontiers) -> LoroResult<Frontiers> {
         let mut u = self.resolve_vv(a)?;
         u.merge(&self.resolve_vv(b)?);
         Ok(self.oplog.lock().dag.vv_to_frontiers(&u))
     }
 
-    /// What `branch` changed since it forked from `against`: the delta from
-    /// their dynamic merge-base to `branch`'s head, plus the base text length.
-    ///
-    /// The baseline is `find_common_ancestor` of the two content frontiers, not
-    /// the static `index.fork_point(branch)`, which goes stale after a
-    /// cross-merge. Diffs run on a throwaway scratch head
-    /// ([`read_at`](MultiHeadDoc::read_at)), so no live head is disturbed.
+    /// What `branch` changed since it forked from `against`: the delta from their
+    /// merge-base to `branch`'s head, plus the base text length. The base is the GCA,
+    /// not the static `fork_point`, which goes stale after a cross-merge. Diffs run on
+    /// a scratch head ([`read_at`](MultiHeadDoc::read_at)).
     pub fn diff_from_fork(
         &self,
         branch: &BranchId,
@@ -206,10 +189,9 @@ impl MultiHeadDoc<Delegated> {
         })?
     }
 
-    /// What merging `source` into `target` would add: the delta from `target`'s
-    /// head to the union frontier. Empty when `source ⊆ target`. Because the
-    /// union is a superset of `target`, `target`'s own concurrent edits are not
-    /// reported as deletions (unlike a head-vs-head diff).
+    /// What merging `source` into `target` would add: the delta from `target`'s head
+    /// to the union frontier. Unlike a head-vs-head diff, `target`'s own concurrent
+    /// edits are not reported as deletions.
     pub fn merge_preview(
         &self,
         target: &BranchId,
