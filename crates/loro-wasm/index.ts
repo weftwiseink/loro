@@ -541,25 +541,20 @@ decorateMethods(BranchingDocHead.prototype, [
   "applyDiff",
 ]);
 
-// Auto-flush branch-subscriber events so consumers need no manual `callPendingEvents()`:
-// `write` enqueues the local-commit event; `read`/`subscribe`/`subscribeRoot` resolve the branch
-// first, and a lazy move on resolve dispatches its diff, which would otherwise sit in the global
-// queue until an unrelated decorated call.
+// Flush pending branch events at exit, or subscribers see them only on an unrelated decorated call.
+// `write` enqueues the local-commit event; `read`/`subscribe`/`subscribeRoot` can dispatch a lazy
+// move on resolve.
 decorateMethods(Branch.prototype, ["write", "read", "subscribe", "subscribeRoot"]);
 
-// `import` re-resolves every known branch (the `Delegated` policy's `after_import`);
-// `merge`/`advance` dispatch a synthesized `diff(X -> Y)` (`by:"import"`, origin `"advance"`)
-// on every arm, including fast-forward. Without the flush subscribers go stale.
+// `import` re-resolves every known branch; `merge`/`advance` dispatch a synthesized diff on every
+// arm, including fast-forward.
 decorateMethods(BranchingDoc.prototype, ["import", "merge", "advance"]);
 
-// A lineage import can re-resolve content branches and enqueue subscriber events; flush at exit.
+// A lineage import can re-resolve content branches and enqueue subscriber events.
 decorateMethods(BranchingIndex.prototype, ["import"]);
 
-// `createBranch` commits a branch-marker op to the index op log, enqueuing a
-// `BranchingIndex.subscribeLocalUpdates` callback; without a flush it never fires and logs
-// `[LORO_INTERNAL_ERROR] Event not called`. `deleteBranch` is local-only today (commits no op),
-// so its flush is a no-op for now; decorated anyway so a future durable delete op flushes
-// without another change.
+// `createBranch` commits a marker op, enqueuing a `subscribeLocalUpdates` callback that never fires
+// without a flush. `deleteBranch` is decorated so a future durable delete op flushes.
 decorateMethods(BranchingDocRepo.prototype, ["createBranch", "deleteBranch"]);
 
 // ---------------------------------------------------------------------------

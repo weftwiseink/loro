@@ -1719,7 +1719,6 @@ impl BranchingDocHead {
         Self(LoroDoc::_new(inner))
     }
 
-    // --- container access ---
     pub fn get_text<I: IntoContainerId>(&self, id: I) -> LoroText {
         self.0.get_text(id)
     }
@@ -1773,7 +1772,6 @@ impl BranchingDocHead {
         self.0.jsonpath(path)
     }
 
-    // --- state reads ---
     pub fn get_value(&self) -> LoroValue {
         self.0.get_value()
     }
@@ -1814,7 +1812,6 @@ impl BranchingDocHead {
         self.0.len_changes()
     }
 
-    // --- local write ---
     pub fn commit(&self) {
         self.0.commit()
     }
@@ -1843,7 +1840,6 @@ impl BranchingDocHead {
         self.0.revert_to(version)
     }
 
-    // --- per-head hooks ---
     pub fn subscribe_pre_commit(&self, callback: PreCommitCallback) -> Subscription {
         self.0.subscribe_pre_commit(callback)
     }

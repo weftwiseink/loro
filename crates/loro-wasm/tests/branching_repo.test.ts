@@ -83,9 +83,8 @@ describe("BranchingDocRepo wasm surface", () => {
   });
 });
 
-// Cross-peer convergence: two `BranchingDocRepo`s sync via doc-level export/import (index bytes,
-// then content bytes). `after_import` eager re-resolve must leave both peers with identical branch
-// state, no dropped or duplicated op. `BranchingDocHead` is never touched by sync.
+// Cross-peer convergence: two repos sync via export/import (index bytes, then content bytes) and
+// must end with identical branch state, no dropped or duplicated op.
 describe("BranchingDocRepo cross-peer sync", () => {
   const UPDATE = { mode: "update" } as const;
 
@@ -120,7 +119,6 @@ describe("BranchingDocRepo cross-peer sync", () => {
     a.openDoc("G").branch("main").write((h) => h.getText("t").insert(0, "A"));
     b.openDoc("G").branch("main").write((h) => h.getText("t").insert(0, "B"));
 
-    // Each peer forks a different branch off its own main and edits it.
     a.createBranch("featA", "main");
     a.openDoc("G").branch("featA").write((h) => h.getText("t").insert(1, "-fa"));
     b.createBranch("featB", "main");
@@ -144,7 +142,6 @@ describe("BranchingDocRepo cross-peer sync", () => {
   });
 
   it("createBranchAt at a single-peer frontier does NOT leak other-peer ops across the boundary", () => {
-    // Fork at A's single-peer frontier must yield A1 alone, not the multi-peer parent.
     const a = new BranchingDocRepo();
     a.openDoc("G").branch("main").write((h) => h.getText("t").insert(0, "A1"));
     const atA = a.openDoc("G").frontierOf("main");
@@ -177,7 +174,6 @@ describe("BranchingDocRepo cross-peer sync", () => {
     expect(b.openDoc("G").merge("main", "feat")).toBe("fast-forward");
     expect(b.openDoc("G").contains("main", "feat")).toBe(true);
 
-    // Sync back: A's main must advance to contain feat.
     converge(a, b, ["G"]);
     expect(a.openDoc("G").contains("main", "feat")).toBe(true);
     expect(readBranch(a, "G", "main")).toBe(readBranch(b, "G", "main"));
@@ -185,11 +181,8 @@ describe("BranchingDocRepo cross-peer sync", () => {
   });
 });
 
-// Branch-scoped subscriptions: `subscribe`/`subscribeRoot` actually deliver a change event to a JS
-// callback, the container-scoped variant carries the right target, and unsubscribe stops delivery.
-//
-// No manual flush is needed: `Branch.write` is decorated in `index.ts` to call
-// `callPendingEvents()` after commit.
+// Branch-scoped `subscribe`/`subscribeRoot` deliver change events to JS callbacks with no manual
+// flush (the decoration is in `index.ts`).
 describe("Branch subscriptions deliver change events", () => {
   it("subscribeRoot fires on a branch write and stops after unsubscribe", () => {
     const repo = new BranchingDocRepo();
@@ -208,7 +201,6 @@ describe("Branch subscriptions deliver change events", () => {
       true,
     );
 
-    // After unsubscribe, a write delivers nothing.
     unsubscribe();
     branch.write((h) => h.getText("t").insert(2, "!"));
     expect(events.length).toBe(1);
@@ -237,8 +229,7 @@ describe("Branch subscriptions deliver change events", () => {
   });
 
   it("a TRUE 3-way merge delivers a catch-up event to the target subscriber", () => {
-    // Two divergent edits at the same position force a real merge ("merged"), which dispatches the
-    // diff tagged `by:"import"` (not a detached `checkout`). `merge` is decorated to auto-flush.
+    // Same-position edits force a real merge, dispatched as `by:"import"` (not a `checkout`).
     const repo = new BranchingDocRepo();
     const doc = repo.openDoc("G");
     doc.branch("main").write((h) => h.getText("t").insert(0, "base"));
@@ -266,8 +257,7 @@ describe("Branch subscriptions deliver change events", () => {
   });
 
   it("a FAST-FORWARD merge delivers a synthesized event (rebind-to-existing no longer silent)", () => {
-    // A fast-forward merge moves the target onto an existing head (rebind-to-existing arm) and must
-    // dispatch the diff(X -> Y) to the `main` subscriber, auto-flushed by the decorated `merge`.
+    // The rebind-to-existing arm must still dispatch diff(X -> Y) to the `main` subscriber.
     const repo = new BranchingDocRepo();
     const doc = repo.openDoc("G");
     doc.branch("main").write((h) => h.getText("t").insert(0, "base"));
@@ -334,11 +324,9 @@ describe("Branch subscriptions deliver change events", () => {
   });
 });
 
-// Wire surface: `subscribeLocalUpdates` plus persistent `version()` / `oplogVersion()` on the
-// branching doc/index (what weft's `EnvelopedAdaptor` drives sync off). Exercised on a NON-MAIN
-// branch, whose ops land on a copy-on-divergence head that a main-keyed tracking loop would miss:
-//   - `subscribeLocalUpdates` must fire for non-main heads.
-//   - `version()` must reflect the shared oplog vv, not a single head's DocState vv.
+// Wire surface (what weft's `EnvelopedAdaptor` drives sync off), exercised on a NON-MAIN branch,
+// whose copy-on-divergence head a main-keyed tracking loop would miss: `subscribeLocalUpdates`
+// must fire for it, and `version()` must reflect the shared oplog vv, not one head's.
 describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta round-trip", () => {
   const UPDATE = { mode: "update" } as const;
   const readBranch = (repo: BranchingDocRepo, doc: string, branch: string) =>
@@ -359,7 +347,6 @@ describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta
     expect(b.branches().sort()).toEqual(["feat", "main"]);
     expect(readBranch(b, "G", "feat")).toBe("base");
 
-    // Capture shared-oplog versions before the non-main edit and wire both local-update streams.
     const beforeDoc = a.openDoc("G").version();
     const beforeIdx = a.index().version();
     const docUpdates: Uint8Array[] = [];
@@ -369,17 +356,14 @@ describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta
 
     a.openDoc("G").branch("feat").write((h) => h.getText("t").insert(4, "-feat"));
 
-    // (1) subscribeLocalUpdates fired for the non-main edit, on content and on the index.
     expect(docUpdates.length).toBeGreaterThan(0);
     expect(idxUpdates.length).toBeGreaterThan(0);
 
-    // (2) version()/oplogVersion() advanced.
     const afterDoc = a.openDoc("G").version();
     expect(afterDoc.compare(beforeDoc)).toBe(1);
     expect(a.openDoc("G").oplogVersion().compare(beforeDoc)).toBe(1);
     expect(a.index().version().compare(beforeIdx)).toBe(1);
 
-    // (3) export({from: before}) yields exactly that edit's delta.
     const docDelta = a.openDoc("G").export({ mode: "update", from: beforeDoc });
     const idxDelta = a.index().export({ mode: "update", from: beforeIdx });
     expect(docDelta.length).toBeGreaterThan(0);
@@ -419,7 +403,6 @@ describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta
     const unsubDoc = b.openDoc("G").subscribeLocalUpdates((bytes) => bDocUpdates.push(bytes));
     const unsubIdx = b.index().subscribeLocalUpdates((bytes) => bIdxUpdates.push(bytes));
 
-    // Import A's updates: index first, then content.
     b.index().import(a.index().export(UPDATE));
     b.openDoc("G").import(a.openDoc("G").export(UPDATE));
 
@@ -429,11 +412,9 @@ describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta
     expect(b.branches().sort()).toEqual(["feat", "main"]);
     expect(readBranch(b, "G", "feat")).toBe("base-feat");
 
-    // ALIVE (content): B's own edit fires the content stream.
     b.openDoc("G").branch("feat").write((h) => h.getText("t").insert(0, "x"));
     expect(bDocUpdates.length).toBeGreaterThan(0);
 
-    // ALIVE (index): a local fast-forward merge commits to B's index and fires the index stream.
     expect(b.openDoc("G").merge("main", "feat")).toBe("fast-forward");
     expect(bIdxUpdates.length).toBeGreaterThan(0);
 
@@ -442,12 +423,10 @@ describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta
   });
 });
 
-// `BranchingDocRepo.createBranch` commits a lineage op to the shared index log, which must reach
-// `BranchingIndex.subscribeLocalUpdates` so a peer learns of a new branch incrementally. The op
-// sits in the global pending-event queue until a decorated method calls `callPendingEvents()`;
-// `createBranch`/`deleteBranch` are decorated in `index.ts` for that reason. Regression guarded:
-// `createBranch` streamed zero frames and logged `[LORO_INTERNAL_ERROR] Event not called`, though a
-// full `export({mode:"update"})` did carry the branch.
+// `createBranch` commits a lineage op that must reach `BranchingIndex.subscribeLocalUpdates` so a
+// peer learns of a new branch incrementally. The op waits in the global pending-event queue until
+// a decorated method flushes it (`index.ts`); undecorated, it streamed zero frames and logged
+// `[LORO_INTERNAL_ERROR] Event not called`.
 describe("BranchingDocRepo branch-lifecycle local-update streaming", () => {
   const UPDATE = { mode: "update" } as const;
 
@@ -534,8 +513,7 @@ describe("BranchingDocRepo branch-lifecycle local-update streaming", () => {
   });
 });
 
-// Derived read-only index projections: tips, forkPoint, docsModifiedOnBranch (no current weftwise
-// caller).
+// Derived read-only index projections: tips, forkPoint, docsModifiedOnBranch.
 describe("BranchingIndex derived reads", () => {
   it("tips / forkPoint / docsModifiedOnBranch cross the wasm boundary", () => {
     const repo = new BranchingDocRepo();
@@ -562,7 +540,6 @@ describe("BranchingIndex derived reads", () => {
     expect(idx.docsModifiedOnBranch("feat")).toEqual(["H"]);
     expect(idx.docsModifiedOnBranch("nope")).toEqual([]);
 
-    // forkPoint: genesis has none; feat forked from main (non-empty frontier).
     expect(idx.forkPoint("main")).toEqual([]);
     expect(idx.forkPoint("feat").length).toBeGreaterThanOrEqual(1);
     expect(typeof idx.forkPoint("feat")[0].peer).toBe("string");

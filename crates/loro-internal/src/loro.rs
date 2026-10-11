@@ -258,10 +258,9 @@ impl LoroDoc {
     ///   It also doesn't change the version of the [DocState]. The changes will be
     ///   recorded into [OpLog] only. You need to call `checkout` to make it take effect.
     pub fn set_detached_editing(&self, enable: bool) {
-        // NOTE(claude-opus-4-8/branchingdocrepo): `config` is Arc-shared across all heads of a
-        // MultiHeadDoc, so this flips detached editing for every head and is not branch-scoped.
-        // Left ungated: it moves no head to the union, and the checkout/attach/import gates cover
-        // the corruption vectors. Not exposed on `BranchingDocHead`; the registry never calls it.
+        // NOTE(claude-opus-4-8/branchingdocrepo): `config` is shared by every head of a
+        // MultiHeadDoc, so this is not branch-scoped. Left ungated: it moves no head to the
+        // union; the checkout/attach/import gates cover corruption.
         self.config.set_detached_editing(enable);
         if enable && self.is_detached() {
             self.with_barrier(|| {
@@ -1001,10 +1000,8 @@ impl LoroDoc {
         state.take_events()
     }
 
-    /// Emit already-collected `DocDiff`s through THIS doc's own observer, with the usual
-    /// root/ancestor filtering. The registry uses it to deliver a lens head's advance after
-    /// dropping its lock; contrast `dispatch_to_branch`, which uses a scratch observer for shared
-    /// heads.
+    /// Emit already-collected `DocDiff`s through THIS doc's own observer. The registry delivers a
+    /// lens head's advance this way after dropping its lock; contrast `dispatch_to_branch`.
     pub(crate) fn emit_collected_diffs(&self, events: Vec<DocDiff>) {
         for event in events {
             self.observer.emit(event);
@@ -1734,11 +1731,9 @@ impl LoroDoc {
     }
 
     pub fn checkout_to_latest(&self) {
-        // An owned head must never move to the shared union frontier (a diff from the wrong base
-        // would corrupt it, and the sink guard does not fire on a Private head). Owned heads
-        // advance only via the registry. Runtime backstop for the `ContainerTrait::doc()` re-entry
-        // path (`BranchingDocHead` omits this at the type level). No-op, not an error, to keep
-        // the `()` signature.
+        // Runtime backstop for the `ContainerTrait::doc()` re-entry path (`BranchingDocHead` omits
+        // this at the type level): moving an owned head to the union frontier corrupts it, and the
+        // sink guard does not fire on a Private head. No-op to keep the `()` signature.
         if self.is_owned() {
             warn!(
                 "attach()/checkout_to_latest() ignored on a registry-owned head \
@@ -1848,11 +1843,10 @@ impl LoroDoc {
     }
 
     /// Checkout to `target` and RETURN the `DocDiff`s instead of emitting them, so the registry can
-    /// dispatch them to the branch's own subscribers after dropping its lock.
+    /// dispatch them after dropping its lock.
     ///
-    /// Recording is forced on for the call and cleared afterward only if it was off before. On an
-    /// already-subscribed head it stays on: `take_events` re-stamps `diff_start_version`, the
-    /// correct `from` for the next local write.
+    /// Recording is cleared afterward only if it was off before: `take_events` re-stamps
+    /// `diff_start_version`, the correct `from` for the next local write.
     pub(crate) fn checkout_collecting_events(
         &self,
         target: &Frontiers,

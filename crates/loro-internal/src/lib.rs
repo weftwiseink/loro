@@ -179,7 +179,6 @@ pub struct LoroDocInner {
         SubscriberSetWithQueue<(), FirstCommitFromPeerCallback, FirstCommitFromPeerPayload>,
     pre_commit_subs: SubscriberSetWithQueue<(), PreCommitCallback, PreCommitCallbackPayload>,
     /// Copy-on-divergence sink guard: `HEAD_MODE_PRIVATE` or `HEAD_MODE_SHARED`.
-    /// Same `Arc` as `DocState`'s, so the sinks check it without a `Weak` upgrade.
     head_mode: Arc<AtomicU8>,
     /// Registry back-pointer; `Some` iff this doc is a `MultiHeadDoc` head. Set once.
     /// Supplies the on-commit hook, keeps the head's peer across `checkout`, and gates

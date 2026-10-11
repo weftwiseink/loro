@@ -7,16 +7,16 @@
 //! (copy-on-divergence). The two variants (`SelfRooted` index, `Delegated`
 //! content) differ only in their [`HeadPolicy`]; [`Manual`] is test-only.
 //!
-//! Shared-head immutability is enforced at loro's two `DocState` mutation sinks
-//! (`apply_local_op`, `apply_diff`) via `head_mode` + `ensure_private`, so a
-//! mutation reaching a shared head errors with [`LoroError::HeadShared`]
-//! instead of corrupting a co-owner. See `crates/loro-internal/src/state.rs`.
+//! Shared-head immutability is enforced at the two `DocState` mutation sinks
+//! (`apply_local_op`, `apply_diff`) via `head_mode` + `ensure_private`: a mutation
+//! reaching a shared head errors with [`LoroError::HeadShared`] instead of
+//! corrupting a co-owner.
 //!
-//! On-commit re-keying of `by_tip` and `HeadPolicy::after_commit` run through
-//! the injected txn on-commit hook (see [`DocOwner`] / `on_head_committed`),
-//! not synchronously from `write`. `import` is history-only: ops enter the
-//! shared op log via `LoroDoc::import_to_history` under the all-heads barrier,
-//! never materializing into a live head.
+//! `by_tip` re-keying and `HeadPolicy::after_commit` run through the injected txn
+//! on-commit hook (see [`DocOwner`] / `on_head_committed`), not from `write`.
+//! `import` is history-only: ops enter the shared op log via
+//! `LoroDoc::import_to_history` under the all-heads barrier, never materializing
+//! into a live head.
 
 use loro_common::{InternalString, ID};
 
@@ -45,9 +45,8 @@ pub type HeadId = u64;
 
 /// How a branch came into being, as recovered from the index attribution runs.
 ///
-/// Single-variant: `runs` stores only `(start, BranchId)` per segment, so
-/// recovery cannot distinguish merge markers from creation markers. Kept as an enum so a
-/// merge-source surface can be added without changing the shape.
+/// Single-variant: `runs` stores only `(start, BranchId)`, so merge markers cannot be told
+/// from creation markers. Kept an enum so a merge source can be added without a shape change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchSourceKind {
     /// The branch's creation marker (`branch.name = "<b>"`).
@@ -67,11 +66,8 @@ pub struct BranchSource {
     pub parent: Option<BranchId>,
 }
 
-/// The pinned root head's id. Created at `refs == 0` and never dropped:
-/// `import` / `export` / `materialize` need at least one live head.
-///
-/// Every other head is live while `refs >= 1` and retired the moment `refs`
-/// reaches `0`.
+/// Pinned root head: born at `refs == 0`, never retired, because
+/// `import` / `export` / `materialize` need a live head.
 const ROOT_HEAD_ID: HeadId = 0;
 
 /// Fires once per new change in the shared history (head commit or import),
