@@ -558,7 +558,8 @@ decorateMethods(BranchingIndex.prototype, ["import"]);
 // `createBranch` commits a branch-marker op to the index op log, enqueuing a
 // `BranchingIndex.subscribeLocalUpdates` callback; without a flush it never fires and logs
 // `[LORO_INTERNAL_ERROR] Event not called`. `deleteBranch` is local-only today (commits no op),
-// so its flush is a no-op for now.
+// so its flush is a no-op for now; decorated anyway so a future durable delete op flushes
+// without another change.
 decorateMethods(BranchingDocRepo.prototype, ["createBranch", "deleteBranch"]);
 
 // ---------------------------------------------------------------------------

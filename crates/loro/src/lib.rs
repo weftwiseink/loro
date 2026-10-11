@@ -1705,7 +1705,8 @@ impl LoroDoc {
 #[derive(Debug, Clone)]
 pub struct BranchingDocHead(LoroDoc);
 
-// Each method forwards to the same-named `LoroDoc` method.
+// Each method forwards to the same-named `LoroDoc` method. `from_doc`/`from_inner` are
+// not-yet-wired constructors (hence `dead_code`).
 #[allow(missing_docs, dead_code)]
 impl BranchingDocHead {
     /// Wrap a resolved branch head (crate-internal).

@@ -117,7 +117,7 @@ fn lock_group_fresh_group_docstate_before_oplog_does_not_panic() {
     let fresh = LoroLockGroup::new();
     let foreign_docstate = fresh.new_lock(0u8, LockKind::DocState);
     let _ds = foreign_docstate.lock();
-    let _ol = root.oplog.lock();
+    let _ol = root.oplog.lock(); // reaching here without a panic is the assertion
 }
 
 // Sink guard.
@@ -160,7 +160,7 @@ fn sink_guard_leaked_handle_refused_after_flip() {
     let leaked = md.head_doc(0).unwrap();
     leaked.get_text("t").insert_unicode(0, "A").unwrap();
 
-    md.bind(&review, 0);
+    md.bind(&review, 0); // refs 2: Private->Shared flip commits "A"
     assert_eq!(md.is_head_shared(&main), Some(true));
 
     let r_op = leaked.get_text("t").insert_unicode(0, "B");
@@ -497,7 +497,7 @@ fn dead_tip_rematerializes_via_replay_after_head_dropped() {
     assert_eq!(pre_value, "F");
 
     // Retire H via `unbind`: the fast-forward-only guard holds a backward resolve of a bound head,
-    // so it no longer moves the head off H.
+    // so the head stays on H.
     md.unbind(&feature);
     assert!(
         md.head_doc(h).is_none(),
@@ -723,7 +723,7 @@ fn index_import_then_record_converges() {
     );
 }
 
-// BranchingDocHead surface, read-exit commit, E1 closures.
+// BranchingDocHead surface, read-exit commit, union-frontier closures.
 
 #[test]
 fn branching_doc_head_surface_read_write() {
@@ -1629,7 +1629,7 @@ fn index_remote_discovered_branch_local_record_survives() {
 // The single-pass lamport-ordered fold attributes every change of a multi-peer, multi-branch
 // history on a cold import (no rejection), with tips equal to the source's.
 
-/// Build the S4 history on a fresh repo and return its index.
+/// Build the diamond + repeated-merge + two-session history on a fresh repo and return its index.
 fn s4_history() -> BranchingDocRepo {
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
@@ -2814,6 +2814,7 @@ fn lens_lineage_ahead_holds_then_fills() {
     );
 
     gb.import(&content_fwd).unwrap();
+    // A content import re-resolves via after_import; drive it explicitly too.
     let _ = gb
         .branch(GENESIS_BRANCH)
         .read(|h| h.get_text("t").to_string());

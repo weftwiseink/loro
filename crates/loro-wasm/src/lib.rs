@@ -2538,8 +2538,9 @@ impl LoroDoc {
 /// The partition is drift-guarded at compile time in `index.ts`.
 ///
 /// > NOTE(claude-opus-4-8/branchingdocrepo): wraps the wasm `LoroDoc` and delegates, rather than
-/// wrapping `loro::BranchingDocHead`, which would need a public full-`LoroDoc` accessor and punch a
-/// head-safety hole.
+/// > wrapping `loro::BranchingDocHead`, which would need a public full-`LoroDoc` accessor and punch
+/// > a head-safety hole. Delegating reuses identical `js_name`s and signatures, so the `index.ts`
+/// > drift guard enforces the partition.
 #[wasm_bindgen]
 pub struct BranchingDocHead(LoroDoc);
 
@@ -2742,6 +2743,7 @@ interface BranchingDocHead<T extends Record<string, Container> = Record<string, 
 const BRANCH_DIFF_TYPES: &str = r#"
 /**
  * How a branch came into being. Always "create": the index attribution discards a marker's kind.
+ * Kept as a union so a "merge" source can be surfaced without changing the shape.
  */
 export type BranchSourceKind = "create" | "merge";
 /**
@@ -3209,7 +3211,7 @@ impl Branch {
     /// The LENS: the branch head's own aliased `LoroDoc`, the single bidirectional handle the
     /// editor, `UndoManager`, presence and canvas bind to. COPY-ON-OPEN: the head is privatized
     /// once and PINNED as the branch's unshared head for the binding's life. Unlike `fork`, an edit
-    /// + `commit` advances THIS branch's head and fires its `subscribeRoot`, and a forward import
+    /// followed by `commit` advances THIS branch's head and fires its `subscribeRoot`, and a forward import
     /// advances it in place (fast-forward only); `new UndoManager(lens)` works.
     ///
     /// This hands out the FULL wasm `LoroDoc`, re-exposing the history surface that

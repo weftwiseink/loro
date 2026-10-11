@@ -258,9 +258,10 @@ impl LoroDoc {
     ///   It also doesn't change the version of the [DocState]. The changes will be
     ///   recorded into [OpLog] only. You need to call `checkout` to make it take effect.
     pub fn set_detached_editing(&self, enable: bool) {
-        // NOTE: `config` is Arc-shared across all heads of a MultiHeadDoc, so this flips detached
-        // editing for every head and is not branch-scoped. Not exposed on `BranchingDocHead`;
-        // the registry never calls it.
+        // NOTE(claude-opus-4-8/branchingdocrepo): `config` is Arc-shared across all heads of a
+        // MultiHeadDoc, so this flips detached editing for every head and is not branch-scoped.
+        // Left ungated: it moves no head to the union, and the checkout/attach/import gates cover
+        // the corruption vectors. Not exposed on `BranchingDocHead`; the registry never calls it.
         self.config.set_detached_editing(enable);
         if enable && self.is_detached() {
             self.with_barrier(|| {
@@ -685,7 +686,7 @@ impl LoroDoc {
         bytes: &[u8],
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
-        // Direct import on an owned head would apply a diff from the shared union head (E1 hazard);
+        // Direct import on an owned head would apply a diff from the shared union head (union-frontier hazard);
         // history enters via `import_to_history`.
         if self.is_owned() {
             return Err(LoroError::OwnedHeadOp("import"));
@@ -1013,7 +1014,7 @@ impl LoroDoc {
     /// only supports backward compatibility but not forward compatibility.
     #[tracing::instrument(skip_all)]
     pub fn import_json_updates<T: TryInto<JsonSchema>>(&self, json: T) -> LoroResult<ImportStatus> {
-        // Owned heads cannot import directly (E1 hazard); see `import_with`.
+        // Owned heads cannot import directly (union-frontier hazard); see `import_with`.
         if self.is_owned() {
             return Err(LoroError::OwnedHeadOp("import"));
         }
@@ -1731,9 +1732,11 @@ impl LoroDoc {
     }
 
     pub fn checkout_to_latest(&self) {
-        // E1 site A: an owned head must never move to the shared union frontier (a diff from the
-        // wrong base would corrupt it, and the sink guard does not fire on a Private head). Owned
-        // heads advance only via the registry. No-op, not an error, to keep the `()` signature.
+        // An owned head must never move to the shared union frontier (a diff from the wrong base
+        // would corrupt it, and the sink guard does not fire on a Private head). Owned heads
+        // advance only via the registry. Runtime backstop for the `ContainerTrait::doc()` re-entry
+        // path (`BranchingDocHead` omits this at the type level). No-op, not an error, to keep
+        // the `()` signature.
         if self.is_owned() {
             warn!(
                 "attach()/checkout_to_latest() ignored on a registry-owned head \
@@ -1813,7 +1816,7 @@ impl LoroDoc {
     /// This will make the current [DocState] detached from the latest version of [OpLog].
     /// Any further import will not be reflected on the [DocState], until user call [LoroDoc::attach()]
     pub fn checkout(&self, frontiers: &Frontiers) -> LoroResult<()> {
-        // E1 gate: an external checkout of an owned head would move its state without re-keying the
+        // Gate: an external checkout of an owned head would move its state without re-keying the
         // registry's `tip`/`by_tip`. The registry's own advance runs in `in_registry_op` and is allowed.
         if self.is_owned() && !crate::multi_head::in_registry_op() {
             return Err(LoroError::OwnedHeadOp("checkout"));
