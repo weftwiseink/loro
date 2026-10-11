@@ -224,6 +224,7 @@ pub struct Branch<'a, P: HeadPolicy> {
 
 impl<P: HeadPolicy> Branch<'_, P> {
     /// Resolve the branch's head for read and run `f` on it.
+    /// Edits inside `f` error on a shared head; use `write`.
     pub fn read<R>(&self, f: impl FnOnce(&BranchingDocHead) -> R) -> LoroResult<R> {
         self.doc
             .read(&self.name, |d| f(&BranchingDocHead::from_head(d.clone())))

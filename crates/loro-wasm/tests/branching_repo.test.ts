@@ -374,7 +374,7 @@ describe("BranchingDoc/Index wire surface: subscribeLocalUpdates + version delta
     expect(readBranch(b, "G", "feat")).toBe("base-feat");
     expect(readBranch(b, "G", "main")).toBe("base"); // isolated
 
-    // (4) The callback bytes alone are valid deltas for a peer at `before`.
+    // The callback bytes alone are valid deltas for a peer at `before`.
     unsubDoc();
     unsubIdx();
     for (const bytes of idxUpdates) c.index().import(bytes);
