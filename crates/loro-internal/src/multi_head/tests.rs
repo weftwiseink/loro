@@ -1601,7 +1601,7 @@ fn index_remote_discovered_branch_local_record_survives() {
     );
 }
 
-/// Build the diamond + repeated-merge + two-session history on a fresh repo and return its index.
+/// Build the diamond + repeated-merge + two-session history on a fresh repo and return the repo.
 fn s4_history() -> BranchingDocRepo {
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
