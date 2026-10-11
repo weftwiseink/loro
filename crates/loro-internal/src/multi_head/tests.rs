@@ -1760,14 +1760,6 @@ fn index_arbitrary_branch_names_round_trip() {
         idx.record_head(&b(n), &d("G"), 1000 + i as u64, i as i32 + 1)
             .unwrap();
     }
-    let names = ["a branch with spaces", "café ☕ 名前", "boc/abc123", "a:b:c"];
-    let idx = IndexDoc::new(SelfRooted::new());
-    idx.init_genesis(&b("main")).unwrap();
-    for (i, n) in names.iter().enumerate() {
-        idx.create_index_branch(&b(n), &b("main")).unwrap();
-        idx.record_head(&b(n), &d("G"), 1000 + i as u64, i as i32 + 1)
-            .unwrap();
-    }
 
     let snap = idx.export(ExportMode::Snapshot).unwrap();
     let restored = IndexDoc::new(SelfRooted::new());
