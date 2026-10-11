@@ -2,8 +2,9 @@
 //! same `subscribe`/`subscribe_root` events as a plain `LoroDoc` for every update.
 //!
 //! Events are normalized to `EventRow { by, origin, touched, mirror_after }`; `mirror_after` is a
-//! `LoroValue` rebuilt by applying each `ContainerDiff` along its path (as `tests/test.rs::test_checkout`).
-//! Frontiers are not compared: heads mint their own peers, so `from`/`to` differ by construction.
+//! `LoroValue` rebuilt by applying each `ContainerDiff` along its path (as
+//! `tests/test.rs::test_checkout`). Frontiers are not compared: heads mint their own peers, so
+//! `from`/`to` differ by construction.
 //!
 //! `by`/`origin` are only compared in the M9 cases.
 

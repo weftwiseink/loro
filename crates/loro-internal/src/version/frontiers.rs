@@ -206,7 +206,8 @@ impl PartialEq for Frontiers {
 impl Eq for Frontiers {}
 
 impl std::hash::Hash for Frontiers {
-    /// Order-independent, consistent with set-equality `PartialEq`; lets `Frontiers` key `Registry::by_tip`.
+    /// Order-independent, consistent with set-equality `PartialEq`; lets `Frontiers` key
+    /// `Registry::by_tip`.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let mut acc: u64 = 0;
         let mut len: u64 = 0;

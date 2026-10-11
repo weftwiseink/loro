@@ -637,7 +637,8 @@ impl LoroDoc {
 
     #[inline(always)]
     pub fn detach(&self) {
-        // Owned heads have no free-standing detach; the registry owns attachment. No-op with a warning.
+        // Owned heads have no free-standing detach; the registry owns attachment. No-op with a
+        // warning.
         if self.is_owned() {
             warn!("detach() ignored on a registry-owned head (deferred to the branching RFP)");
             return;
@@ -686,8 +687,8 @@ impl LoroDoc {
         bytes: &[u8],
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
-        // Direct import on an owned head would apply a diff from the shared union head (union-frontier hazard);
-        // history enters via `import_to_history`.
+        // Direct import on an owned head would apply a diff from the shared union head
+        // (union-frontier hazard); history enters via `import_to_history`.
         if self.is_owned() {
             return Err(LoroError::OwnedHeadOp("import"));
         }
@@ -1000,9 +1001,10 @@ impl LoroDoc {
         state.take_events()
     }
 
-    /// Emit already-collected `DocDiff`s through THIS doc's own observer, with the usual root/ancestor
-    /// filtering. The registry uses it to deliver a lens head's advance after dropping its lock;
-    /// contrast `dispatch_to_branch`, which uses a scratch observer for shared heads.
+    /// Emit already-collected `DocDiff`s through THIS doc's own observer, with the usual
+    /// root/ancestor filtering. The registry uses it to deliver a lens head's advance after
+    /// dropping its lock; contrast `dispatch_to_branch`, which uses a scratch observer for shared
+    /// heads.
     pub(crate) fn emit_collected_diffs(&self, events: Vec<DocDiff>) {
         for event in events {
             self.observer.emit(event);
@@ -1817,7 +1819,8 @@ impl LoroDoc {
     /// Any further import will not be reflected on the [DocState], until user call [LoroDoc::attach()]
     pub fn checkout(&self, frontiers: &Frontiers) -> LoroResult<()> {
         // Gate: an external checkout of an owned head would move its state without re-keying the
-        // registry's `tip`/`by_tip`. The registry's own advance runs in `in_registry_op` and is allowed.
+        // registry's `tip`/`by_tip`. The registry's own advance runs in `in_registry_op` and is
+        // allowed.
         if self.is_owned() && !crate::multi_head::in_registry_op() {
             return Err(LoroError::OwnedHeadOp("checkout"));
         }
@@ -1848,8 +1851,8 @@ impl LoroDoc {
     /// dispatch them to the branch's own subscribers after dropping its lock.
     ///
     /// Recording is forced on for the call and cleared afterward only if it was off before. On an
-    /// already-subscribed head it stays on: `take_events` re-stamps `diff_start_version`, the correct
-    /// `from` for the next local write.
+    /// already-subscribed head it stays on: `take_events` re-stamps `diff_start_version`, the
+    /// correct `from` for the next local write.
     pub(crate) fn checkout_collecting_events(
         &self,
         target: &Frontiers,

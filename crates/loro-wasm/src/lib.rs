@@ -3211,8 +3211,8 @@ impl Branch {
     /// The LENS: the branch head's own aliased `LoroDoc`, the single bidirectional handle the
     /// editor, `UndoManager`, presence and canvas bind to. COPY-ON-OPEN: the head is privatized
     /// once and PINNED as the branch's unshared head for the binding's life. Unlike `fork`, an edit
-    /// followed by `commit` advances THIS branch's head and fires its `subscribeRoot`, and a forward import
-    /// advances it in place (fast-forward only); `new UndoManager(lens)` works.
+    /// followed by `commit` advances THIS branch's head and fires its `subscribeRoot`, and a
+    /// forward import advances it in place (fast-forward only); `new UndoManager(lens)` works.
     ///
     /// This hands out the FULL wasm `LoroDoc`, re-exposing the history surface that
     /// `BranchingDocHead` withholds. Consumers should only read/subscribe/edit/commit/undo/cursor
