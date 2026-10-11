@@ -256,7 +256,7 @@ describe("Branch subscriptions deliver change events", () => {
     unsubscribe();
   });
 
-  it("a FAST-FORWARD merge delivers a synthesized event (rebind-to-existing no longer silent)", () => {
+  it("a FAST-FORWARD merge delivers a synthesized event to the target branch subscriber", () => {
     // The rebind-to-existing arm must still dispatch diff(X -> Y) to the `main` subscriber.
     const repo = new BranchingDocRepo();
     const doc = repo.openDoc("G");

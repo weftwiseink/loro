@@ -278,8 +278,8 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             // so assert rather than handle.
             debug_assert!(
                 !reg.heads.get(&from_head).map(|h| h.unshared).unwrap_or(false),
-                "create_branch from a lensed head would share the pin (invariant 6); \
-                 content branches must materialize lazily instead"
+                "create_branch from a lensed head would share the pin; a lens head is never \
+                 shared with another branch, so content branches must materialize lazily"
             );
             this.rebind(reg, new, from_head)
         });
