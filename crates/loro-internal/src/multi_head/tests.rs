@@ -2752,10 +2752,6 @@ fn lens_lineage_ahead_holds_then_fills() {
     );
 
     gb.import(&content_fwd).unwrap();
-    // A content import re-resolves via `after_import`; drive it explicitly too.
-    let _ = gb
-        .branch(GENESIS_BRANCH)
-        .read(|h| h.get_text("t").to_string());
     assert_eq!(
         lens.get_text("t").to_string(),
         "BASE MORE",
