@@ -566,8 +566,7 @@ fn frontiers_to_ids(frontiers: &Frontiers) -> JsResult<JsIDs> {
     Ok(value.into())
 }
 
-/// The JS string for a `BranchSourceKind`; always `"create"` since index recovery discards a
-/// marker's kind.
+/// The JS string for a `BranchSourceKind`.
 fn branch_source_kind_str(kind: BranchSourceKind) -> &'static str {
     match kind {
         BranchSourceKind::Create => "create",
@@ -2739,9 +2738,8 @@ interface BranchingDocHead<T extends Record<string, Container> = Record<string, 
 const BRANCH_DIFF_TYPES: &str = r#"
 /**
  * How a branch came into being. Always "create": the index attribution discards a marker's kind.
- * Kept as a union so a "merge" source can be surfaced without changing the shape.
  */
-export type BranchSourceKind = "create" | "merge";
+export type BranchSourceKind = "create";
 /**
  * Where a branch came from: the op-id of its creation marker plus the parent branch NAME
  * (null for genesis). `op` is the marker op itself, distinct from `tips[b]` and `forkPoint(b)`.

@@ -46,7 +46,7 @@ pub type HeadId = u64;
 /// How a branch came into being, as recovered from the index attribution runs.
 ///
 /// Single-variant: `runs` stores only `(start, BranchId)`, so merge markers cannot be told
-/// from creation markers. Kept an enum so a merge source can be added without a shape change.
+/// from creation markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchSourceKind {
     /// The branch's creation marker (`branch.name = "<b>"`).
