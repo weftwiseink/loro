@@ -161,6 +161,7 @@ impl Branched {
     }
 }
 
+/// Union of two frontiers' ids; `checkout` shrinks it back to a valid frontier.
 fn union(a: &Frontiers, b: &Frontiers) -> Frontiers {
     let mut ids: Vec<_> = a.iter().collect();
     ids.extend(b.iter());
@@ -184,6 +185,7 @@ fn write_map_str(d: &LoroDoc, map: &str, key: &str, val: &str) {
     d.get_map(map).insert(key, val).unwrap();
 }
 
+// M1: a local commit emits `Local` on both surfaces (no transition).
 #[test]
 fn m1_local_write() {
     let (doc, prec, _s) = plain();
@@ -241,6 +243,7 @@ fn m2ii_import_fast_forward_shared_root() {
     assert_eq!(prec.len(), 1);
 }
 
+// M3: import with disjoint divergence on a uniquely-owned head (catch-up arm).
 #[test]
 fn m3_import_divergence_catchup() {
     let r = remote();
@@ -289,6 +292,7 @@ fn m4_new_container_remote_shared() {
     assert_parity(&prec, &br.rec, CompareOpts::default());
 }
 
+// M5: delete, catch-up arm.
 #[test]
 fn m5_delete_catchup() {
     let r = remote();
@@ -366,6 +370,8 @@ fn setup_rebind_to_existing() -> (Branched, Frontiers, Vec<u8>) {
     (br, td, bytes)
 }
 
+// M8: `main` moves onto `draft`'s existing head (`by_tip` hit). A rebind is a pointer swap
+// yet must still deliver the diff.
 #[test]
 fn m8_rebind_to_existing() {
     let (br, td, bytes) = setup_rebind_to_existing();
@@ -420,6 +426,7 @@ fn m9b_by_origin_resolve() {
     assert_eq!(rows[0].origin, "resolve");
 }
 
+// M10: the rebind-to-existing move delivers exactly one event.
 #[test]
 fn m10_exactly_once() {
     let (br, td, _bytes) = setup_rebind_to_existing();

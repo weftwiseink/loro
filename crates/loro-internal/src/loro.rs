@@ -258,9 +258,9 @@ impl LoroDoc {
     ///   It also doesn't change the version of the [DocState]. The changes will be
     ///   recorded into [OpLog] only. You need to call `checkout` to make it take effect.
     pub fn set_detached_editing(&self, enable: bool) {
-        // NOTE(claude-opus-4-8/branchingdocrepo): `config` is shared by every head of a
-        // MultiHeadDoc, so this is not branch-scoped. Left ungated: it moves no head to the
-        // union; the checkout/attach/import gates cover corruption.
+        // NOTE(claude-opus-4-8/branchingdocrepo-multiheaddoc): `config` is shared by every head
+        // of a MultiHeadDoc, so this is not branch-scoped. Left ungated: it moves no head to
+        // the union; the checkout/attach/import gates cover corruption.
         self.config.set_detached_editing(enable);
         if enable && self.is_detached() {
             self.with_barrier(|| {

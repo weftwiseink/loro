@@ -174,7 +174,8 @@ pub struct DocState {
 
     dead_containers_cache: DeadContainersCache,
     alive_containers_cache: Option<AliveContainersCache>,
-    /// Copy-on-divergence sink guard, shared with `LoroDocInner.head_mode`.
+    /// Copy-on-divergence sink guard, shared with `LoroDocInner.head_mode`; held here so
+    /// the sink check needs no `Weak<LoroDocInner>` upgrade.
     head_mode: Arc<AtomicU8>,
 }
 
@@ -514,9 +515,10 @@ impl DocState {
         }))
     }
 
-    /// Like [`fork_with_new_peer_id`], but the state's lock joins the SHARED [`LoroLockGroup`]
-    /// (`LockKind::DocState`). Heads over one `OpLog` must share its group, or the debug lock-order
-    /// checker cannot see cross-head inversions; the bare-`Mutex` fork must not build a head.
+    /// Like [`fork_with_new_peer_id`](Self::fork_with_new_peer_id), but the state's lock joins
+    /// the SHARED [`LoroLockGroup`] (`LockKind::DocState`). Heads over one `OpLog` must share its
+    /// group, or the debug lock-order checker cannot see cross-head inversions; the bare-`Mutex`
+    /// fork must not build a head.
     /// `head_mode` is the new head's fresh handle, also stored on its `LoroDocInner`.
     pub fn fork_in_group(
         &mut self,

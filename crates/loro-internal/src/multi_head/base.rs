@@ -274,6 +274,8 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         );
         let (from_head, _) = self.resolve(from, Intent::Read)?;
         self.with_reg(|this, reg| {
+            // Unreachable in the content flow (branches materialize lazily via the index),
+            // so assert rather than handle.
             debug_assert!(
                 !reg.heads.get(&from_head).map(|h| h.unshared).unwrap_or(false),
                 "create_branch from a lensed head would share the pin (invariant 6); \
@@ -329,6 +331,7 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
                 if reg.by_tip.get(&old_tip) == Some(&id) {
                     reg.by_tip.remove(&old_tip);
                 }
+                // A lens (unshared) head is never a `by_tip` owner; don't re-key it in.
                 if !unshared {
                     reg.by_tip.insert(new_tip.clone(), id);
                 }

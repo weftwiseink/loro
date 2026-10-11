@@ -550,7 +550,8 @@ decorateMethods(Branch.prototype, ["write", "read", "subscribe", "subscribeRoot"
 // arm, including fast-forward.
 decorateMethods(BranchingDoc.prototype, ["import", "merge", "advance"]);
 
-// A lineage import can re-resolve content branches and enqueue subscriber events.
+// Re-resolves only the index's own branches (`SelfRooted::after_import`), not content docs (that
+// is `repo.importIndex`); flushes any events the re-resolve enqueues.
 decorateMethods(BranchingIndex.prototype, ["import"]);
 
 // `createBranch` commits a marker op, enqueuing a `subscribeLocalUpdates` callback that never fires

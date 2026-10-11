@@ -10,8 +10,9 @@ use super::ROOT_HEAD_ID;
 use super::*;
 
 /// The repo's index doc. Two root maps: `docs: LoroMap<DocId, LoroMap<"heads",
-/// LoroMap<PeerID, Counter>>>`, and `branch`, whose `name` key set to `"<b>"`
-/// is a branch's creation marker (see `SelfRooted`).
+/// LoroMap<PeerID, Counter>>>`, and `branch`, whose `name` key (`"<b>"`) is a
+/// branch's creation marker and `merge` key (`"<seq>:<b>"`) a merge marker (see
+/// `SelfRooted`).
 pub type IndexDoc = MultiHeadDoc<SelfRooted>;
 
 impl MultiHeadDoc<SelfRooted> {
@@ -52,8 +53,10 @@ impl MultiHeadDoc<SelfRooted> {
 
     /// Merge `from` into `into` repo-wide with a single index marker op: advance
     /// `into`'s head to `join(tips[into], tips[from])` (per-key union of every doc's
-    /// `docs[D].heads` VV), then commit one marker. The marker's deps are the join, so
-    /// the causal fold attributes it to `into`. `AlreadyContained` writes nothing.
+    /// `docs[D].heads` VV, so concurrent same-branch writers survive), then commit one
+    /// marker. Its deps are the join, so the causal fold attributes it to `into` (a
+    /// marker needs no dep agreement). `from` is untouched.
+    /// Returns `AlreadyContained` (nothing written), else `FastForward`/`Merged` (one marker).
     pub fn merge(&self, into: &BranchId, from: &BranchId) -> LoroResult<MergeOutcome> {
         let ti = self.policy().target(self, into)?;
         let tf = self.policy().target(self, from)?;

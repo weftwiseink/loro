@@ -491,8 +491,7 @@ fn dead_tip_rematerializes_via_replay_after_head_dropped() {
     let pre_value = md.read(&feature, |d| d.get_text("t").to_string()).unwrap();
     assert_eq!(pre_value, "F");
 
-    // Retire H via `unbind`: the fast-forward-only guard holds a backward resolve of a bound head,
-    // so the head stays on H.
+    // Retire H via `unbind`: the fast-forward-only guard would hold a backward resolve on H.
     md.unbind(&feature);
     assert!(
         md.head_doc(h).is_none(),
@@ -718,7 +717,7 @@ fn index_import_then_record_converges() {
     );
 }
 
-// BranchingDocHead surface, read-exit commit, union-frontier closures.
+// BranchingDocHead surface, read-exit commit, owned-head gates, fork.
 
 #[test]
 fn branching_doc_head_surface_read_write() {
@@ -1159,6 +1158,7 @@ fn subscribe_survives_rebind() {
     md.bind(&b("main"), 0);
     md.bind(&b("feat"), 0);
 
+    // Subscribe on feat before it diverges (installed on the shared root).
     let count = Arc::new(AtomicUsize::new(0));
     let c2 = count.clone();
     let sub = md
@@ -1558,7 +1558,8 @@ fn index_snapshot_restore_preserves_tips_for_every_branch() {
     }
 }
 
-// Control: `index_import_then_record_converges`.
+// A local record on a remotely-discovered branch must survive the next resolve and reach the
+// peer. Control: `index_import_then_record_converges` (B creates `feat` locally first).
 
 #[test]
 fn index_remote_discovered_branch_local_record_survives() {
@@ -1701,6 +1702,8 @@ fn index_cold_import_of_diamond_repeated_merge_two_session_history_attributes_al
     assert_eq!(ids, vec![ID::new(500, 3), ID::new(600, 2)]);
 }
 
+// A non-marker change whose deps span two branches' tips cannot occur in well-formed use, so it
+// is a loud import error (not a silent attribute-to-main); the op stays inert in the log.
 #[test]
 fn index_change_spanning_two_branches_is_rejected_without_moving_tips() {
     let idx = IndexDoc::new(SelfRooted::new());
@@ -1946,6 +1949,8 @@ fn repo_merge_branch_content_catches_up() {
     assert!(repo.branches().contains(&b("feat")));
 }
 
+// The merge marker must always emit an op: a same-value map set is a no-op, so `after_commit`
+// would never fire and the merge would be lost, locally and on cold import.
 #[test]
 fn index_merge_into_lww_winner_still_emits_and_propagates() {
     // merge(feat, main): feat's branch.name already equals "feat" at the join, so re-setting it
@@ -2747,6 +2752,7 @@ fn lens_lineage_ahead_holds_then_fills() {
     );
 
     gb.import(&content_fwd).unwrap();
+    // A content import re-resolves via `after_import`; drive it explicitly too.
     let _ = gb
         .branch(GENESIS_BRANCH)
         .read(|h| h.get_text("t").to_string());

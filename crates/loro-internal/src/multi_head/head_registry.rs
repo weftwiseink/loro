@@ -219,9 +219,10 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         h.doc.renew_txn_if_auto_commit(None);
     }
 
-    /// Drop a `refs == 0` head (never the pinned root). Asserts no pending ops instead
-    /// of letting `Drop` implicit-commit them: `write` commits before returning and
-    /// rebinds happen at op boundaries, so a pending op is out of contract.
+    /// Drop a `refs == 0` head. The root is pinned: it anchors `by_tip`, `materialize` and
+    /// import/export. Asserts no pending ops instead of letting `Drop` implicit-commit them:
+    /// `write` commits before returning and rebinds happen at op boundaries, so a pending op
+    /// is out of contract.
     fn retire(&self, reg: &mut Registry, id: HeadId) {
         if id == ROOT_HEAD_ID {
             return;
@@ -284,10 +285,11 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
             .unwrap_or_default()
     }
 
-    /// Deliver `events` to `subs` through a scratch observer, so a shared head's
-    /// co-owner never sees the jump. Runs after the registry lock drops, so callbacks
-    /// may re-enter the registry. Handles are held until the last `emit` (dropping
-    /// one unsubscribes it).
+    /// Deliver `events` to `subs` through a scratch observer: it reproduces a plain doc's
+    /// container filtering (`Observer::emit_inner`), and holds only this branch's
+    /// callbacks, so a shared head's co-owner never sees the jump. Runs after the
+    /// registry lock drops, so callbacks may re-enter the registry. Handles are held
+    /// until the last `emit` (dropping one unsubscribes it).
     pub(super) fn dispatch_to_branch(&self, subs: SubsSnapshot, events: Vec<DocDiff>) {
         if subs.is_empty() || events.is_empty() {
             return;
@@ -523,7 +525,8 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
         }
         // `or_insert`, not `insert`: a `read_at` scratch head advanced to a frontier a
         // live head rests at must not displace that key (`retire(scratch)` would drop
-        // the live head from `by_tip`).
+        // the live head from `by_tip`). A `resolve` only gets here on a `by_tip` miss, so
+        // it still installs the moved head. A lens (unshared) head never enters `by_tip`.
         if !unshared {
             reg.by_tip.entry(new_tip).or_insert(id);
         }
@@ -638,9 +641,9 @@ impl<P: HeadPolicy> MultiHeadDoc<P> {
     /// a lens head (`unshared`, evicted from `by_tip`). Later resolves advance this
     /// same head in place, fast-forward-only.
     ///
-    /// Exposes the full `LoroDoc` surface that `BranchingDocHead` withholds. By
-    /// convention, not by type, consumers only read/subscribe/edit/commit/undo;
-    /// `checkout` is incoherent while the head is behind the shared union.
+    /// Exposes the full `LoroDoc` surface that `BranchingDocHead` withholds, but the head
+    /// is owned: `checkout`/`import`/`set_peer_id` return `OwnedHeadOp`, and
+    /// `detach`/`checkout_to_latest` are no-ops.
     pub fn open_lens(&self, b: &BranchId) -> LoroResult<LoroDoc> {
         let (id, doc) = self.resolve(b, Intent::Write)?;
         self.with_reg(|_, reg| {

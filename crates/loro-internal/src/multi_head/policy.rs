@@ -152,7 +152,8 @@ impl Attribution {
 
 /// The index's resolution policy: its own op log is the source of truth for
 /// where each branch is. Self-rooting breaks the `BranchingDoc`-depends-on-index
-/// circularity: the index consults no other index.
+/// circularity: the index consults no other index. Eager copy means every index
+/// head is born `refs == 1`, so the sink guard never fires on one.
 ///
 /// Attribution is causal, not by peer identity: a change belongs to the branch
 /// of its own marker if it carries one, else to the branch of its dependencies

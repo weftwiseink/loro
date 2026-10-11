@@ -2908,7 +2908,7 @@ impl BranchingIndex {
         subscription_to_js_function_callback(sub)
     }
 
-    /// Shared op-log version vector.
+    /// Shared op-log version vector: the sync unit a wire adaptor compares against a peer's.
     pub fn version(&self) -> VersionVector {
         VersionVector(self.0.oplog_vv())
     }
@@ -3107,7 +3107,7 @@ impl BranchingDoc {
         subscription_to_js_function_callback(sub)
     }
 
-    /// Shared op-log version vector.
+    /// Shared op-log version vector: the sync unit a wire adaptor compares against a peer's.
     pub fn version(&self) -> VersionVector {
         VersionVector(self.0.oplog_vv())
     }
@@ -3157,8 +3157,7 @@ impl Branch {
     }
 
     /// The gated escape hatch: EJECT a standalone `LoroDoc` (independent op log, full surface)
-    /// snapshotted at this head's own frontier. The only `Branch` method that hands out a
-    /// `LoroDoc`.
+    /// snapshotted at this head's own frontier.
     pub fn fork(&self) -> JsResult<LoroDoc> {
         let forked = self.doc.branch(self.name.clone()).fork()?;
         Ok(LoroDoc {
@@ -3169,12 +3168,13 @@ impl Branch {
 
     /// The LENS: the branch head's own aliased `LoroDoc`, the handle the editor, `UndoManager`,
     /// presence and canvas bind to. COPY-ON-OPEN: the head is privatized once and PINNED for the
-    /// binding's life. Unlike `fork`, an edit plus `commit` advances THIS branch and fires its
-    /// `subscribeRoot`; a forward import advances it in place.
+    /// binding's life, so no sibling can flip it shared or retire it. Unlike `fork`, an edit plus
+    /// `commit` advances THIS branch and fires its `subscribeRoot`; a forward import advances it
+    /// in place.
     ///
-    /// This is the FULL `LoroDoc`: by convention only read/subscribe/edit/commit/undo; `checkout`
-    /// is incoherent while the head is behind the shared union. Each call mints a fresh wrapper;
-    /// key an identity cache by `lensGeneration`.
+    /// The head is registry-owned: `checkout`, `import` and `setPeerId` on it throw
+    /// `OwnedHeadOp`, and `detach`/`attach` are ignored. Each call mints a fresh wrapper; key an
+    /// identity cache by `lensGeneration`.
     pub fn lens(&self) -> JsResult<LoroDoc> {
         let head = self.doc.branch(self.name.clone()).lens()?;
         Ok(LoroDoc {
@@ -3208,6 +3208,7 @@ const BRANCHING_REPO_TYPES: &str = r#"
 interface Branch {
     /**
      * Resolve the branch's head for read and run `f` on its head-safe `BranchingDocHead`.
+     * A mutation in `f` commits on exit on a Private head; on a shared head it throws.
      */
     read<R>(f: (head: BranchingDocHead) => R): R;
     /**
@@ -3215,7 +3216,8 @@ interface Branch {
      */
     write<R>(f: (head: BranchingDocHead) => R): R;
     /**
-     * Branch-scoped container subscription. Returns a `() => void` unsubscribe.
+     * Branch-scoped container subscription; follows the branch across rebinds. Returns a
+     * `() => void` unsubscribe.
      */
     subscribe(containerId: ContainerID, f: (event: LoroEventBatch) => void): () => void;
     /**

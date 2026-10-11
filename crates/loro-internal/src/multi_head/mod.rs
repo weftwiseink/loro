@@ -9,11 +9,12 @@
 //!
 //! Shared-head immutability is enforced at the two `DocState` mutation sinks
 //! (`apply_local_op`, `apply_diff`) via `head_mode` + `ensure_private`: a mutation
-//! reaching a shared head errors with [`LoroError::HeadShared`] instead of
-//! corrupting a co-owner.
+//! reaching a shared head errors with
+//! [`LoroError::HeadShared`](loro_common::LoroError::HeadShared) instead of corrupting
+//! a co-owner.
 //!
 //! `by_tip` re-keying and `HeadPolicy::after_commit` run through the injected txn
-//! on-commit hook (see [`DocOwner`] / `on_head_committed`), not from `write`.
+//! on-commit hook (see [`DocOwner`](crate::DocOwner) / `on_head_committed`), not from `write`.
 //! `import` is history-only: ops enter the shared op log via
 //! `LoroDoc::import_to_history` under the all-heads barrier, never materializing
 //! into a live head.
