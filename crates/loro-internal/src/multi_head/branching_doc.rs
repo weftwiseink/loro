@@ -1,13 +1,11 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use crate::dag::DagUtils;
 use crate::encoding::ExportMode;
-use crate::event::Diff;
-use crate::handler::TextDelta;
 use crate::undo::DiffBatch;
 use crate::version::{shrink_frontiers, Frontiers, VersionVector};
-use loro_common::{IdSpan, LoroError, LoroResult};
+use crate::LoroDoc;
+use loro_common::{ContainerType, IdSpan, LoroError, LoroResult};
 
 use super::*;
 
@@ -22,32 +20,31 @@ pub enum MergeOutcome {
     Merged,
 }
 
-/// The branch-vs-fork-base content diff plus the base doc's text length, from
-/// one [`diff_from_fork`](MultiHeadDoc::diff_from_fork) call.
+/// The branch-vs-merge-base content diff plus the base's text length, from one
+/// [`diff_from_fork`](MultiHeadDoc::diff_from_fork) call.
 #[derive(Debug, Clone)]
 pub struct ForkDiff {
-    /// The delta from the dynamic merge-base (GCA) to `branch`'s head.
+    /// The delta from the version-vector meet ([`merge_base`](MultiHeadDoc::merge_base)) to
+    /// `branch`'s head.
     pub diff: DiffBatch,
-    /// Summed text insert char count at the base; non-text containers and
-    /// mark-only edits contribute 0.
+    /// The total unicode length of the base's alive text containers; non-text containers
+    /// contribute 0.
     pub merge_base_length: usize,
 }
 
-/// Inserted unicode scalar values across the text containers of a `DiffBatch`.
-fn text_insert_len(batch: &DiffBatch) -> usize {
-    batch
-        .iter()
-        .map(|(_, d)| match d {
-            Diff::Text(t) => TextDelta::from_text_diff(t.iter())
-                .iter()
-                .map(|td| match td {
-                    TextDelta::Insert { insert, .. } => insert.chars().count(),
-                    _ => 0,
-                })
-                .sum(),
-            _ => 0,
-        })
-        .sum()
+/// Total unicode length of `d`'s alive text containers, read under one state lock.
+fn text_len(d: &LoroDoc) -> LoroResult<usize> {
+    let mut state = d.app_state().lock();
+    let mut len = 0;
+    for id in state.get_all_alive_containers()? {
+        if id.container_type() != ContainerType::Text {
+            continue;
+        }
+        if let Some(idx) = state.arena.id_to_idx(&id) {
+            len += state.get_text_unicode_len(idx);
+        }
+    }
+    Ok(len)
 }
 
 /// One content document: a `MultiHeadDoc` with delegated (index-backed) branch
@@ -167,24 +164,29 @@ impl MultiHeadDoc<Delegated> {
         Ok(self.oplog.lock().dag.vv_to_frontiers(&u))
     }
 
-    /// What `branch` changed since it forked from `against`: the delta from their
-    /// merge-base to `branch`'s head, plus the base text length. The base is the GCA,
-    /// not the static `fork_point`, which goes stale after a cross-merge. Diffs run on
-    /// a scratch head ([`read_at`](MultiHeadDoc::read_at)).
+    /// The merge base of branches `a` and `b`: the frontier of `vv(a) ∩ vv(b)`. Always a real
+    /// version, and it moves with every merge. Not a replay base: checkouts pick their own.
+    pub fn merge_base(&self, a: &BranchId, b: &BranchId) -> LoroResult<Frontiers> {
+        let mut vv = self.resolve_vv(&self.frontier_of(a)?)?;
+        vv.intersect_with(&self.resolve_vv(&self.frontier_of(b)?)?);
+        Ok(self.oplog.lock().dag.vv_to_frontiers(&vv))
+    }
+
+    /// What `branch` did that `against` does not have: the delta from their
+    /// [`merge_base`](Self::merge_base) (the version-vector meet) to `branch`'s head, plus the
+    /// base's text length. Runs on a scratch head ([`read_at`](MultiHeadDoc::read_at)).
     pub fn diff_from_fork(
         &self,
         branch: &BranchId,
         against: &BranchId,
     ) -> LoroResult<ForkDiff> {
         let fb = self.frontier_of(branch)?;
-        let fa = self.frontier_of(against)?;
-        let base = self.oplog.lock().dag.find_common_ancestor(&fb, &fa).0;
-        self.read_at(&fb, |d| -> LoroResult<ForkDiff> {
-            let diff = d.diff(&base, &fb)?;
-            let base_diff = d.diff(&Frontiers::default(), &base)?;
+        let base = self.merge_base(branch, against)?;
+        self.read_at(&base, |d| -> LoroResult<ForkDiff> {
+            let merge_base_length = text_len(d)?;
             Ok(ForkDiff {
-                diff,
-                merge_base_length: text_insert_len(&base_diff),
+                diff: d.diff(&base, &fb)?,
+                merge_base_length,
             })
         })?
     }

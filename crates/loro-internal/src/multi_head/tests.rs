@@ -2430,7 +2430,7 @@ fn branching_doc_head_diff_passthrough_state_preserving() {
 }
 
 #[test]
-fn diff_from_fork_dynamic_gca_baseline() {
+fn diff_from_fork_meet_baseline() {
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
     g.branch(GENESIS_BRANCH)
@@ -2448,23 +2448,23 @@ fn diff_from_fork_dynamic_gca_baseline() {
     assert_eq!(
         inserted_text(&fork.diff),
         "-feat",
-        "delta is feat's post-fork insert against the GCA base only"
+        "delta is feat's post-fork insert against the meet only"
     );
     assert_eq!(delete_count(&fork.diff), 0, "no deletion of main's concurrent edit");
     assert_eq!(fork.merge_base_length, 4, "merge_base_length = len('base')");
 }
 
 #[test]
-fn diff_from_fork_dynamic_gca_moves_after_ff_merge() {
-    // The baseline is the dynamic GCA, not the static fork_point: after main fast-forwards into
-    // feat the GCA is main's head ("base-main"); a static baseline would report "-main-feat".
+fn diff_from_fork_meet_moves_after_ff_merge() {
+    // The baseline is the meet, not the static fork_point: after main fast-forwards into
+    // feat the meet is main's head ("base-main"); a static baseline would report "-main-feat".
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
     g.branch(GENESIS_BRANCH)
         .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
         .unwrap();
     repo.create_branch(&b("feat"), &b(GENESIS_BRANCH)).unwrap();
-    // feat doesn't edit concurrently, so the merge is a clean fast-forward and the GCA moves up.
+    // feat doesn't edit concurrently, so the merge is a clean fast-forward and the meet moves up.
     g.branch(GENESIS_BRANCH)
         .write(|h| h.get_text("t").insert_unicode(4, "-main").unwrap())
         .unwrap();
@@ -2477,7 +2477,7 @@ fn diff_from_fork_dynamic_gca_moves_after_ff_merge() {
     let inserted = inserted_text(&fork.diff);
     assert_eq!(
         inserted, "-feat",
-        "dynamic GCA = main's merged head: only feat's post-merge insert"
+        "meet = main's merged head: only feat's post-merge insert"
     );
     assert!(
         !inserted.contains("-main"),
@@ -2631,8 +2631,6 @@ fn conveniences_leave_head_frontiers_unchanged() {
 }
 
 // diffFromFork from the version-vector meet (cdocs/proposals/2026-10-13-diff-from-fork-merge-base.md).
-// The `#[ignore]`d tests fail on today's `diff_from_fork` (replay base, not the meet); the fix
-// un-ignores them.
 
 use crate::handler::TextHandler;
 
@@ -2662,14 +2660,8 @@ fn vv_meet(g: &BranchingDoc, a: &BranchId, bb: &BranchId) -> Frontiers {
     ol.dag.vv_to_frontiers(&vv)
 }
 
-/// The merge base under test. Binds to `merge_base` once it exists; until then it is the base
-/// today's `diff_from_fork` uses.
 fn merge_base_under_test(g: &BranchingDoc, a: &BranchId, bb: &BranchId) -> Frontiers {
-    use crate::dag::DagUtils;
-    let fa = g.frontier_of(a).unwrap();
-    let fb = g.frontier_of(bb).unwrap();
-    let ol = g.oplog.lock();
-    ol.dag.find_common_ancestor(&fa, &fb).0
+    g.merge_base(a, bb).unwrap()
 }
 
 fn sorted_chars(s: &str) -> Vec<char> {
@@ -2709,7 +2701,6 @@ fn pull_main_spike() -> (BranchingDocRepo, Arc<BranchingDoc>) {
 
 /// T-F1.
 #[test]
-#[ignore = "red until the diff-from-fork meet fix"]
 fn diff_from_fork_meet_after_pull_main() {
     let (_repo, g) = pull_main_spike();
     let fork = g.diff_from_fork(&b("b"), &b(GENESIS_BRANCH)).unwrap();
@@ -2733,7 +2724,6 @@ fn diff_from_fork_meet_after_pull_main() {
 
 /// T-F2 (a): one merge round trip; after each step the inserts are b's edits not in main.
 #[test]
-#[ignore = "red until the diff-from-fork meet fix"]
 fn diff_from_fork_meet_round_trip_merges() {
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
@@ -2773,7 +2763,6 @@ fn diff_from_fork_meet_round_trip_merges() {
 
 /// T-F2 (b): 100 one-way Pull mains; the inserts are b's cumulative edits since the fork.
 #[test]
-#[ignore = "red until the diff-from-fork meet fix"]
 fn diff_from_fork_meet_many_pull_mains() {
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
@@ -2808,7 +2797,6 @@ fn diff_from_fork_meet_many_pull_mains() {
 
 /// T-F3: a map container (canvas-shaped); main's pulled-in key is not b's.
 #[test]
-#[ignore = "red until the diff-from-fork meet fix"]
 fn diff_from_fork_meet_map_container() {
     let repo = BranchingDocRepo::open().unwrap();
     let g = repo.open_doc("G".into());
@@ -2851,7 +2839,6 @@ fn diff_from_fork_base_length_unicode_scalars() {
 
 /// T-F6: `merge_base` is symmetric, is the contained side's frontier, and is the VV meet.
 #[test]
-#[ignore = "red until the diff-from-fork meet fix"]
 fn merge_base_is_the_vv_meet() {
     let (repo, g) = pull_main_spike();
     let (bb, main) = (b("b"), b(GENESIS_BRANCH));

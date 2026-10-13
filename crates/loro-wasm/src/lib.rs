@@ -2750,8 +2750,9 @@ export type BranchSource = {
     readonly parent: string | null;
 };
 /**
- * The branch-vs-fork-base content diff plus the base doc's shallow TEXT length, from one
- * `diffFromFork()` call. `diff` is the `[ContainerID, Diff][]` `doc.diff` produces.
+ * The branch-vs-merge-base content diff plus the total length of the base's alive text
+ * containers, from one `diffFromFork()` call. `diff` is the `[ContainerID, Diff][]` `doc.diff`
+ * produces.
  */
 export type ForkDiff = {
     readonly diff: [ContainerID, Diff][];
@@ -3026,9 +3027,17 @@ impl BranchingDoc {
         frontiers_to_ids(&self.0.frontier_of(&b.into())?)
     }
 
-    /// What `branch` changed since it forked from `against`: `{ diff, mergeBaseLength }`. The
-    /// baseline is the DYNAMIC merge-base (GCA), not the static `forkPoint`, so it stays correct
-    /// after a cross-merge. `mergeBaseLength` is the base doc's shallow TEXT length.
+    /// The merge base of branches `a` and `b`: the frontier of `vv(a) ∩ vv(b)` (the
+    /// version-vector meet), the base `diffFromFork` diffs from.
+    #[wasm_bindgen(js_name = "mergeBase")]
+    pub fn merge_base(&self, a: &str, b: &str) -> JsResult<JsIDs> {
+        frontiers_to_ids(&self.0.merge_base(&a.into(), &b.into())?)
+    }
+
+    /// What `branch` did that `against` does not have: `{ diff, mergeBaseLength }`. The
+    /// baseline is the version-vector meet ([`mergeBase`](Self::merge_base)), not the static
+    /// `forkPoint`, so it stays correct after merges in either direction. `mergeBaseLength` is
+    /// the total length of the base's alive text containers.
     #[wasm_bindgen(js_name = "diffFromFork")]
     pub fn diff_from_fork(&self, branch: &str, against: &str) -> JsResult<JsForkDiff> {
         let fork: ForkDiff = self.0.diff_from_fork(&branch.into(), &against.into())?;
