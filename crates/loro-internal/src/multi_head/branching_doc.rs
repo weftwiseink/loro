@@ -24,11 +24,9 @@ pub enum MergeOutcome {
 /// [`diff_from_fork`](MultiHeadDoc::diff_from_fork) call.
 #[derive(Debug, Clone)]
 pub struct ForkDiff {
-    /// The delta from the version-vector meet ([`merge_base`](MultiHeadDoc::merge_base)) to
-    /// `branch`'s head.
+    /// The delta from [`merge_base`](MultiHeadDoc::merge_base) to `branch`'s head.
     pub diff: DiffBatch,
-    /// The total unicode length of the base's alive text containers; non-text containers
-    /// contribute 0.
+    /// Unicode length of the base's alive text containers (non-text contribute 0).
     pub merge_base_length: usize,
 }
 
@@ -166,8 +164,9 @@ impl MultiHeadDoc<Delegated> {
         Ok(self.oplog.lock().dag.vv_to_frontiers(&u))
     }
 
-    /// The merge base of branches `a` and `b`: the frontier of `vv(a) ∩ vv(b)`. Always a real
-    /// version, and it moves with every merge. Not a replay base: checkouts pick their own.
+    /// The merge base of branches `a` and `b`: the frontier of `vv(a) ∩ vv(b)`. Unlike
+    /// `find_common_ancestor`, a replay base that can retreat below the meet under
+    /// concurrency, this is the exact meet and moves with every merge.
     pub fn merge_base(&self, a: &BranchId, b: &BranchId) -> LoroResult<Frontiers> {
         let mut vv = self.resolve_vv(&self.frontier_of(a)?)?;
         vv.intersect_with(&self.resolve_vv(&self.frontier_of(b)?)?);

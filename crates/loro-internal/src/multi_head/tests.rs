@@ -2757,7 +2757,7 @@ fn diff_from_fork_meet_round_trip_merges() {
     check("both edit again", "x2x3");
 }
 
-/// T-F2 (b): 100 one-way Pull mains; the inserts are b's cumulative edits since the fork.
+/// T-F2 (b): 100 one-way Pull mains.
 #[test]
 fn diff_from_fork_meet_many_pull_mains() {
     let repo = BranchingDocRepo::open().unwrap();
@@ -2820,7 +2820,7 @@ fn diff_from_fork_meet_map_container() {
     );
 }
 
-/// T-F5: the base length counts unicode scalars.
+/// T-F5.
 #[test]
 fn diff_from_fork_base_length_unicode_scalars() {
     let repo = BranchingDocRepo::open().unwrap();
@@ -2880,7 +2880,6 @@ fn diff_from_fork_base_length_skips_detached_text() {
     assert_eq!(fork.merge_base_length, 2, "only the alive root text 'xy' counts");
 }
 
-/// An alive text container nested under a map key counts toward the base length.
 #[test]
 fn diff_from_fork_base_length_counts_nested_text() {
     let repo = BranchingDocRepo::open().unwrap();
