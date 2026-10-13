@@ -40,9 +40,11 @@ fn text_len(d: &LoroDoc) -> LoroResult<usize> {
         if id.container_type() != ContainerType::Text {
             continue;
         }
-        if let Some(idx) = state.arena.id_to_idx(&id) {
-            len += state.get_text_unicode_len(idx);
-        }
+        let idx = state
+            .arena
+            .id_to_idx(&id)
+            .expect("an alive container is registered in the arena");
+        len += state.get_text_unicode_len(idx);
     }
     Ok(len)
 }

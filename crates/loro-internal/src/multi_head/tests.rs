@@ -2660,10 +2660,6 @@ fn vv_meet(g: &BranchingDoc, a: &BranchId, bb: &BranchId) -> Frontiers {
     ol.dag.vv_to_frontiers(&vv)
 }
 
-fn merge_base_under_test(g: &BranchingDoc, a: &BranchId, bb: &BranchId) -> Frontiers {
-    g.merge_base(a, bb).unwrap()
-}
-
 fn sorted_chars(s: &str) -> Vec<char> {
     let mut v: Vec<char> = s.chars().collect();
     v.sort_unstable();
@@ -2741,7 +2737,7 @@ fn diff_from_fork_meet_round_trip_merges() {
         );
         assert_eq!(delete_count(&fork.diff), 0, "{step}: no deletes");
         assert_eq!(
-            merge_base_under_test(&g, &bb, &main),
+            g.merge_base(&bb, &main).unwrap(),
             vv_meet(&g, &bb, &main),
             "{step}: merge base is the VV meet"
         );
@@ -2843,12 +2839,12 @@ fn merge_base_is_the_vv_meet() {
     let (repo, g) = pull_main_spike();
     let (bb, main) = (b("b"), b(GENESIS_BRANCH));
     assert_eq!(
-        merge_base_under_test(&g, &bb, &main),
-        merge_base_under_test(&g, &main, &bb),
+        g.merge_base(&bb, &main).unwrap(),
+        g.merge_base(&main, &bb).unwrap(),
         "symmetric"
     );
     assert_eq!(
-        merge_base_under_test(&g, &bb, &main),
+        g.merge_base(&bb, &main).unwrap(),
         vv_meet(&g, &bb, &main),
         "the VV-intersection frontier after a Pull main"
     );
@@ -2856,7 +2852,7 @@ fn merge_base_is_the_vv_meet() {
     repo.create_branch(&b("c"), &bb).unwrap();
     dff_prepend(&g, "c", "C ");
     assert_eq!(
-        merge_base_under_test(&g, &bb, &b("c")),
+        g.merge_base(&bb, &b("c")).unwrap(),
         g.frontier_of(&bb).unwrap(),
         "b contained in c: the base is b's frontier"
     );
@@ -2882,6 +2878,27 @@ fn diff_from_fork_base_length_skips_detached_text() {
     dff_append(&g, "b", "!");
     let fork = g.diff_from_fork(&b("b"), &b(GENESIS_BRANCH)).unwrap();
     assert_eq!(fork.merge_base_length, 2, "only the alive root text 'xy' counts");
+}
+
+/// An alive text container nested under a map key counts toward the base length.
+#[test]
+fn diff_from_fork_base_length_counts_nested_text() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| {
+            let t = h
+                .get_map("m")
+                .insert_container("k", TextHandler::new_detached())
+                .unwrap();
+            t.insert_unicode(0, "abc").unwrap();
+            h.get_text("t").insert_unicode(0, "xy").unwrap();
+        })
+        .unwrap();
+    repo.create_branch(&b("b"), &b(GENESIS_BRANCH)).unwrap();
+    dff_append(&g, "b", "!");
+    let fork = g.diff_from_fork(&b("b"), &b(GENESIS_BRANCH)).unwrap();
+    assert_eq!(fork.merge_base_length, 5, "root 'xy' plus nested 'abc'");
 }
 
 // Branch.lens(): copy-on-open pin, fast-forward-only guard, lens-observer delivery.
