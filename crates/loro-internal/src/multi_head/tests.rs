@@ -2630,6 +2630,273 @@ fn conveniences_leave_head_frontiers_unchanged() {
     );
 }
 
+// diffFromFork from the version-vector meet (cdocs/proposals/2026-10-13-diff-from-fork-merge-base.md).
+// The `#[ignore]`d tests fail on today's `diff_from_fork` (replay base, not the meet); the fix
+// un-ignores them.
+
+use crate::handler::TextHandler;
+
+fn dff_append(g: &BranchingDoc, br: &str, s: &str) {
+    g.branch(br)
+        .write(|h| {
+            let t = h.get_text("t");
+            let n = t.len_unicode();
+            t.insert_unicode(n, s).unwrap()
+        })
+        .unwrap();
+}
+
+fn dff_prepend(g: &BranchingDoc, br: &str, s: &str) {
+    g.branch(br)
+        .write(|h| h.get_text("t").insert_unicode(0, s).unwrap())
+        .unwrap();
+}
+
+/// Oracle: the frontier of `vv(a) ∩ vv(b)`.
+fn vv_meet(g: &BranchingDoc, a: &BranchId, bb: &BranchId) -> Frontiers {
+    let fa = g.frontier_of(a).unwrap();
+    let fb = g.frontier_of(bb).unwrap();
+    let ol = g.oplog.lock();
+    let mut vv = ol.dag.frontiers_to_vv(&fa).unwrap();
+    vv.intersect_with(&ol.dag.frontiers_to_vv(&fb).unwrap());
+    ol.dag.vv_to_frontiers(&vv)
+}
+
+/// The merge base under test. Binds to `merge_base` once it exists; until then it is the base
+/// today's `diff_from_fork` uses.
+fn merge_base_under_test(g: &BranchingDoc, a: &BranchId, bb: &BranchId) -> Frontiers {
+    use crate::dag::DagUtils;
+    let fa = g.frontier_of(a).unwrap();
+    let fb = g.frontier_of(bb).unwrap();
+    let ol = g.oplog.lock();
+    ol.dag.find_common_ancestor(&fa, &fb).0
+}
+
+fn sorted_chars(s: &str) -> Vec<char> {
+    let mut v: Vec<char> = s.chars().collect();
+    v.sort_unstable();
+    v
+}
+
+fn map_keys(batch: &DiffBatch) -> Vec<String> {
+    let mut keys: Vec<String> = batch
+        .iter()
+        .flat_map(|(_, diff)| match diff {
+            EvDiff::Map(m) => m.updated.keys().map(|k| k.to_string()).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The report's Pull-main spike: base text, branch edit, concurrent main edit, Pull main, both edit.
+fn pull_main_spike() -> (BranchingDocRepo, Arc<BranchingDoc>) {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    dff_append(&g, GENESIS_BRANCH, "one\ntwo\nthree\n");
+    repo.create_branch(&b("b"), &b(GENESIS_BRANCH)).unwrap();
+    dff_prepend(&g, "b", "B1 ");
+    dff_append(&g, GENESIS_BRANCH, "M1\n");
+    assert_eq!(
+        repo.merge_branch(&b("b"), &b(GENESIS_BRANCH)).unwrap(),
+        MergeOutcome::Merged
+    );
+    dff_prepend(&g, "b", "B2 ");
+    dff_append(&g, GENESIS_BRANCH, "M2\n");
+    (repo, g)
+}
+
+/// T-F1.
+#[test]
+#[ignore = "red until the diff-from-fork meet fix"]
+fn diff_from_fork_meet_after_pull_main() {
+    let (_repo, g) = pull_main_spike();
+    let fork = g.diff_from_fork(&b("b"), &b(GENESIS_BRANCH)).unwrap();
+    let inserted = inserted_text(&fork.diff);
+    assert_eq!(
+        sorted_chars(&inserted),
+        sorted_chars("B1 B2 "),
+        "only b's own inserts, got {inserted:?}"
+    );
+    assert!(!inserted.contains("M1"), "main's pulled-in M1 is not b's edit");
+    assert_eq!(delete_count(&fork.diff), 0);
+    assert_eq!(
+        fork.merge_base_length, 17,
+        "base = the meet, one\\ntwo\\nthree\\nM1\\n"
+    );
+
+    let rev = g.diff_from_fork(&b(GENESIS_BRANCH), &b("b")).unwrap();
+    assert_eq!(inserted_text(&rev.diff), "M2\n", "main did only M2 that b lacks");
+    assert_eq!(delete_count(&rev.diff), 0);
+}
+
+/// T-F2 (a): one merge round trip; after each step the inserts are b's edits not in main.
+#[test]
+#[ignore = "red until the diff-from-fork meet fix"]
+fn diff_from_fork_meet_round_trip_merges() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    let (bb, main) = (b("b"), b(GENESIS_BRANCH));
+    dff_append(&g, GENESIS_BRANCH, "base");
+    repo.create_branch(&bb, &main).unwrap();
+
+    let check = |step: &str, expected: &str| {
+        let fork = g.diff_from_fork(&bb, &main).unwrap();
+        let inserted = inserted_text(&fork.diff);
+        assert_eq!(
+            sorted_chars(&inserted),
+            sorted_chars(expected),
+            "{step}: inserts are b's edits not in main, got {inserted:?}"
+        );
+        assert_eq!(delete_count(&fork.diff), 0, "{step}: no deletes");
+        assert_eq!(
+            merge_base_under_test(&g, &bb, &main),
+            vv_meet(&g, &bb, &main),
+            "{step}: merge base is the VV meet"
+        );
+    };
+
+    dff_prepend(&g, "b", "x1");
+    check("b edits", "x1");
+    repo.merge_branch(&main, &bb).unwrap();
+    check("merge(main, b)", "");
+    dff_prepend(&g, "b", "x2");
+    dff_append(&g, GENESIS_BRANCH, "m2");
+    check("both edit", "x2");
+    assert_eq!(repo.merge_branch(&bb, &main).unwrap(), MergeOutcome::Merged);
+    check("merge(b, main)", "x2");
+    dff_prepend(&g, "b", "x3");
+    dff_append(&g, GENESIS_BRANCH, "m3");
+    check("both edit again", "x2x3");
+}
+
+/// T-F2 (b): 100 one-way Pull mains; the inserts are b's cumulative edits since the fork.
+#[test]
+#[ignore = "red until the diff-from-fork meet fix"]
+fn diff_from_fork_meet_many_pull_mains() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    let (bb, main) = (b("b"), b(GENESIS_BRANCH));
+    dff_append(&g, GENESIS_BRANCH, "seed\n");
+    repo.create_branch(&bb, &main).unwrap();
+    for _ in 0..100 {
+        dff_prepend(&g, "b", "bb");
+        dff_append(&g, GENESIS_BRANCH, "m");
+        repo.merge_branch(&bb, &main).unwrap();
+    }
+
+    let fork = g.diff_from_fork(&bb, &main).unwrap();
+    let inserted = inserted_text(&fork.diff);
+    assert_eq!(
+        inserted.chars().count(),
+        200,
+        "b's cumulative 200 chars, got {}",
+        inserted.chars().count()
+    );
+    assert!(
+        inserted.chars().all(|c| c == 'b'),
+        "none of main's text is b's"
+    );
+    assert_eq!(delete_count(&fork.diff), 0);
+    assert_eq!(
+        fork.merge_base_length,
+        5 + 100,
+        "base = main's text at the meet: seed\\n plus main's 100 inserts"
+    );
+}
+
+/// T-F3: a map container (canvas-shaped); main's pulled-in key is not b's.
+#[test]
+#[ignore = "red until the diff-from-fork meet fix"]
+fn diff_from_fork_meet_map_container() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    let (bb, main) = (b("b"), b(GENESIS_BRANCH));
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_map("m").insert("seed", 0).unwrap())
+        .unwrap();
+    repo.create_branch(&bb, &main).unwrap();
+    g.branch("b")
+        .write(|h| h.get_map("m").insert("x", 1).unwrap())
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_map("m").insert("k", 2).unwrap())
+        .unwrap();
+    assert_eq!(repo.merge_branch(&bb, &main).unwrap(), MergeOutcome::Merged);
+    g.branch("b")
+        .write(|h| h.get_map("m").insert("j", 3).unwrap())
+        .unwrap();
+
+    let fork = g.diff_from_fork(&bb, &main).unwrap();
+    assert_eq!(
+        map_keys(&fork.diff),
+        vec!["j".to_string(), "x".to_string()],
+        "b updated x and j; k came from main"
+    );
+}
+
+/// T-F5: the base length counts unicode scalars.
+#[test]
+fn diff_from_fork_base_length_unicode_scalars() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    dff_append(&g, GENESIS_BRANCH, "héllo🙂");
+    repo.create_branch(&b("b"), &b(GENESIS_BRANCH)).unwrap();
+    dff_append(&g, "b", "!");
+    let fork = g.diff_from_fork(&b("b"), &b(GENESIS_BRANCH)).unwrap();
+    assert_eq!(fork.merge_base_length, 6, "unicode scalars, not UTF-16 (7) or UTF-8 (10)");
+    assert_eq!(inserted_text(&fork.diff), "!");
+}
+
+/// T-F6: `merge_base` is symmetric, is the contained side's frontier, and is the VV meet.
+#[test]
+#[ignore = "red until the diff-from-fork meet fix"]
+fn merge_base_is_the_vv_meet() {
+    let (repo, g) = pull_main_spike();
+    let (bb, main) = (b("b"), b(GENESIS_BRANCH));
+    assert_eq!(
+        merge_base_under_test(&g, &bb, &main),
+        merge_base_under_test(&g, &main, &bb),
+        "symmetric"
+    );
+    assert_eq!(
+        merge_base_under_test(&g, &bb, &main),
+        vv_meet(&g, &bb, &main),
+        "the VV-intersection frontier after a Pull main"
+    );
+
+    repo.create_branch(&b("c"), &bb).unwrap();
+    dff_prepend(&g, "c", "C ");
+    assert_eq!(
+        merge_base_under_test(&g, &bb, &b("c")),
+        g.frontier_of(&bb).unwrap(),
+        "b contained in c: the base is b's frontier"
+    );
+}
+
+/// T-F7: a text container detached by a map-key delete before the base contributes 0.
+#[test]
+fn diff_from_fork_base_length_skips_detached_text() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| {
+            let m = h.get_map("m");
+            let t = m.insert_container("k", TextHandler::new_detached()).unwrap();
+            t.insert_unicode(0, "abc").unwrap();
+            h.get_text("t").insert_unicode(0, "xy").unwrap();
+        })
+        .unwrap();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_map("m").delete("k").unwrap())
+        .unwrap();
+    repo.create_branch(&b("b"), &b(GENESIS_BRANCH)).unwrap();
+    dff_append(&g, "b", "!");
+    let fork = g.diff_from_fork(&b("b"), &b(GENESIS_BRANCH)).unwrap();
+    assert_eq!(fork.merge_base_length, 2, "only the alive root text 'xy' counts");
+}
+
 // Branch.lens(): copy-on-open pin, fast-forward-only guard, lens-observer delivery.
 
 /// A forward import advances a bound lens in place; lens and branch subscribers fire.
