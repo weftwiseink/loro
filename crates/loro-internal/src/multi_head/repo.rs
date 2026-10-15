@@ -17,10 +17,12 @@ pub struct BranchingDocRepo {
 }
 
 /// What an `import_index` did: the op import's status, plus the branches whose
-/// tip it moved with the docs re-resolved on each (`None`: every open doc;
-/// `Some([])`: the tip moved but no open doc's record did, as when a peer's
-/// genesis root joins `main`). Sorted by branch, then doc. Empty for an
-/// already-contained frame.
+/// tip it moved. `Some(docs)`: the docs whose record moved in the branch's tip
+/// range, open here or not (the open ones were re-resolved); `Some([])`: the tip
+/// moved but no record did, as when a peer's genesis root joins `main`; `None`:
+/// the range was not computed (a branch new to this session, or an unresolvable
+/// tip) and every open doc was re-resolved. Sorted by branch, then doc. Empty
+/// for an already-contained frame.
 #[derive(Debug, Clone)]
 pub struct IndexImportOutcome {
     pub status: ImportStatus,
