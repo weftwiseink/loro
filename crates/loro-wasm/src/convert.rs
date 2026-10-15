@@ -6,6 +6,7 @@ use loro_internal::encoding::{ImportBlobMetadata, ImportStatus};
 use loro_internal::event::{Diff, ListDeltaMeta, ListDiff, TextDiff, TextMeta};
 use loro_internal::handler::{Handler, TextDelta, ValueOrHandler};
 use loro_internal::json::JsonSchema;
+use loro_internal::multi_head::IndexImportOutcome;
 use loro_internal::version::VersionRange;
 use loro_internal::StringSlice;
 use loro_internal::{Counter, CounterSpan, FxHashMap, IdSpan, ListDiffItem};
@@ -483,6 +484,28 @@ pub(crate) fn import_status_to_js_value(status: ImportStatus) -> JsResult<JsValu
         },
     )?;
     Ok(obj.into())
+}
+
+/// `ImportStatus` plus `moved: Array<{ branch, docs: string[] | null }>`.
+pub(crate) fn index_import_outcome_to_js_value(outcome: IndexImportOutcome) -> JsResult<JsValue> {
+    let obj = import_status_to_js_value(outcome.status)?;
+    let moved = Array::new();
+    for (branch, docs) in outcome.moved {
+        let entry = Object::new();
+        Reflect::set(&entry, &"branch".into(), &JsValue::from_str(&branch))?;
+        let docs = match docs {
+            None => JsValue::null(),
+            Some(docs) => docs
+                .iter()
+                .map(|d| JsValue::from_str(d))
+                .collect::<Array>()
+                .into(),
+        };
+        Reflect::set(&entry, &"docs".into(), &docs)?;
+        moved.push(&entry);
+    }
+    Reflect::set(&obj, &"moved".into(), &moved)?;
+    Ok(obj)
 }
 
 fn id_span_vector_to_js_value(v: VersionRange) -> JsValue {

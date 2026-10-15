@@ -8,8 +8,8 @@
 mod container_tree;
 
 use convert::{
-    import_blob_metadata_to_js, import_status_to_js_value, js_diff_to_inner_diff,
-    js_json_schema_to_loro_json_schema, js_to_id_span, js_to_version_vector,
+    import_blob_metadata_to_js, import_status_to_js_value, index_import_outcome_to_js_value,
+    js_diff_to_inner_diff, js_json_schema_to_loro_json_schema, js_to_id_span, js_to_version_vector,
     js_value_to_loro_value, loro_json_schema_to_js_json_schema, resolved_diff_to_js,
 };
 use js_sys::{Array, Object, Promise, Reflect, Uint8Array};
@@ -430,6 +430,8 @@ extern "C" {
     pub type JsCommitOption;
     #[wasm_bindgen(typescript_type = "ImportStatus")]
     pub type JsImportStatus;
+    #[wasm_bindgen(typescript_type = "IndexImportOutcome")]
+    pub type JsIndexImportOutcome;
     #[wasm_bindgen(typescript_type = "(change: Change) => boolean")]
     pub type JsTravelChangeFunction;
     #[wasm_bindgen(typescript_type = "(string|number)[]")]
@@ -2860,11 +2862,12 @@ impl BranchingDocRepo {
 
     /// Import LINEAGE/index bytes and advance every open content doc's lens forward to any branch
     /// frontier the import recorded (fast-forward only). Use this, not `index().import`, as the
-    /// lineage sink on a repo with open content docs.
+    /// lineage sink on a repo with open content docs. Only the open docs whose record moved are
+    /// re-resolved; `moved` reports the branches and docs (see `IndexImportOutcome`).
     #[wasm_bindgen(js_name = "importIndex")]
-    pub fn import_index(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
+    pub fn import_index(&self, bytes: &[u8]) -> JsResult<JsIndexImportOutcome> {
         let outcome = self.0.import_index(bytes)?;
-        Ok(import_status_to_js_value(outcome.status)?.into())
+        Ok(index_import_outcome_to_js_value(outcome)?.into())
     }
 }
 
@@ -7751,6 +7754,18 @@ export type CounterSpan = { start: number, end: number };
 export type ImportStatus = {
   success: Map<PeerID, CounterSpan>,
   pending: Map<PeerID, CounterSpan> | null
+}
+
+/**
+ * What `BranchingDocRepo.importIndex` did: the op import's status, plus each branch whose tip
+ * the import moved, sorted by branch then doc, and `[]` for an already-contained frame.
+ * `docs: string[]` names the docs whose record moved in the branch's tip range, open here or
+ * not (the open ones were re-resolved); `docs: []` means the tip moved but no record did (a
+ * peer's genesis root joining `main`); `docs: null` means the range was not computed (a branch
+ * new to this session, or an unresolvable tip) and every open doc was re-resolved.
+ */
+export type IndexImportOutcome = ImportStatus & {
+  moved: Array<{ branch: string, docs: string[] | null }>
 }
 
 export type Frontiers = OpId[];

@@ -545,3 +545,33 @@ describe("BranchingIndex derived reads", () => {
     expect(typeof idx.forkPoint("feat")[0].peer).toBe("string");
   });
 });
+
+describe("BranchingDocRepo.importIndex moved set", () => {
+  const UPDATE = { mode: "update" } as const;
+
+  it("names each moved branch and the docs whose record moved, open or not", () => {
+    const a = new BranchingDocRepo();
+    const ga = a.openDoc("G");
+    ga.branch("main").write((h) => h.getText("t").insert(0, "g"));
+    a.openDoc("H").branch("main").write((h) => h.getText("t").insert(0, "h"));
+
+    const b = new BranchingDocRepo();
+    const gb = b.openDoc("G"); // H stays closed on b
+    gb.import(ga.export(UPDATE));
+
+    const first = b.importIndex(a.index().export(UPDATE));
+    expect(first.success.size).toBeGreaterThan(0);
+    expect(first.pending).toBeNull();
+    expect(first.moved).toEqual([{ branch: "main", docs: ["G", "H"] }]);
+    expect(gb.branch("main").read((h) => h.getText("t").toString())).toBe("g");
+
+    a.createBranch("tidy", "main");
+    const frame = a.index().export({ mode: "update", from: b.index().version() });
+    const created = b.importIndex(frame);
+    expect(created.moved).toEqual([{ branch: "tidy", docs: null }]);
+
+    const again = b.importIndex(frame);
+    expect(again.success.size).toBe(0);
+    expect(again.moved).toEqual([]);
+  });
+});
