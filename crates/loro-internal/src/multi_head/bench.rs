@@ -8,7 +8,6 @@
 //! branches, one agent commit on `tidy`.
 use super::*;
 use crate::encoding::ExportMode;
-use crate::handler::HandlerTrait;
 use loro_common::{Counter, LoroResult, PeerID, ID};
 use std::sync::Arc;
 use std::time::Instant;
@@ -108,8 +107,8 @@ fn agent_update(idx: &[u8], contents: &[Vec<u8>], n: usize) -> Vec<u8> {
 }
 
 /// The whole-index deep-value read of one record: the reference `recorded_ids`
-/// is measured against. Test-only.
-fn recorded_ids_deep(idx: &IndexDoc, b: &BranchId, doc: &DocId) -> LoroResult<Vec<ID>> {
+/// is measured and checked against. Test-only.
+pub(super) fn recorded_ids_deep(idx: &IndexDoc, b: &BranchId, doc: &DocId) -> LoroResult<Vec<ID>> {
     idx.read(b, |d| {
         let mut ids = Vec::new();
         let heads = d

@@ -3213,3 +3213,63 @@ fn lens_container_scoped_subscribe_parity_after_observer_switch() {
         "the 'u' container subscriber did NOT fire (container filtering preserved through the head observer)"
     );
 }
+
+// Index record reads.
+
+/// `recorded_ids` reads one record through handles; it equals the whole-index deep
+/// value for a single-peer record, a multi-peer record, an unknown doc, and an
+/// unknown branch, on the root head and on a copied head.
+#[test]
+fn recorded_ids_direct_read_equals_deep_value() {
+    use super::bench::recorded_ids_deep;
+
+    let idx = IndexDoc::new(SelfRooted::new());
+    idx.init_genesis(&b(GENESIS_BRANCH)).unwrap();
+    idx.record_head(&b(GENESIS_BRANCH), &"single".into(), 7, 3)
+        .unwrap();
+    let mut multi = Frontiers::from_id(ID::new(11, 5));
+    multi.push(ID::new(12, 9));
+    idx.record_frontier(&b(GENESIS_BRANCH), &"multi".into(), &multi)
+        .unwrap();
+    idx.create_index_branch(&b("copy"), &b(GENESIS_BRANCH))
+        .unwrap();
+    idx.record_head(&b("copy"), &"single".into(), 7, 4).unwrap();
+
+    for br in [b(GENESIS_BRANCH), b("copy")] {
+        for doc in ["single", "multi", "unknown"] {
+            let doc: DocId = doc.into();
+            assert_eq!(
+                idx.recorded_ids(&br, &doc).unwrap(),
+                recorded_ids_deep(&idx, &br, &doc).unwrap(),
+                "{br}/{doc}"
+            );
+        }
+    }
+    let mut single_main = idx
+        .recorded_ids(&b(GENESIS_BRANCH), &"single".into())
+        .unwrap();
+    single_main.sort();
+    assert_eq!(single_main, vec![ID::new(7, 3)]);
+    assert_eq!(
+        idx.recorded_ids(&b("copy"), &"single".into()).unwrap(),
+        vec![ID::new(7, 4)],
+        "the copied head carries its own record"
+    );
+    let mut multi_ids = idx
+        .recorded_ids(&b(GENESIS_BRANCH), &"multi".into())
+        .unwrap();
+    multi_ids.sort();
+    assert_eq!(multi_ids, vec![ID::new(11, 5), ID::new(12, 9)]);
+    assert!(idx
+        .recorded_ids(&b(GENESIS_BRANCH), &"unknown".into())
+        .unwrap()
+        .is_empty());
+    assert!(idx
+        .recorded_ids(&b("nope"), &"single".into())
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        idx.recorded_ids(&b("nope"), &"single".into()).unwrap(),
+        recorded_ids_deep(&idx, &b("nope"), &"single".into()).unwrap()
+    );
+}

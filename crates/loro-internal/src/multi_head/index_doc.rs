@@ -2,6 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use std::cmp::Ordering;
 
+use crate::handler::{Handler, HandlerTrait, ValueOrHandler};
 use crate::version::{shrink_frontiers, Frontiers};
 use loro_common::{Counter, InternalString, Lamport, LoroError, LoroResult, LoroValue, PeerID, ID};
 
@@ -146,20 +147,22 @@ impl MultiHeadDoc<SelfRooted> {
 
     /// The raw ids recorded in `docs[doc].heads` on `b`'s index head, before
     /// `Delegated::target` reduces them. Empty if the branch or doc is unknown.
+    /// One record is read through container handles (`MapHandler::get_` resolves a
+    /// mergeable marker to its child by deterministic cid), never a deep value of
+    /// the whole index, so the read is O(1) in the mount.
     pub fn recorded_ids(&self, b: &BranchId, doc: &DocId) -> LoroResult<Vec<ID>> {
         self.read(b, |d| {
             let mut ids = Vec::new();
-            let heads = d
-                .get_deep_value()
-                .as_map()
-                .and_then(|root| root.get("docs").cloned())
-                .and_then(|v| v.into_map().ok())
-                .and_then(|docs| docs.get(doc.as_str()).cloned())
-                .and_then(|v| v.into_map().ok())
-                .and_then(|per| per.get("heads").cloned())
-                .and_then(|v| v.into_map().ok());
-            if let Some(heads) = heads {
-                for (peer_str, counter) in heads.iter() {
+            let Some(ValueOrHandler::Handler(Handler::Map(per_doc))) =
+                d.get_map("docs").get_(doc.as_str())
+            else {
+                return ids;
+            };
+            let Some(ValueOrHandler::Handler(Handler::Map(heads))) = per_doc.get_("heads") else {
+                return ids;
+            };
+            if let LoroValue::Map(m) = heads.get_value() {
+                for (peer_str, counter) in m.iter() {
                     if let (Ok(peer), Some(c)) = (peer_str.parse::<PeerID>(), counter.as_i64()) {
                         ids.push(ID::new(peer, *c as Counter));
                     }
