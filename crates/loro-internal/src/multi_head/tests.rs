@@ -3273,3 +3273,320 @@ fn recorded_ids_direct_read_equals_deep_value() {
         recorded_ids_deep(&idx, &b("nope"), &"single".into()).unwrap()
     );
 }
+
+// Scoped `import_index`: the moved set, scoping, fail-safe, pending lineage.
+
+/// `(branch, docs)` as `import_index` reports it.
+fn mv(branch: &str, docs: Option<&[&str]>) -> (BranchId, Option<Vec<DocId>>) {
+    (
+        b(branch),
+        docs.map(|ds| ds.iter().map(|d| DocId::from(*d)).collect()),
+    )
+}
+
+fn counter() -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    crate::subscription::Subscriber,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let fires = Arc::new(AtomicUsize::new(0));
+    let f = fires.clone();
+    let cb: crate::subscription::Subscriber = Arc::new(move |_ev: crate::event::DiffEvent| {
+        f.fetch_add(1, SeqCst);
+    });
+    (fires, cb)
+}
+
+/// The moved set: a first-contact commit names the sender's genesis join on `main`
+/// and the doc on `tidy`; a later commit names only the doc; a merge marker names
+/// the merged doc on `main`; a remote branch creation is `None`; an already-contained
+/// frame is `[]`, moves no bound head, and delivers nothing.
+#[test]
+fn import_index_moved_set() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let seed = BranchingDocRepo::open().unwrap();
+    let gs = seed.open_doc("G".into());
+    gs.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    seed.create_branch(&b("tidy"), &b(GENESIS_BRANCH)).unwrap();
+    let idx_seed = seed.index().export(ExportMode::all_updates()).unwrap();
+    let c_seed = gs.export(ExportMode::all_updates()).unwrap();
+
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    bb.index().import(&idx_seed).unwrap();
+    gb.import(&c_seed).unwrap();
+    let main_lens = gb.branch(GENESIS_BRANCH).lens().unwrap();
+    let tidy_lens = gb.branch("tidy").lens().unwrap();
+    let (main_fires, cb) = counter();
+    let _ms = main_lens.subscribe_root(cb);
+    let (tidy_fires, cb) = counter();
+    let _ts = tidy_lens.subscribe_root(cb);
+
+    // An agent: a third peer, so its genesis marker rides along on first contact.
+    let agent = BranchingDocRepo::open().unwrap();
+    agent.index().import(&idx_seed).unwrap();
+    let ga = agent.open_doc("G".into());
+    ga.import(&c_seed).unwrap();
+    let vv_content = ga.oplog_vv();
+    ga.branch("tidy")
+        .write(|h| h.get_text("t").insert_unicode(4, "+1").unwrap())
+        .unwrap();
+    let frame1 = agent
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    gb.import(&ga.export(ExportMode::updates_owned(vv_content)).unwrap())
+        .unwrap();
+    let o1 = bb.import_index(&frame1).unwrap();
+    assert_eq!(
+        o1.moved,
+        vec![mv("main", Some(&[])), mv("tidy", Some(&["G"]))]
+    );
+    assert_eq!(tidy_lens.get_text("t").to_string(), "base+1");
+    assert_eq!(tidy_fires.load(SeqCst), 1);
+    assert_eq!(main_fires.load(SeqCst), 0, "main's record did not move");
+
+    let vv_content = ga.oplog_vv();
+    ga.branch("tidy")
+        .write(|h| h.get_text("t").insert_unicode(6, "+2").unwrap())
+        .unwrap();
+    let frame2 = agent
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    gb.import(&ga.export(ExportMode::updates_owned(vv_content)).unwrap())
+        .unwrap();
+    let o2 = bb.import_index(&frame2).unwrap();
+    assert_eq!(o2.moved, vec![mv("tidy", Some(&["G"]))]);
+    assert_eq!(tidy_lens.get_text("t").to_string(), "base+1+2");
+
+    // Merge marker: the frame carries one marker op naming no doc; the tip-range scan
+    // names the merged-in doc on `main`.
+    agent.merge_branch(&b(GENESIS_BRANCH), &b("tidy")).unwrap();
+    let merge_frame = agent
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    let o3 = bb.import_index(&merge_frame).unwrap();
+    assert_eq!(o3.moved, vec![mv("main", Some(&["G"]))]);
+    assert_eq!(main_lens.get_text("t").to_string(), "base+1+2");
+    assert_eq!(main_fires.load(SeqCst), 1);
+
+    // Remote branch creation: no old tip, every open doc.
+    agent
+        .create_branch(&b("remote"), &b(GENESIS_BRANCH))
+        .unwrap();
+    let branch_frame = agent
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    let o4 = bb.import_index(&branch_frame).unwrap();
+    assert_eq!(o4.moved, vec![mv("remote", None)]);
+
+    // Already contained: nothing moves, nothing resolves, nothing fires.
+    let heads = [
+        gb.bound_head(&b(GENESIS_BRANCH)),
+        gb.bound_head(&b("tidy")),
+        gb.bound_head(&b("remote")),
+    ];
+    let fires = (main_fires.load(SeqCst), tidy_fires.load(SeqCst));
+    for frame in [&frame1, &frame2, &merge_frame, &branch_frame] {
+        let o = bb.import_index(frame).unwrap();
+        assert_eq!(o.moved, vec![], "already contained");
+        assert_eq!(o.status.success.iter().count(), 0);
+    }
+    assert_eq!(
+        [
+            gb.bound_head(&b(GENESIS_BRANCH)),
+            gb.bound_head(&b("tidy")),
+            gb.bound_head(&b("remote")),
+        ],
+        heads
+    );
+    assert_eq!((main_fires.load(SeqCst), tidy_fires.load(SeqCst)), fires);
+}
+
+/// Scoping is observable: of two open docs, only the one whose record moved
+/// re-resolves (fires); the other's bound head is untouched.
+#[test]
+fn import_index_scopes_to_moved_docs() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    let ha = a.open_doc("H".into());
+    for (d, s) in [(&ga, "g"), (&ha, "h")] {
+        d.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, s).unwrap())
+            .unwrap();
+    }
+    let idx = a.index().export(ExportMode::all_updates()).unwrap();
+
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    let hb = bb.open_doc("H".into());
+    bb.index().import(&idx).unwrap();
+    gb.import(&ga.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    hb.import(&ha.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    let g_lens = gb.branch(GENESIS_BRANCH).lens().unwrap();
+    let h_lens = hb.branch(GENESIS_BRANCH).lens().unwrap();
+    let (g_fires, cb) = counter();
+    let _gs = g_lens.subscribe_root(cb);
+    let (h_fires, cb) = counter();
+    let _hs = h_lens.subscribe_root(cb);
+    let h_head = hb.bound_head(&b(GENESIS_BRANCH));
+
+    let vv = ga.oplog_vv();
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(1, "!").unwrap())
+        .unwrap();
+    gb.import(&ga.export(ExportMode::updates_owned(vv)).unwrap())
+        .unwrap();
+    let frame = a
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    let o = bb.import_index(&frame).unwrap();
+    assert_eq!(o.moved, vec![mv("main", Some(&["G"]))]);
+    assert_eq!(g_lens.get_text("t").to_string(), "g!");
+    assert_eq!(g_fires.load(SeqCst), 1, "exactly the moved doc fired");
+    assert_eq!(h_fires.load(SeqCst), 0, "the untouched doc did not fire");
+    assert_eq!(h_lens.get_text("t").to_string(), "h");
+    assert_eq!(hb.bound_head(&b(GENESIS_BRANCH)), h_head);
+}
+
+/// Fail-safe: a frontier the DAG cannot resolve, on either side, is `Every`.
+#[test]
+fn docs_changed_between_unresolvable_tip_is_every() {
+    let repo = BranchingDocRepo::open().unwrap();
+    let g = repo.open_doc("G".into());
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "x").unwrap())
+        .unwrap();
+    let idx = repo.index();
+    let tip = idx.tips()[&b(GENESIS_BRANCH)].clone();
+    let bogus = Frontiers::from_id(ID::new(999_999, 7));
+    assert_eq!(idx.docs_changed_between(&tip, &bogus), RecordScope::Every);
+    assert_eq!(idx.docs_changed_between(&bogus, &tip), RecordScope::Every);
+    assert_eq!(
+        idx.docs_changed_between(&Frontiers::default(), &tip),
+        RecordScope::Docs(rustc_hash::FxHashSet::from_iter([DocId::from("G")])),
+        "an empty old frontier is the whole causal past"
+    );
+    assert_eq!(
+        idx.docs_changed_between(&tip, &tip),
+        RecordScope::Docs(rustc_hash::FxHashSet::default())
+    );
+}
+
+/// The `Every` arm through `import_index`: docs bound on a branch before the index
+/// knew it advance when the branch arrives. Observed through lenses and
+/// subscriptions held open ACROSS the import: a `lens()` or `read` after it would
+/// re-resolve on access and hide a broken arm.
+#[test]
+fn import_index_new_branch_advances_lens_held_open() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    let ha = a.open_doc("H".into());
+    for (d, s) in [(&ga, "g"), (&ha, "h")] {
+        d.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, s).unwrap())
+            .unwrap();
+    }
+    a.create_branch(&b("x"), &b(GENESIS_BRANCH)).unwrap();
+    for d in [&ga, &ha] {
+        d.branch("x")
+            .write(|h| h.get_text("t").insert_unicode(1, "+x").unwrap())
+            .unwrap();
+    }
+    let idx = a.index().export(ExportMode::all_updates()).unwrap();
+
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    let hb = bb.open_doc("H".into());
+    gb.import(&ga.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    hb.import(&ha.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    // Bound on `x` before the index knows it: the empty frontier.
+    let g_lens = gb.branch("x").lens().unwrap();
+    let h_lens = hb.branch("x").lens().unwrap();
+    assert_eq!(g_lens.get_text("t").to_string(), "");
+    let (g_fires, cb) = counter();
+    let _gs = g_lens.subscribe_root(cb);
+    let (h_fires, cb) = counter();
+    let _hs = h_lens.subscribe_root(cb);
+
+    let o = bb.import_index(&idx).unwrap();
+    assert!(
+        o.moved.contains(&mv("x", None)),
+        "a branch new to the session re-resolves every open doc: {:?}",
+        o.moved
+    );
+    assert_eq!(g_lens.get_text("t").to_string(), "g+x");
+    assert_eq!(h_lens.get_text("t").to_string(), "h+x");
+    assert_eq!(g_fires.load(SeqCst), 1);
+    assert_eq!(h_fires.load(SeqCst), 1);
+}
+
+/// Pending then unblocked lineage: the later frame lands `pending` and moves
+/// nothing; the earlier frame unblocks both, and the held-open lens lands on the
+/// final record with one delivery.
+#[test]
+fn import_index_pending_then_unblocked_lands_on_final_record() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "base").unwrap())
+        .unwrap();
+    let idx_base = a.index().export(ExportMode::all_updates()).unwrap();
+    let c_base = ga.export(ExportMode::all_updates()).unwrap();
+
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    bb.index().import(&idx_base).unwrap();
+    gb.import(&c_base).unwrap();
+    let lens = gb.branch(GENESIS_BRANCH).lens().unwrap();
+    let (fires, cb) = counter();
+    let _s = lens.subscribe_root(cb);
+
+    let vv_content = ga.oplog_vv();
+    let vv0 = a.index().oplog_vv();
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(4, "+1").unwrap())
+        .unwrap();
+    let vv1 = a.index().oplog_vv();
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(6, "+2").unwrap())
+        .unwrap();
+    let frame1 = a.index().export(ExportMode::updates_owned(vv0)).unwrap();
+    let frame2 = a.index().export(ExportMode::updates_owned(vv1)).unwrap();
+    gb.import(&ga.export(ExportMode::updates_owned(vv_content)).unwrap())
+        .unwrap();
+    assert_eq!(
+        lens.get_text("t").to_string(),
+        "base",
+        "content alone holds"
+    );
+
+    let o2 = bb.import_index(&frame2).unwrap();
+    assert!(o2.status.pending.is_some(), "deps missing: pending");
+    assert_eq!(o2.moved, vec![]);
+    assert_eq!(lens.get_text("t").to_string(), "base");
+    assert_eq!(fires.load(SeqCst), 0);
+
+    let o1 = bb.import_index(&frame1).unwrap();
+    assert_eq!(o1.moved, vec![mv("main", Some(&["G"]))]);
+    assert_eq!(lens.get_text("t").to_string(), "base+1+2");
+    assert_eq!(fires.load(SeqCst), 1, "one delivery for the unblocked pair");
+    assert!(!gb.lens_held(&b(GENESIS_BRANCH)));
+}

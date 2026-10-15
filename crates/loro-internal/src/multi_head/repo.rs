@@ -16,6 +16,17 @@ pub struct BranchingDocRepo {
     docs: std::sync::Mutex<FxHashMap<DocId, Arc<BranchingDoc>>>,
 }
 
+/// What an `import_index` did: the op import's status, plus the branches whose
+/// tip it moved with the docs re-resolved on each (`None`: every open doc;
+/// `Some([])`: the tip moved but no open doc's record did, as when a peer's
+/// genesis root joins `main`). Sorted by branch, then doc. Empty for an
+/// already-contained frame.
+#[derive(Debug, Clone)]
+pub struct IndexImportOutcome {
+    pub status: ImportStatus,
+    pub moved: Vec<(BranchId, Option<Vec<DocId>>)>,
+}
+
 /// The genesis branch every repo opens with.
 pub const GENESIS_BRANCH: &str = "main";
 
@@ -77,18 +88,53 @@ impl BranchingDocRepo {
         Ok(outcome)
     }
 
-    /// Import lineage bytes, then re-resolve every open content doc's index-known
-    /// branches (fast-forward-only). Closes the content-before-lineage gap;
-    /// unresolvable ids are a no-op.
-    pub fn import_index(&self, bytes: &[u8]) -> LoroResult<ImportStatus> {
+    /// Import lineage bytes, then re-resolve each open content doc whose record
+    /// moved on a branch the import moved (fast-forward-only). Closes the
+    /// content-before-lineage gap; unresolvable ids are a no-op.
+    ///
+    /// The docs to re-resolve come from an op-log scan of each moved branch's
+    /// old-to-new tip range (`IndexDoc::docs_changed_between`), so the cost is the
+    /// bare import plus one resolve per changed open doc, at any mount size. Every
+    /// ambiguity resolves more, never less: a branch new to this session (no old
+    /// tip) or one whose range cannot be computed re-resolves every open doc. A
+    /// frame that moves no tip (already contained) re-resolves nothing and reports
+    /// `moved: []`.
+    ///
+    /// `before` is read outside the import's barrier: a concurrent local commit can
+    /// only widen a range. The `docs` lock is held for the whole loop, so a
+    /// concurrent `open_doc` lands before or after it, never mid-loop.
+    pub fn import_index(&self, bytes: &[u8]) -> LoroResult<IndexImportOutcome> {
+        let before = self.index.tips();
         let status = self.index.import(bytes)?;
-        let branches = self.index.branches();
-        for doc in self.docs.lock().unwrap().values() {
-            for b in &branches {
-                let _ = doc.resolve_with(b, Intent::Read, ResolveCause::Import { origin: "".into() });
+        let after = self.index.tips();
+        let docs = self.docs.lock().unwrap();
+        let cause = || ResolveCause::Import { origin: "".into() };
+        let mut moved: Vec<(BranchId, Option<Vec<DocId>>)> = Vec::new();
+        for (b, new) in &after {
+            let scope = match before.get(b) {
+                Some(old) if old == new => continue,
+                Some(old) => self.index.docs_changed_between(old, new),
+                None => RecordScope::Every,
+            };
+            match scope {
+                RecordScope::Docs(set) => {
+                    let mut names: Vec<DocId> = set.into_iter().collect();
+                    names.sort();
+                    for doc in names.iter().filter_map(|d| docs.get(d)) {
+                        let _ = doc.resolve_with(b, Intent::Read, cause());
+                    }
+                    moved.push((b.clone(), Some(names)));
+                }
+                RecordScope::Every => {
+                    for doc in docs.values() {
+                        let _ = doc.resolve_with(b, Intent::Read, cause());
+                    }
+                    moved.push((b.clone(), None));
+                }
             }
         }
-        Ok(status)
+        moved.sort_by(|x, y| x.0.cmp(&y.0));
+        Ok(IndexImportOutcome { status, moved })
     }
 
     /// Unbind the branch from every open content doc and the index, and drop its

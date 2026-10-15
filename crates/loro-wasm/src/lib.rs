@@ -2863,8 +2863,8 @@ impl BranchingDocRepo {
     /// lineage sink on a repo with open content docs.
     #[wasm_bindgen(js_name = "importIndex")]
     pub fn import_index(&self, bytes: &[u8]) -> JsResult<JsImportStatus> {
-        let status = self.0.import_index(bytes)?;
-        Ok(import_status_to_js_value(status)?.into())
+        let outcome = self.0.import_index(bytes)?;
+        Ok(import_status_to_js_value(outcome.status)?.into())
     }
 }
 

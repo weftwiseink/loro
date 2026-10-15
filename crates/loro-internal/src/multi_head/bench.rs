@@ -8,6 +8,7 @@
 //! branches, one agent commit on `tidy`.
 use super::*;
 use crate::encoding::ExportMode;
+use crate::version::Frontiers;
 use loro_common::{Counter, LoroResult, PeerID, ID};
 use std::sync::Arc;
 use std::time::Instant;
@@ -367,4 +368,39 @@ fn bench_rss_eager_index_branches() {
         ),
         _ => println!("RSS n={n}: /proc/self/status unavailable on this platform"),
     }
+}
+
+/// S5: fail-safe and already-contained semantics at a small shape (asserted, not
+/// timed): an unresolvable tip is `Every`; a repeated frame moves nothing.
+#[test]
+#[ignore]
+fn bench_s5_failsafe_and_contained() {
+    let n = 5;
+    let (_seed, idx, contents) = seed(n, 0);
+    let (r, docs) = renderer(&idx, &contents, n);
+    let main = BranchId::from(GENESIS_BRANCH);
+    let tidy = BranchId::from("tidy");
+    let bogus = Frontiers::from_id(ID::new(999_999, 7));
+    let tips = r.index().tips();
+    assert_eq!(
+        r.index().docs_changed_between(&tips[&main], &bogus),
+        RecordScope::Every
+    );
+    assert_eq!(
+        r.index().docs_changed_between(&bogus, &tips[&main]),
+        RecordScope::Every
+    );
+    let upd = agent_update(&idx, &contents, n);
+    let o1 = r.import_index(&upd).unwrap();
+    assert!(!o1.moved.is_empty());
+    let heads: Vec<_> = docs.iter().map(|d| d.bound_head(&tidy)).collect();
+    let o2 = r.import_index(&upd).unwrap();
+    assert!(o2.moved.is_empty(), "already contained: moved is empty");
+    assert_eq!(o2.status.success.iter().count(), 0);
+    let heads2: Vec<_> = docs.iter().map(|d| d.bound_head(&tidy)).collect();
+    assert_eq!(heads, heads2);
+    println!(
+        "S5 moved(first)={:?} moved(repeat)={:?}",
+        o1.moved, o2.moved
+    );
 }
