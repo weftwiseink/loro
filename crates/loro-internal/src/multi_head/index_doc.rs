@@ -154,9 +154,8 @@ impl MultiHeadDoc<SelfRooted> {
 
     /// The raw ids recorded in `docs[doc].heads` on `b`'s index head, before
     /// `Delegated::target` reduces them. Empty if the branch or doc is unknown.
-    /// One record is read through container handles (`MapHandler::get_` resolves a
-    /// mergeable marker to its child by deterministic cid), never a deep value of
-    /// the whole index, so the read is O(1) in the mount.
+    /// Reads one record through container handles, not a deep value, so it is O(1)
+    /// in the mount.
     pub fn recorded_ids(&self, b: &BranchId, doc: &DocId) -> LoroResult<Vec<ID>> {
         self.read(b, |d| {
             let mut ids = Vec::new();
@@ -180,18 +179,14 @@ impl MultiHeadDoc<SelfRooted> {
     }
 
     /// The docs whose `docs[D].heads` record an op in `vv(new) - vv(old)` touches,
-    /// read from the op log alone: a mergeable child's cid names its key path, so
-    /// no head state is materialized. An empty `old` covers the whole causal past
-    /// of `new`. Cost is O(ops in the range): one op for a plain commit, the
-    /// merged-in delta for a merge marker.
+    /// read from the op log alone (a mergeable child's cid names its key path).
+    /// An empty `old` covers the whole causal past of `new`. O(ops in the range).
     ///
     /// Fails SAFE. A frontier the DAG cannot resolve, or a `new` that does not
-    /// include `old` (its range would read empty), yields [`RecordScope::Every`]
-    /// (the caller re-resolves every open doc), never an empty set, which would
-    /// silently leave an open editor on a stale head. The guard covers an
-    /// unresolvable frontier, not a short log: like `branch_sources` and causal
-    /// attribution, this assumes the index op log is never shallow-trimmed below a
-    /// branch root, so `iter_changes` yields every op the range names.
+    /// include `old` (its range would read empty), yields [`RecordScope::Every`],
+    /// never an empty set, which would silently leave an open editor on a stale
+    /// head. Assumes the index op log is never shallow-trimmed below a branch
+    /// root (as `branch_sources` and causal attribution do).
     pub fn docs_changed_between(&self, old: &Frontiers, new: &Frontiers) -> RecordScope {
         let ol = self.oplog.lock();
         let (Some(vv_new), Some(vv_old)) =
@@ -206,8 +201,7 @@ impl MultiHeadDoc<SelfRooted> {
         }
         let mut out = FxHashSet::default();
         for span in vv_new.sub_iter(&vv_old) {
-            // A stored change may merge several commits, and `iter_changes` yields
-            // every change overlapping the span: clip to the span's own ops.
+            // `iter_changes` yields whole changes overlapping the span: clip to its ops.
             let in_span = |op: &Op| {
                 op.counter < span.counter.end
                     && op.counter + op.atom_len() as Counter > span.counter.start
@@ -427,10 +421,9 @@ pub enum RecordScope {
 
 /// The doc an index op records a head for: an op on the mergeable `docs[D].heads`
 /// map, or the `docs` root's marker set keyed `D`. `None` for any other op: branch
-/// markers, and the `docs[D]` map's own `"heads"` marker set, whose cid parses
-/// mergeable with key `D` (not `"heads"`). The same commit always carries the
-/// `heads` insert, so that `None` is not a miss; naming `D` for it would only
-/// double-count.
+/// markers, and the `docs[D]` map's own `"heads"` marker set (its cid parses
+/// mergeable with key `D`). The same commit always carries the `heads` insert, so
+/// that `None` is not a miss.
 fn doc_of_op(ol: &OpLog, op: &Op) -> Option<DocId> {
     let cid = ol.arena.idx_to_id(op.container)?;
     if let Some((parent, key, ContainerType::Map)) = cid.parse_mergeable() {

@@ -94,13 +94,10 @@ impl BranchingDocRepo {
     /// moved on a branch the import moved (fast-forward-only). Closes the
     /// content-before-lineage gap; unresolvable ids are a no-op.
     ///
-    /// The docs to re-resolve come from an op-log scan of each moved branch's
-    /// old-to-new tip range (`IndexDoc::docs_changed_between`), so the cost is the
-    /// bare import plus one resolve per changed open doc, at any mount size. Every
-    /// ambiguity resolves more, never less: a branch new to this session (no old
-    /// tip) or one whose range cannot be computed re-resolves every open doc. A
-    /// frame that moves no tip (already contained) re-resolves nothing and reports
-    /// `moved: []`.
+    /// The docs come from `IndexDoc::docs_changed_between` over each moved branch's
+    /// old-to-new tip range, so cost is the bare import plus one resolve per changed
+    /// open doc. Ambiguity re-resolves more, never less: a branch new to this
+    /// session, or an uncomputable range, re-resolves every open doc.
     ///
     /// `before` is read outside the import's barrier: a concurrent local commit can
     /// only widen a range. The `docs` lock is held for the whole loop, so a

@@ -3375,7 +3375,6 @@ fn import_index_moved_set() {
     assert_eq!(main_lens.get_text("t").to_string(), "base+1+2");
     assert_eq!(main_fires.load(SeqCst), 1);
 
-    // Remote branch creation: no old tip, every open doc.
     agent
         .create_branch(&b("remote"), &b(GENESIS_BRANCH))
         .unwrap();
@@ -3386,7 +3385,6 @@ fn import_index_moved_set() {
     let o4 = bb.import_index(&branch_frame).unwrap();
     assert_eq!(o4.moved, vec![mv("remote", None)]);
 
-    // Already contained: nothing moves, nothing resolves, nothing fires.
     let heads = [
         gb.bound_head(&b(GENESIS_BRANCH)),
         gb.bound_head(&b("tidy")),
@@ -3715,7 +3713,6 @@ fn import_index_straddling_change_block_names_only_new_ops() {
     let (h_fires, cb) = counter();
     let _hs = h_lens.subscribe_root(cb);
 
-    // Frame 1: a commit to G.
     let vv = ga.oplog_vv();
     ga.branch(GENESIS_BRANCH)
         .write(|h| h.get_text("t").insert_unicode(1, "!").unwrap())
@@ -3761,7 +3758,6 @@ fn import_index_moved_names_unopened_doc() {
     let idx = a.index().export(ExportMode::all_updates()).unwrap();
     let bb = BranchingDocRepo::open().unwrap();
     bb.index().import(&idx).unwrap();
-    // G is NOT open on bb.
     ga.branch(GENESIS_BRANCH)
         .write(|h| h.get_text("t").insert_unicode(1, "!").unwrap())
         .unwrap();
