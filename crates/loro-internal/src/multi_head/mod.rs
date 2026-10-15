@@ -22,6 +22,8 @@
 use loro_common::{InternalString, ID};
 
 mod base;
+#[cfg(test)]
+mod bench;
 mod branch;
 mod branching_doc;
 mod head_registry;
