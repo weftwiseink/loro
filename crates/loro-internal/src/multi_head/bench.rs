@@ -219,6 +219,8 @@ fn bench_s3_import_cost() {
             upd.len()
         );
         let ceiling = (n, r, extra) == (400, 50, 30) || (n, r, extra) == (1000, 1000, 0);
+        // The 0.1 ms floor is active at small shapes (bare reads 0.07 ms), so the
+        // tripwire there is 0.5 ms, not 5x the measured bare import.
         if ceiling && full > 5.0 * bare.max(0.1) {
             over.push(format!(
                 "n={n} r={r} b={branches}: import_index {full:.2}ms > 5x bare {bare:.3}ms"
