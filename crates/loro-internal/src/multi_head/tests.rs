@@ -3482,6 +3482,18 @@ fn docs_changed_between_unresolvable_tip_is_every() {
         idx.docs_changed_between(&tip, &tip),
         RecordScope::Docs(rustc_hash::FxHashSet::default())
     );
+    // A tip that moved backward (`new` does not include `old`) has an empty
+    // `vv(new) - vv(old)`; reading that as "nothing moved" would under-resolve.
+    let earlier = tip.clone();
+    g.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(1, "y").unwrap())
+        .unwrap();
+    let later = idx.tips()[&b(GENESIS_BRANCH)].clone();
+    assert_ne!(earlier, later);
+    assert_eq!(
+        idx.docs_changed_between(&later, &earlier),
+        RecordScope::Every
+    );
 }
 
 /// The `Every` arm through `import_index`: docs bound on a branch before the index

@@ -185,7 +185,8 @@ impl MultiHeadDoc<SelfRooted> {
     /// of `new`. Cost is O(ops in the range): one op for a plain commit, the
     /// merged-in delta for a merge marker.
     ///
-    /// Fails SAFE. A frontier the DAG cannot resolve yields [`RecordScope::Every`]
+    /// Fails SAFE. A frontier the DAG cannot resolve, or a `new` that does not
+    /// include `old` (its range would read empty), yields [`RecordScope::Every`]
     /// (the caller re-resolves every open doc), never an empty set, which would
     /// silently leave an open editor on a stale head. The guard covers an
     /// unresolvable frontier, not a short log: like `branch_sources` and causal
@@ -199,6 +200,10 @@ impl MultiHeadDoc<SelfRooted> {
             tracing::warn!("index: cannot resolve a branch tip range; re-resolving every open doc");
             return RecordScope::Every;
         };
+        if !vv_new.includes_vv(&vv_old) {
+            tracing::warn!("index: a branch tip moved backward; re-resolving every open doc");
+            return RecordScope::Every;
+        }
         let mut out = FxHashSet::default();
         for span in vv_new.sub_iter(&vv_old) {
             // A stored change may merge several commits, and `iter_changes` yields
