@@ -3602,3 +3602,184 @@ fn import_index_pending_then_unblocked_lands_on_final_record() {
     assert_eq!(fires.load(SeqCst), 1, "one delivery for the unblocked pair");
     assert!(!gb.lens_held(&b(GENESIS_BRANCH)));
 }
+
+/// Two senders commit concurrently on `tidy` to different docs; one frame carries
+/// both. The tip becomes a two-head join, the scan walks both spans, and each
+/// held-open lens advances exactly once.
+#[test]
+fn import_index_concurrent_records_join_in_one_frame() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let seed = BranchingDocRepo::open().unwrap();
+    let gs = seed.open_doc("G".into());
+    let hs = seed.open_doc("H".into());
+    for (d, s) in [(&gs, "g"), (&hs, "h")] {
+        d.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, s).unwrap())
+            .unwrap();
+    }
+    seed.create_branch(&b("tidy"), &b(GENESIS_BRANCH)).unwrap();
+    let idx_seed = seed.index().export(ExportMode::all_updates()).unwrap();
+    let g_seed = gs.export(ExportMode::all_updates()).unwrap();
+    let h_seed = hs.export(ExportMode::all_updates()).unwrap();
+
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    let hb = bb.open_doc("H".into());
+    bb.index().import(&idx_seed).unwrap();
+    gb.import(&g_seed).unwrap();
+    hb.import(&h_seed).unwrap();
+    let g_lens = gb.branch("tidy").lens().unwrap();
+    let h_lens = hb.branch("tidy").lens().unwrap();
+    let (g_fires, cb) = counter();
+    let _gs = g_lens.subscribe_root(cb);
+    let (h_fires, cb) = counter();
+    let _hs = h_lens.subscribe_root(cb);
+
+    let a1 = BranchingDocRepo::open().unwrap();
+    a1.index().import(&idx_seed).unwrap();
+    let g1 = a1.open_doc("G".into());
+    g1.import(&g_seed).unwrap();
+    let a2 = BranchingDocRepo::open().unwrap();
+    a2.index().import(&idx_seed).unwrap();
+    let h2 = a2.open_doc("H".into());
+    h2.import(&h_seed).unwrap();
+    // Concurrent: neither agent has seen the other's commit.
+    g1.branch("tidy")
+        .write(|h| h.get_text("t").insert_unicode(1, "1").unwrap())
+        .unwrap();
+    h2.branch("tidy")
+        .write(|h| h.get_text("t").insert_unicode(1, "2").unwrap())
+        .unwrap();
+    // a2 learns a1's lineage, then one frame from bb's version carries both peers.
+    a2.index()
+        .import(
+            &a1.index()
+                .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+                .unwrap(),
+        )
+        .unwrap();
+    let frame = a2
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    gb.import(&g1.export(ExportMode::updates_owned(gb.oplog_vv())).unwrap())
+        .unwrap();
+    hb.import(&h2.export(ExportMode::updates_owned(hb.oplog_vv())).unwrap())
+        .unwrap();
+    let o = bb.import_index(&frame).unwrap();
+    assert_eq!(
+        o.moved,
+        vec![mv("main", Some(&[])), mv("tidy", Some(&["G", "H"]))]
+    );
+    assert_eq!(
+        bb.index().tips()[&b("tidy")].len(),
+        2,
+        "two-head join on tidy"
+    );
+    assert_eq!(g_lens.get_text("t").to_string(), "g1");
+    assert_eq!(h_lens.get_text("t").to_string(), "h2");
+    assert_eq!(g_fires.load(SeqCst), 1);
+    assert_eq!(h_fires.load(SeqCst), 1);
+}
+
+/// A same-peer change block that straddles the old tip: commit 1 (to G) arrives,
+/// then commit 2 (to H) in its own frame. The receiver stores both in one merged
+/// block; the clipped scan names exactly H for frame 2 (G does not fire again),
+/// and H's held-open lens advances.
+#[test]
+fn import_index_straddling_change_block_names_only_new_ops() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    let ha = a.open_doc("H".into());
+    for (d, s) in [(&ga, "g"), (&ha, "h")] {
+        d.branch(GENESIS_BRANCH)
+            .write(|h| h.get_text("t").insert_unicode(0, s).unwrap())
+            .unwrap();
+    }
+    let idx = a.index().export(ExportMode::all_updates()).unwrap();
+    let bb = BranchingDocRepo::open().unwrap();
+    let gb = bb.open_doc("G".into());
+    let hb = bb.open_doc("H".into());
+    bb.index().import(&idx).unwrap();
+    gb.import(&ga.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    hb.import(&ha.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    let g_lens = gb.branch(GENESIS_BRANCH).lens().unwrap();
+    let h_lens = hb.branch(GENESIS_BRANCH).lens().unwrap();
+    let (g_fires, cb) = counter();
+    let _gs = g_lens.subscribe_root(cb);
+    let (h_fires, cb) = counter();
+    let _hs = h_lens.subscribe_root(cb);
+
+    // Frame 1: a commit to G.
+    let vv = ga.oplog_vv();
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(1, "!").unwrap())
+        .unwrap();
+    gb.import(&ga.export(ExportMode::updates_owned(vv)).unwrap())
+        .unwrap();
+    let f1 = a
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    let o1 = bb.import_index(&f1).unwrap();
+    assert_eq!(o1.moved, vec![mv("main", Some(&["G"]))]);
+    assert_eq!(g_fires.load(SeqCst), 1);
+
+    // Frame 2: a commit to H, same peer, consecutive counter: merges into the block.
+    let vv = ha.oplog_vv();
+    ha.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(1, "?").unwrap())
+        .unwrap();
+    hb.import(&ha.export(ExportMode::updates_owned(vv)).unwrap())
+        .unwrap();
+    let f2 = a
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    let o2 = bb.import_index(&f2).unwrap();
+    assert_eq!(o2.moved, vec![mv("main", Some(&["H"]))], "exactly H");
+    assert_eq!(h_lens.get_text("t").to_string(), "h?");
+    assert_eq!(h_fires.load(SeqCst), 1);
+    assert_eq!(g_fires.load(SeqCst), 1, "G did not re-fire");
+    assert_eq!(g_lens.get_text("t").to_string(), "g!");
+}
+
+/// `moved` names a doc whose record moved even when it is not open here, and the
+/// doc resolves lazily when opened after the import.
+#[test]
+fn import_index_moved_names_unopened_doc() {
+    let a = BranchingDocRepo::open().unwrap();
+    let ga = a.open_doc("G".into());
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(0, "g").unwrap())
+        .unwrap();
+    let idx = a.index().export(ExportMode::all_updates()).unwrap();
+    let bb = BranchingDocRepo::open().unwrap();
+    bb.index().import(&idx).unwrap();
+    // G is NOT open on bb.
+    ga.branch(GENESIS_BRANCH)
+        .write(|h| h.get_text("t").insert_unicode(1, "!").unwrap())
+        .unwrap();
+    let f = a
+        .index()
+        .export(ExportMode::updates_owned(bb.index().oplog_vv()))
+        .unwrap();
+    let o = bb.import_index(&f).unwrap();
+    assert_eq!(o.moved, vec![mv("main", Some(&["G"]))]);
+    let gb = bb.open_doc("G".into());
+    gb.import(&ga.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    assert_eq!(
+        gb.branch(GENESIS_BRANCH)
+            .lens()
+            .unwrap()
+            .get_text("t")
+            .to_string(),
+        "g!"
+    );
+}
