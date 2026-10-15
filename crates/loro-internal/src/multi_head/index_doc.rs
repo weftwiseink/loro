@@ -2,9 +2,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use std::cmp::Ordering;
 
+use crate::container::map::MapSet;
 use crate::handler::{Handler, HandlerTrait, ValueOrHandler};
+use crate::op::{InnerContent, Op};
+use crate::oplog::OpLog;
 use crate::version::{shrink_frontiers, Frontiers};
-use loro_common::{Counter, InternalString, Lamport, LoroError, LoroResult, LoroValue, PeerID, ID};
+use loro_common::{
+    ContainerID, ContainerType, Counter, InternalString, Lamport, LoroError, LoroResult, LoroValue,
+    PeerID, ID,
+};
+use rle::HasLength;
 
 use super::policy::{BRANCH_MERGE_KEY, BRANCH_NAME_KEY, BRANCH_ROOT};
 use super::ROOT_HEAD_ID;
@@ -170,6 +177,45 @@ impl MultiHeadDoc<SelfRooted> {
             }
             ids
         })
+    }
+
+    /// The docs whose `docs[D].heads` record an op in `vv(new) - vv(old)` touches,
+    /// read from the op log alone: a mergeable child's cid names its key path, so
+    /// no head state is materialized. An empty `old` covers the whole causal past
+    /// of `new`. Cost is O(ops in the range): one op for a plain commit, the
+    /// merged-in delta for a merge marker.
+    ///
+    /// Fails SAFE. A frontier the DAG cannot resolve yields [`RecordScope::Every`]
+    /// (the caller re-resolves every open doc), never an empty set, which would
+    /// silently leave an open editor on a stale head. The guard covers an
+    /// unresolvable frontier, not a short log: like `branch_sources` and causal
+    /// attribution, this assumes the index op log is never shallow-trimmed below a
+    /// branch root, so `iter_changes` yields every op the range names.
+    pub fn docs_changed_between(&self, old: &Frontiers, new: &Frontiers) -> RecordScope {
+        let ol = self.oplog.lock();
+        let (Some(vv_new), Some(vv_old)) =
+            (ol.dag.frontiers_to_vv(new), ol.dag.frontiers_to_vv(old))
+        else {
+            tracing::warn!("index: cannot resolve a branch tip range; re-resolving every open doc");
+            return RecordScope::Every;
+        };
+        let mut out = FxHashSet::default();
+        for span in vv_new.sub_iter(&vv_old) {
+            // A stored change may merge several commits, and `iter_changes` yields
+            // every change overlapping the span: clip to the span's own ops.
+            let in_span = |op: &Op| {
+                op.counter < span.counter.end
+                    && op.counter + op.atom_len() as Counter > span.counter.start
+            };
+            for ch in ol.iter_changes(span) {
+                for op in ch.ops().iter().filter(|op| in_span(op)) {
+                    if let Some(d) = doc_of_op(&ol, op) {
+                        out.insert(d);
+                    }
+                }
+            }
+        }
+        RecordScope::Docs(out)
     }
 
     /// The branches this session knows: the keys of the derived `tips`.
@@ -363,4 +409,45 @@ impl MultiHeadDoc<SelfRooted> {
     pub fn head_of(&self, b: &BranchId) -> LoroResult<HeadId> {
         Ok(self.resolve(b, Intent::Read)?.0)
     }
+}
+
+/// Which open docs a moved branch must re-resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordScope {
+    /// Exactly these docs' records moved.
+    Docs(FxHashSet<DocId>),
+    /// Unknown (a branch new to this session, or an unresolvable tip): every open doc.
+    Every,
+}
+
+/// The doc an index op records a head for: an op on the mergeable `docs[D].heads`
+/// map, or the `docs` root's marker set keyed `D`. `None` for any other op: branch
+/// markers, and the `docs[D]` map's own `"heads"` marker set, whose cid parses
+/// mergeable with key `D` (not `"heads"`). The same commit always carries the
+/// `heads` insert, so that `None` is not a miss; naming `D` for it would only
+/// double-count.
+fn doc_of_op(ol: &OpLog, op: &Op) -> Option<DocId> {
+    let cid = ol.arena.idx_to_id(op.container)?;
+    if let Some((parent, key, ContainerType::Map)) = cid.parse_mergeable() {
+        if key == "heads" {
+            if let Some((root, doc, ContainerType::Map)) = parent.parse_mergeable() {
+                if matches!(&root, ContainerID::Root { name, .. } if name.as_str() == "docs") {
+                    return Some(doc.into());
+                }
+            }
+        }
+        return None;
+    }
+    if let ContainerID::Root {
+        name,
+        container_type: ContainerType::Map,
+    } = &cid
+    {
+        if name.as_str() == "docs" {
+            if let InnerContent::Map(MapSet { key, .. }) = &op.content {
+                return Some(key.clone());
+            }
+        }
+    }
+    None
 }
