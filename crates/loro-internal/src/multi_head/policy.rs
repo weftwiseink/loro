@@ -165,6 +165,13 @@ impl Attribution {
 /// or `after_commit` per critical section, so readers see all of a fold or none.
 /// `after_commit` publishes after the commit returns; a session is
 /// single-writer, so its next `resolve` runs after the publish.
+///
+/// NOTE(fable-5-1/fork-index-import-cost): every `BranchingDocRepo::open()` mints a
+/// genesis marker, which joins `main` as a parallel root on every other peer at
+/// first contact, so `tips[main]` is a multi-root frontier that grows with the
+/// peers ever seen and `import_index` reports `(main, [])` for that join. Harmless
+/// at today's peer counts; tracked in weftwise
+/// `cdocs/proposals/2026-10-15-per-peer-genesis-root-join.md`.
 #[allow(missing_debug_implementations)]
 pub struct SelfRooted {
     // Lazy: the lock group exists only once `MultiHeadDoc::new` has run.
